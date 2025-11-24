@@ -1,0 +1,58 @@
+6095:
+  name: メドピア
+  theme_tags:
+    - AGING
+    - HOME_MEDICAL
+    - MEDICAL_DX
+    - SENIOR_LIFE
+  business_model: DATA_PLATFORM
+
+2150:
+  name: ケアネット
+  theme_tags:
+    - AGING
+    - MEDICAL_DX
+    - NURSING_CARE
+  business_model: COST_REDUCTION_INFRA
+
+3918:
+  name: PCIホールディングス
+  theme_tags:
+    - MEDICAL_DX
+    - COST_EFFICIENCY
+    - AGING
+  business_model: COST_REDUCTION_INFRA
+
+2371:
+  name: カカクコム
+  theme_tags:
+    - SENIOR_LIFE
+    - DATA_DRIVEN
+    - MEDICAL_DX
+  business_model: DATA_PLATFORM
+
+6195:
+  name: ホープ
+  theme_tags:
+    - AGING
+    - PUBLIC_SECTOR_DX
+  business_model: POLICY_DEPENDENT
+
+6594:
+  name: 日本電産
+  theme_tags:
+    - HUMANOID
+    - ROBOTICS_CORE
+    - MECHATRONICS
+    - POWER_ELECTRONICS
+  business_model: ROBOTICS_CORE
+
+6954:
+  name: ファナック
+  theme_tags:
+    - HUMANOID
+    - ROBOTICS_CORE
+    - MOTION_CONTROL
+    - SENSOR_FUSION
+  business_model: ROBOTICS_CORE
+

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 環境変数・設定ファイル（機密情報）
+api.ini
+.env
+*.key
+*.pem
+
+# キャッシュ・データ
+.jquants_cache/
+output/
+*.csv
+*.json
+!config/*.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ログ
+*.log
+
