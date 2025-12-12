@@ -466,6 +466,80 @@ class DynamicSectorAverages:
         self.cache_timestamp = time.time()
         return data
 
+    def calculate_sector_averages_from_cache(self, max_samples_per_sector: int = 100) -> dict:
+        """
+        キャッシュされたデータから実際のセクター平均を計算する。
+        複数銘柄の分析結果からセクター別のPS、PEG、PERなどの中央値を算出。
+        """
+        try:
+            tasks = build_offline_analysis_tasks(self.session)
+            if not tasks:
+                print("📊 セクター平均計算: キャッシュデータが不足しています")
+                return {}
+            
+            print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...")
+            results = []
+            max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [
+                    ex.submit(
+                        analyze_single_stock_complete_v3,
+                        self.session, {}, code, name, market, sector,
+                        offline=True
+                    ) for (code, name, market, sector) in tasks[:max_samples_per_sector * 20]  # 全セクター分のサンプル
+                ]
+                for i, fut in enumerate(as_completed(futs), 1):
+                    res = fut.result()
+                    if res.get("success") and res.get("ps_ratio") is not None:
+                        results.append(res)
+                    if i % 100 == 0:
+                        print(f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})")
+            
+            if not results:
+                print("📊 セクター平均計算: 有効なデータがありません")
+                return {}
+            
+            # DataFrameに変換
+            df = pd.DataFrame([
+                {
+                    "sector": r.get("sector_name") or DynamicSectorAverages.get_sector_static(r.get("stock_code", "")),
+                    "ps": r.get("ps_ratio"),
+                    "peg": r.get("peg_ratio"),
+                    "per": r.get("per"),
+                }
+                for r in results
+            ])
+            
+            # セクター別に集計
+            sector_stats = {}
+            for sector in df["sector"].unique():
+                sector_df = df[df["sector"] == sector]
+                if len(sector_df) < 3:  # サンプル数が少なすぎる場合はスキップ
+                    continue
+                
+                ps_values = sector_df["ps"].dropna()
+                peg_values = sector_df["peg"].dropna()
+                per_values = sector_df["per"].dropna()
+                
+                sector_stats[sector] = {
+                    "ps": float(ps_values.median()) if len(ps_values) > 0 else None,
+                    "peg": float(peg_values.median()) if len(peg_values) > 0 else None,
+                    "per": float(per_values.median()) if len(per_values) > 0 else None,
+                    "sample_count": len(sector_df),
+                    "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data_source": "calculated_from_cache"
+                }
+            
+            print(f"📊 セクター平均計算完了: {len(sector_stats)}セクター")
+            return sector_stats
+            
+        except Exception as e:
+            print(f"⚠️ セクター平均計算エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
     def load_or_download_data_v2(self, endpoint, cache_name, bypass_cache: bool = False):
         """当日CSVキャッシュ→API→CSV保存。bypass_cache=True なら当日キャッシュを無視して取り直す。"""
         try:
@@ -1367,6 +1441,7 @@ def run_interactive():
         print("1) 収集（価格+財務を凍結保存）")
         print("2) オフライン一括分析（トップ10出力）")
         print("3) 単銘柄分析（キャッシュ使用）")
+        print("4) セクター平均を更新（キャッシュから計算）")
         print("5) 全銘柄ゆっくり収集（自動待機・再開可）")
         print("6) 鮮度で取り直し収集（例: 7日より古いものだけ）")
         print("7) 全銘柄“強制”再収集（pending初期化＋当日再取得）")
@@ -1415,6 +1490,34 @@ def run_interactive():
             fp = outdir / f"single_{code}_{ts}.csv"
             df.to_csv(fp, index=False, encoding="utf-8-sig")
             print(f"✅ 出力: {fp}")
+        elif choice == "4":
+            print("📊 セクター平均をキャッシュから計算中...")
+            sector_avgs_obj = DynamicSectorAverages(session)
+            updated_avgs = sector_avgs_obj.calculate_sector_averages_from_cache()
+            if updated_avgs:
+                # キャッシュを更新
+                cache_file = CACHE_DIR / "sector_averages.json"
+                sectors = ['自動車','半導体','エレクトロニクス','銀行','通信','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+                data = {}
+                for sector in sectors:
+                    if sector in updated_avgs:
+                        data[sector] = updated_avgs[sector]
+                    else:
+                        data[sector] = sector_avgs_obj.get_default_sector_average(sector)
+                cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
+                sector_avgs_obj.sector_cache = data
+                sector_avgs_obj.cache_timestamp = time.time()
+                sector_avgs = data
+                print(f"✅ セクター平均を更新しました（{len(updated_avgs)}セクター）")
+                for sector, stats in updated_avgs.items():
+                    ps_val = stats.get('ps', None)
+                    peg_val = stats.get('peg', None)
+                    sample_count = stats.get('sample_count', 0)
+                    ps_str = f"{ps_val:.2f}" if ps_val is not None else "N/A"
+                    peg_str = f"{peg_val:.2f}" if peg_val is not None else "N/A"
+                    print(f"  {sector}: PS={ps_str}, PEG={peg_str}, サンプル数={sample_count}")
+            else:
+                print("⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。")
         elif choice == "5":
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
