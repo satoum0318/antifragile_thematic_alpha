@@ -546,6 +546,80 @@ class DynamicSectorAverages:
         self.cache_timestamp = time.time()
         return data
 
+    def calculate_sector_averages_from_cache(self, max_samples_per_sector: int = 100) -> dict:
+        """
+        キャッシュされたデータから実際のセクター平均を計算する。
+        複数銘柄の分析結果からセクター別のPS、PEG、PERなどの中央値を算出。
+        """
+        try:
+            tasks = build_offline_analysis_tasks(self.session)
+            if not tasks:
+                print("[分析] セクター平均計算: キャッシュデータが不足しています")
+                return {}
+            
+            print(f"[分析] セクター平均計算: {len(tasks)}銘柄から計算中...")
+            results = []
+            max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [
+                    ex.submit(
+                        analyze_single_stock_complete_v3,
+                        self.session, {}, code, name, market, sector,
+                        offline=True
+                    ) for (code, name, market, sector) in tasks[:max_samples_per_sector * 20]  # 全セクター分のサンプル
+                ]
+                for i, fut in enumerate(as_completed(futs), 1):
+                    res = fut.result()
+                    if res.get("success") and res.get("ps_ratio") is not None:
+                        results.append(res)
+                    if i % 100 == 0:
+                        print(f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})")
+            
+            if not results:
+                print("[分析] セクター平均計算: 有効なデータがありません")
+                return {}
+            
+            # DataFrameに変換
+            df = pd.DataFrame([
+                {
+                    "sector": r.get("sector_name") or DynamicSectorAverages.get_sector_static(r.get("stock_code", "")),
+                    "ps": r.get("ps_ratio"),
+                    "peg": r.get("peg_ratio"),
+                    "per": r.get("per"),
+                }
+                for r in results
+            ])
+            
+            # セクター別に集計
+            sector_stats = {}
+            for sector in df["sector"].unique():
+                sector_df = df[df["sector"] == sector]
+                if len(sector_df) < 3:  # サンプル数が少なすぎる場合はスキップ
+                    continue
+                
+                ps_values = sector_df["ps"].dropna()
+                peg_values = sector_df["peg"].dropna()
+                per_values = sector_df["per"].dropna()
+                
+                sector_stats[sector] = {
+                    "ps": float(ps_values.median()) if len(ps_values) > 0 else None,
+                    "peg": float(peg_values.median()) if len(peg_values) > 0 else None,
+                    "per": float(per_values.median()) if len(per_values) > 0 else None,
+                    "sample_count": len(sector_df),
+                    "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data_source": "calculated_from_cache"
+                }
+            
+            print(f"[分析] セクター平均計算完了: {len(sector_stats)}セクター")
+            return sector_stats
+            
+        except Exception as e:
+            print(f"[警告] セクター平均計算エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
     def load_or_download_data_v2(self, endpoint, cache_name, bypass_cache: bool = False):
         """当日CSVキャッシュ→API→CSV保存。bypass_cache=True なら当日キャッシュを無視して取り直す。"""
         try:
@@ -1343,19 +1417,20 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
 # ------------------------------------------------------------
 # レポート出力
 # ------------------------------------------------------------
-def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> None:
+def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
         return
     for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx"]:
         ok[c] = pd.to_numeric(ok[c], errors="coerce")
+    suffix = f"_{timestamp}" if timestamp else ""
     rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
-    rec.to_csv(outdir / "top_recommended.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / "top_safety.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / "top_speculative.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / "top_piotroski.csv", index=False, encoding="utf-8-sig")
+    rec.to_csv(outdir / f"top_recommended{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_safety{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / f"top_speculative{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_piotroski{suffix}.csv", index=False, encoding="utf-8-sig")
 
-def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> None:
+def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty: return
     ok["safety"] = pd.to_numeric(ok["safety"], errors="coerce")
@@ -1363,9 +1438,13 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> N
     ok["spec_score"] = pd.to_numeric(ok["spec_score"], errors="coerce")
     rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
     lines = ["# おすすめトップテン", ""]
+    if timestamp:
+        lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
+        lines.append("")
     for _, r in rec.iterrows():
         lines.append(f"- **{r['code']} {r['name']}** | 安全 {r['safety']} | Pio {r['piot']} | 仕手 {r['spec_score']} | PER {r['per']} | PEG {r['peg']} | PS {r['ps']}")
-    (outdir / "report_top10.md").write_text("\n".join(lines), encoding="utf-8")
+    suffix = f"_{timestamp}" if timestamp else ""
+    (outdir / f"report_top10{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
 
 # ==== 投資助言レポート生成 ====
 
@@ -1447,8 +1526,228 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
     return df
 
+def write_single_stock_report(analysis_result: dict, outdir: Path) -> Optional[Path]:
+    """
+    単銘柄分析結果から詳細レポートを生成する
+    Piotroskiスコアの解釈を改善し、誤解を招く表現を避ける
+    """
+    if not analysis_result.get("success"):
+        return None
+    
+    code = analysis_result.get("stock_code", "")
+    name = analysis_result.get("company_name", "")
+    sector = analysis_result.get("sector_name", "")
+    price = analysis_result.get("current_price")
+    
+    piot = analysis_result.get("piotroski", {})
+    piot_score = piot.get("score", 0)
+    piot_eval = piot.get("evaluation", "不明")
+    piot_details = piot.get("details", {})
+    
+    safety = analysis_result.get("safety", {})
+    safety_score = safety.get("total_score", 0)
+    safety_level = safety.get("safety_level", "不明")
+    
+    spec = analysis_result.get("speculation", {})
+    spec_score = spec.get("score", 0)
+    spec_level = spec.get("level", "不明")
+    
+    ps = analysis_result.get("ps_ratio")
+    per = analysis_result.get("per")
+    peg = analysis_result.get("peg_ratio")
+    rsi = analysis_result.get("rsi")
+    adx = analysis_result.get("adx")
+    
+    lines = []
+    lines.append("# 株式分析レポート")
+    lines.append("")
+    lines.append("## 銘柄情報")
+    lines.append("")
+    lines.append(f"**銘柄コード**: {code}")
+    lines.append(f"**会社名**: {name}")
+    lines.append(f"**セクター**: {sector}")
+    if price:
+        lines.append(f"**現在価格**: {price:,.0f}円")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 評価サマリー")
+    lines.append("")
+    lines.append("| 項目 | 評価 |")
+    lines.append("|------|------|")
+    lines.append(f"| **安全性** | {safety_level} (スコア: {safety_score:.1f}/25.0) |")
+    lines.append(f"| **投機性** | {spec_level} (スコア: {spec_score}/100) |")
+    lines.append(f"| **財務健全性** | {piot_eval} (Piotroskiスコア: {piot_score}/9) |")
+    lines.append("| **総合判定** | ✅ 分析完了 |")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 財務健全性評価")
+    lines.append("")
+    lines.append("### Piotroskiスコア")
+    lines.append("")
+    lines.append(f"**スコア**: {piot_score}/9点")
+    lines.append("")
+    lines.append("**重要な補足説明**:")
+    lines.append("")
+    lines.append("Piotroskiスコアは**前年比較ベース**の評価指標です。以下の特徴があります：")
+    lines.append("")
+    lines.append("1. **前年比較ベース**: 前年度と比較した改善・悪化を評価します")
+    lines.append("2. **絶対値は反映しない**: 有利子負債比率などの絶対的な財務健全性は直接反映されません")
+    lines.append("3. **既に健全な企業はスコアが低くなる傾向**: 既に健全な財務状態の企業は、")
+    lines.append("   改善の余地が少ないためスコアが低くなる傾向があります")
+    lines.append("")
+    
+    # Piotroskiスコアが低い場合の解釈を改善
+    if piot_score < 5:
+        lines.append("**この銘柄について**:")
+        lines.append("")
+        lines.append(f"Piotroskiスコアが{piot_score}点と低い場合でも、以下の可能性があります：")
+        lines.append("")
+        lines.append("- **絶対的な財務健全性が高い**: 有利子負債比率が低く、現金超過状態など、")
+        lines.append("  既に健全な財務状態のため、前年比での改善ポイントが少ない")
+        lines.append("- **安定した財務状態**: 財務状態が安定しているため、大きな改善・悪化がない")
+        lines.append("")
+        lines.append("**推奨**: Piotroskiスコアだけで判断せず、有利子負債比率、ネットD/Eレシオ、")
+        lines.append("流動比率などの絶対的な財務健全性指標も併せて評価してください。")
+        lines.append("")
+    else:
+        lines.append(f"Piotroskiスコアが{piot_score}点と良好な評価です。")
+        lines.append("財務健全性の改善傾向が見られます。")
+        lines.append("")
+    
+    if piot_details:
+        lines.append("### 評価項目詳細")
+        lines.append("")
+        lines.append("| 評価項目 | 判定 | 説明 |")
+        lines.append("|---------|------|------|")
+        item_names = {
+            "positive_net_income": ("当期純利益がプラス", "当期純利益が正の値である"),
+            "positive_ocf": ("営業CFがプラス", "営業キャッシュフローが正の値である"),
+            "ocf_gt_ni": ("営業CF > 純利益", "営業キャッシュフローが純利益を上回る（収益の質が高い）"),
+            "roa_up": ("ROA改善", "総資産利益率が前年比で改善している"),
+            "ocf_margin_up": ("営業CFマージン改善", "営業キャッシュフローマージンが前年比で改善している"),
+            "current_ratio_up": ("流動比率改善", "流動比率が前年比で改善している"),
+            "shares_down": ("発行済み株式数減少", "発行済み株式数が減少している（自社株買いなど）"),
+            "gpm_up": ("売上総利益率改善", "売上総利益率が前年比で改善している"),
+            "leverage_down": ("レバレッジ低下", "レバレッジ（負債比率）が前年比で低下している"),
+        }
+        for key, (name, desc) in item_names.items():
+            result = piot_details.get(key, False)
+            status = "✅ 合格" if result else "❌ 不合格"
+            lines.append(f"| {name} | {status} | {desc} |")
+        lines.append("")
+    
+    lines.append("---")
+    lines.append("")
+    lines.append("## 財務指標")
+    lines.append("")
+    lines.append("### バリュエーション指標")
+    lines.append("")
+    lines.append("| 指標 | 値 |")
+    lines.append("|------|-----|")
+    if ps is not None:
+        lines.append(f"| **PSレシオ** | {ps:.2f} |")
+    else:
+        lines.append("| **PSレシオ** | データなし |")
+    if per is not None:
+        lines.append(f"| **PER** | {per:.2f} |")
+    else:
+        lines.append("| **PER** | データなし |")
+    if peg is not None:
+        lines.append(f"| **PEGレシオ** | {peg:.2f} |")
+    else:
+        lines.append("| **PEGレシオ** | データなし |")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## テクニカル指標")
+    lines.append("")
+    lines.append("| 指標 | 値 |")
+    lines.append("|------|-----|")
+    if rsi is not None:
+        lines.append(f"| **RSI** | {rsi:.2f} |")
+    else:
+        lines.append("| **RSI** | データなし |")
+    if adx is not None:
+        lines.append(f"| **ADX** | {adx:.2f} |")
+    else:
+        lines.append("| **ADX** | データなし |")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 投資判断のポイント")
+    lines.append("")
+    
+    # ポジティブ要因
+    lines.append("### ポジティブ要因")
+    positives = []
+    if spec_score < 30:
+        positives.append("✅ 投機性が低く、比較的安定した取引環境")
+    if rsi is not None and rsi < 40:
+        positives.append("✅ RSIが売られすぎゾーンに近く、反発の可能性")
+    if piot_score >= 5:
+        positives.append("✅ Piotroskiスコアが良好で、財務健全性の改善傾向")
+    if not positives:
+        positives.append("（特になし）")
+    for p in positives:
+        lines.append(f"- {p}")
+    lines.append("")
+    
+    # 注意すべき要因（表現を改善）
+    lines.append("### 注意すべき要因")
+    warnings = []
+    if per is not None and per > 50:
+        warnings.append("⚠️ PERが高水準で、成長期待が織り込まれている可能性")
+    if piot_score < 5:
+        warnings.append(f"⚠️ Piotroskiスコアが{piot_score}/9と低め（前年比較ベースの評価のため、絶対的な財務健全性は別途確認が必要）")
+    if adx is not None and adx < 25:
+        warnings.append("⚠️ ADXが低く、明確なトレンドが形成されていない")
+    if safety_score < 15:
+        warnings.append("⚠️ 安全性評価が「普通」以下で、リスク管理が必要")
+    if not warnings:
+        warnings.append("（特になし）")
+    for w in warnings:
+        lines.append(f"- {w}")
+    lines.append("")
+    
+    lines.append("---")
+    lines.append("")
+    lines.append("## 総合所見")
+    lines.append("")
+    lines.append(f"{name}（{code}）の財務分析結果について：")
+    lines.append("")
+    lines.append("### 財務健全性について")
+    lines.append("")
+    if piot_score < 5:
+        lines.append(f"Piotroskiスコアは{piot_score}/9点と「{piot_eval}」の評価ですが、これは以下の理由による可能性があります：")
+        lines.append("")
+        lines.append("1. **既に健全な財務状態**: 有利子負債比率が低く、現金超過状態など、")
+        lines.append("   既に健全な財務状態のため、前年比での改善ポイントが少ない")
+        lines.append("2. **前年比較ベースの評価**: Piotroskiスコアは改善傾向を評価するため、")
+        lines.append("   既に健全な企業はスコアが低くなる傾向がある")
+        lines.append("3. **絶対的な財務健全性の確認が必要**: 有利子負債比率、ネットD/Eレシオ、")
+        lines.append("   流動比率などの絶対指標も併せて評価することが重要です")
+        lines.append("")
+        lines.append("**結論**: 財務健全性については、Piotroskiスコアだけで判断せず、")
+        lines.append("有利子負債比率などの絶対指標も併せて評価することが重要です。")
+    else:
+        lines.append(f"Piotroskiスコアは{piot_score}/9点と良好な評価です。")
+        lines.append("財務健全性の改善傾向が見られます。")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("*本レポートは自動生成された分析結果です。投資判断は自己責任で行ってください。*")
+    lines.append("")
+    
+    # ファイルに出力
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = outdir / f"single_{code}_{ts}_report.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
 def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
-                                   topn: int = 15, details_n: int = 30) -> None:
+                                   topn: int = 15, details_n: int = 30, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty: return
     ranked = _build_ranked(ok)
@@ -1521,8 +1820,9 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append("")
 
     outdir.mkdir(exist_ok=True)
-    (outdir / "ranked_with_scores.csv").write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
-    (outdir / "report_investment_advice.md").write_text("\n".join(lines), encoding="utf-8")
+    suffix = f"_{timestamp}" if timestamp else ""
+    (outdir / f"ranked_with_scores{suffix}.csv").write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
+    (outdir / f"report_investment_advice{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
 
 def build_offline_analysis_tasks(session: requests.Session) -> list[tuple[str, str, str, str | None]]:
     """
@@ -1718,9 +2018,10 @@ def run_interactive():
         print("1) 収集（価格+財務を凍結保存）")
         print("2) オフライン一括分析（トップ10出力）")
         print("3) 単銘柄分析（キャッシュ使用）")
+        print("4) セクター平均を更新（キャッシュから計算）")
         print("5) 全銘柄ゆっくり収集（自動待機・再開可）")
         print("6) 鮮度で取り直し収集（例: 7日より古いものだけ）")
-        print("7) 全銘柄“強制”再収集（pending初期化＋当日再取得）")
+        print("7) 全銘柄「強制」再収集（pending初期化＋当日再取得）")
         print("q) 終了")
         choice = input("選択: ").strip().lower()
 
@@ -1750,13 +2051,21 @@ def run_interactive():
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             outfile = outdir / f"screening_offline_{ts}.csv"
             flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-            write_reports(flat, outdir, topn=10)
-            write_markdown_report(flat, outdir, topn=10)
+            write_reports(flat, outdir, topn=10, timestamp=ts)
+            write_markdown_report(flat, outdir, topn=10, timestamp=ts)
             try:
-                write_investment_advice_report(flat, outdir, topn=15)
+                write_investment_advice_report(flat, outdir, topn=15, timestamp=ts)
             except Exception:
                 pass
             print(f"[OK] 出力: {outfile}")
+            print(f"[OK] ランキング・レポート出力完了（タイムスタンプ: {ts}）")
+            print(f"  - top_recommended_{ts}.csv")
+            print(f"  - top_safety_{ts}.csv")
+            print(f"  - top_speculative_{ts}.csv")
+            print(f"  - top_piotroski_{ts}.csv")
+            print(f"  - ranked_with_scores_{ts}.csv")
+            print(f"  - report_top10_{ts}.md")
+            print(f"  - report_investment_advice_{ts}.md")
         elif choice == "3":
             code = input("銘柄コード4桁: ").strip()
             name = lookup_company_name(session, code)
@@ -1765,7 +2074,39 @@ def run_interactive():
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             fp = outdir / f"single_{code}_{ts}.csv"
             df.to_csv(fp, index=False, encoding="utf-8-sig")
-            print(f"[OK] 出力: {fp}")
+            print(f"[OK] CSV出力: {fp}")
+            # 詳細レポートも生成
+            report_path = write_single_stock_report(res, outdir)
+            if report_path:
+                print(f"[OK] レポート出力: {report_path}")
+        elif choice == "4":
+            print("[更新] セクター平均をキャッシュから計算中...")
+            sector_avgs_obj = DynamicSectorAverages(session)
+            updated_avgs = sector_avgs_obj.calculate_sector_averages_from_cache()
+            if updated_avgs:
+                # キャッシュを更新
+                cache_file = CACHE_DIR / "sector_averages.json"
+                sectors = ['自動車','半導体','エレクトロニクス','銀行','通信','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+                data = {}
+                for sector in sectors:
+                    if sector in updated_avgs:
+                        data[sector] = updated_avgs[sector]
+                    else:
+                        data[sector] = sector_avgs_obj.get_default_sector_average(sector)
+                cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
+                sector_avgs_obj.sector_cache = data
+                sector_avgs_obj.cache_timestamp = time.time()
+                sector_avgs = data
+                print(f"[OK] セクター平均を更新しました（{len(updated_avgs)}セクター）")
+                for sector, stats in updated_avgs.items():
+                    ps_val = stats.get('ps', None)
+                    peg_val = stats.get('peg', None)
+                    sample_count = stats.get('sample_count', 0)
+                    ps_str = f"{ps_val:.2f}" if ps_val is not None else "N/A"
+                    peg_str = f"{peg_val:.2f}" if peg_val is not None else "N/A"
+                    print(f"  {sector}: PS={ps_str}, PEG={peg_str}, サンプル数={sample_count}")
+            else:
+                print("[警告] セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。")
         elif choice == "5":
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
@@ -1835,7 +2176,11 @@ def main():
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fp = outdir / f"single_{args.code}_{ts}.csv"
         df.to_csv(fp, index=False, encoding="utf-8-sig")
-        print(f"[OK] 単銘柄出力: {fp}")
+        print(f"[OK] CSV出力: {fp}")
+        # 詳細レポートも生成
+        report_path = write_single_stock_report(res, outdir)
+        if report_path:
+            print(f"[OK] レポート出力: {report_path}")
         return
 
     if args.phase == "analyze":
@@ -1867,13 +2212,21 @@ def main():
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         outfile = outdir / f"screening_offline_{ts}.csv"
         flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-        write_reports(flat, outdir, topn=max(10, args.top))
-        write_markdown_report(flat, outdir, topn=max(10, args.top))
+        write_reports(flat, outdir, topn=max(10, args.top), timestamp=ts)
+        write_markdown_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
         try:
-            write_investment_advice_report(flat, outdir, topn=max(10, args.top))
+            write_investment_advice_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
         except Exception:
             pass
         print(f"[OK] オフライン分析出力: {outfile}")
+        print(f"[OK] ランキング・レポート出力完了（タイムスタンプ: {ts}）")
+        print(f"  - top_recommended_{ts}.csv")
+        print(f"  - top_safety_{ts}.csv")
+        print(f"  - top_speculative_{ts}.csv")
+        print(f"  - top_piotroski_{ts}.csv")
+        print(f"  - ranked_with_scores_{ts}.csv")
+        print(f"  - report_top10_{ts}.md")
+        print(f"  - report_investment_advice_{ts}.md")
 
 
 
