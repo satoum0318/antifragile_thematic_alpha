@@ -47,6 +47,7 @@ JQUANTS_API_BASE = "https://api.jquants.com/v1"
 CACHE_DIR = Path(".jquants_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 LOOKBACK_DAYS = 700
+REPORTS_DIR = Path("output") / "reports"
 
 # ヘルパ（先頭のimport群の下あたり）
 def seconds_until_next_day(buffer_sec: int = 10) -> int:
@@ -805,6 +806,224 @@ def calculate_volatility(prices: pd.Series, period: int = 20) -> Tuple[Optional[
 
 
 # ------------------------------------------------------------
+# 長期投資向け: 最大DD / 売上CAGR / 安全基準
+# ------------------------------------------------------------
+def calculate_max_drawdown(prices: pd.Series, lookback_days: Optional[int] = None) -> Optional[float]:
+    """
+    価格履歴から最大下落幅（最大ドローダウン）を計算する。
+    Returns: 最大下落幅（負の値）。例: -0.5 は50%下落。
+    """
+    if prices is None or len(prices) < 2:
+        return None
+    try:
+        prices_series = prices.copy()
+        if lookback_days is not None:
+            prices_series = prices_series.head(lookback_days)
+        if len(prices_series) < 2:
+            return None
+        # 時系列を古い順に並べる（累積最大値計算のため）
+        if prices_series.index.dtype == "datetime64[ns]" or isinstance(prices_series.index[0], (datetime.datetime, pd.Timestamp)):
+            prices_sorted = prices_series.sort_index()
+        else:
+            prices_sorted = prices_series.iloc[::-1].reset_index(drop=True)
+        cumulative_max = prices_sorted.expanding().max()
+        drawdowns = (prices_sorted - cumulative_max) / cumulative_max
+        max_dd = float(drawdowns.min())
+        return max_dd if np.isfinite(max_dd) else None
+    except Exception:
+        return None
+
+
+def _pick_numeric_field(record: dict, keys: List[str]) -> Optional[float]:
+    for key in keys:
+        if key in record and record[key] not in (None, "", "NA"):
+            try:
+                return float(record[key])
+            except Exception:
+                continue
+    return None
+
+
+def _fiscal_year_from_statement(record: dict) -> int:
+    for ky in ("fiscalYear", "FiscalYear", "period", "CurrentFiscalYearEndDate", "DisclosedDate"):
+        value = str(record.get(ky) or "")
+        match = re.findall(r"\d{4}", value)
+        if match:
+            return int(match[0])
+    return -1
+
+
+def build_financial_history_from_statements(stmts: List[dict], max_years: int = 5) -> List[dict]:
+    """
+    財務諸表リストから最大 max_years 件の整形済み辞書を生成する（新しい年度順）。
+    """
+    if not stmts:
+        return []
+    sorted_stmts = sorted(stmts, key=_fiscal_year_from_statement, reverse=True)
+    history: list[dict] = []
+    for stmt in sorted_stmts:
+        rec = {
+            "fiscal_year": _fiscal_year_from_statement(stmt),
+            "revenue": _pick_numeric_field(stmt, ["NetSales", "Revenue", "OperatingRevenue"]),
+            "operating_income": _pick_numeric_field(stmt, ["OperatingIncome", "OperatingIncomeLoss", "OperatingProfit"]),
+            "net_income": _pick_numeric_field(stmt, ["NetIncomeLoss", "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome"]),
+            "operating_cash_flow": _pick_numeric_field(stmt, ["NetCashProvidedByUsedInOperatingActivities", "CashFlowsFromOperatingActivities"]),
+            "total_assets": _pick_numeric_field(stmt, ["TotalAssets"]),
+            "equity": _pick_numeric_field(stmt, ["EquityAttributableToOwnersOfParent", "Equity", "NetAssets"]),
+            "current_assets": _pick_numeric_field(stmt, ["CurrentAssets"]),
+            "current_liabilities": _pick_numeric_field(stmt, ["CurrentLiabilities"]),
+            "gross_profit_margin": None,
+            "shares_outstanding": _pick_numeric_field(
+                stmt,
+                [
+                    "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+                    "NumberOfIssuedAndOutstandingShares",
+                ],
+            ),
+        }
+        cash_and_equivalents = _pick_numeric_field(
+            stmt,
+            [
+                "CashAndCashEquivalents",
+                "CashAndCashEquivalentsAtEndOfPeriod",
+                "Cash",
+                "CashEquivalents",
+                "CashAndDeposits",
+            ],
+        )
+        if cash_and_equivalents is None:
+            cash_and_equivalents = rec["current_assets"]
+        rec["cash_and_equivalents"] = cash_and_equivalents
+
+        if rec["total_assets"] is not None and rec["total_assets"] > 0 and rec["equity"] is not None:
+            rec["equity_ratio"] = rec["equity"] / rec["total_assets"]
+        else:
+            rec["equity_ratio"] = None
+
+        gross_profit = _pick_numeric_field(stmt, ["GrossProfit"])
+        if rec["revenue"] and gross_profit and rec["revenue"] != 0:
+            rec["gross_profit_margin"] = gross_profit / rec["revenue"]
+
+        history.append(rec)
+        if len(history) >= max_years:
+            break
+    return history
+
+
+def compute_sales_cagr(history: List[dict], years: int = 3) -> Optional[float]:
+    revenues = [rec.get("revenue") for rec in history if rec.get("revenue")]
+    if len(revenues) <= years:
+        return None
+    latest = revenues[0]
+    past = revenues[years]
+    if not past or past <= 0 or not latest or latest <= 0:
+        return None
+    try:
+        return (latest / past) ** (1 / years) - 1
+    except (ZeroDivisionError, OverflowError):
+        return None
+
+
+def calculate_safety_criteria_v1(
+    ps_ratio: Optional[float],
+    cash_and_equivalents: Optional[float],
+    market_cap: Optional[float],
+    operating_cash_flow: Optional[float],
+    equity_ratio: Optional[float],
+    sales_cagr: Optional[float],
+    max_drawdown: Optional[float],
+) -> dict:
+    """
+    安全・長期投資向けの基準を評価する（必須条件: PS<1, OCF>0, 自己資本比率>=50%, 異常DDなし）。
+    """
+    criteria = {
+        "ps_under_1": False,
+        "cash_rich": False,
+        "positive_ocf": False,
+        "equity_ratio_50plus": False,
+        "equity_ratio_70plus": False,
+        "growth_potential": False,
+        "no_speculative_drop": False,
+    }
+    scores: dict[str, float] = {}
+    total_score = 0.0
+    max_score = 100.0
+
+    if ps_ratio is not None and ps_ratio < 1.0:
+        criteria["ps_under_1"] = True
+        scores["ps_under_1"] = 25.0
+        total_score += 25.0
+    else:
+        scores["ps_under_1"] = 0.0
+
+    if (cash_and_equivalents is not None and market_cap is not None and market_cap > 0 and cash_and_equivalents > market_cap):
+        criteria["cash_rich"] = True
+        scores["cash_rich"] = 20.0
+        total_score += 20.0
+    else:
+        scores["cash_rich"] = 0.0
+
+    if operating_cash_flow is not None and operating_cash_flow > 0:
+        criteria["positive_ocf"] = True
+        scores["positive_ocf"] = 20.0
+        total_score += 20.0
+    else:
+        scores["positive_ocf"] = 0.0
+
+    if equity_ratio is not None and equity_ratio >= 0.5:
+        criteria["equity_ratio_50plus"] = True
+        scores["equity_ratio_50plus"] = 15.0
+        total_score += 15.0
+    else:
+        scores["equity_ratio_50plus"] = 0.0
+
+    if equity_ratio is not None and equity_ratio >= 0.7:
+        criteria["equity_ratio_70plus"] = True
+        scores["equity_ratio_70plus"] = 10.0
+        total_score += 10.0
+    else:
+        scores["equity_ratio_70plus"] = 0.0
+
+    if sales_cagr is not None and sales_cagr > 0:
+        criteria["growth_potential"] = True
+        scores["growth_potential"] = 5.0
+        total_score += 5.0
+    else:
+        scores["growth_potential"] = 0.0
+
+    if max_drawdown is not None:
+        if max_drawdown > -0.8:
+            criteria["no_speculative_drop"] = True
+            scores["no_speculative_drop"] = 5.0
+            total_score += 5.0
+        else:
+            scores["no_speculative_drop"] = 0.0
+    else:
+        scores["no_speculative_drop"] = 2.5
+        total_score += 2.5
+
+    required_conditions_met = (
+        criteria["ps_under_1"] and
+        criteria["positive_ocf"] and
+        criteria["equity_ratio_50plus"] and
+        criteria["no_speculative_drop"]
+    )
+
+    return {
+        "criteria": criteria,
+        "scores": scores,
+        "total_score": round(total_score, 1),
+        "max_score": max_score,
+        "required_conditions_met": required_conditions_met,
+        "ps_ratio": ps_ratio,
+        "cash_and_equivalents": cash_and_equivalents,
+        "equity_ratio": equity_ratio,
+        "sales_cagr": sales_cagr,
+        "max_drawdown": max_drawdown,
+    }
+
+
+# ------------------------------------------------------------
 # Piotroski（実データのみ）
 # ------------------------------------------------------------
 def calculate_piotroski_real(fin: dict) -> dict:
@@ -1070,52 +1289,9 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             stmts = fc.load_statements(code)
         else:
             stmts = fdm.fetch_statements(code)
-
-        def _pick_num(d: dict, keys: List[str]):
-            for k in keys:
-                if k in d and d[k] not in (None, "", "NA"):
-                    try:
-                        return float(d[k])
-                    except Exception:
-                        continue
-            return None
-
-        def _year_key(d):
-            for ky in ("fiscalYear","FiscalYear","period","CurrentFiscalYearEndDate","DisclosedDate"):
-                s = str(d.get(ky) or "")
-                m = re.findall(r"\d{4}", s)
-                if m:
-                    return int(m[0])
-            return -1
-
-        cur_fin = {}; prv_fin = {}
-        if isinstance(stmts, list) and len(stmts) > 0:
-            stmts_sorted = sorted(stmts, key=_year_key, reverse=True)
-            cur_stmt = stmts_sorted[0]
-            prv_stmt = None
-            for x in stmts_sorted[1:]:
-                if _year_key(x) != _year_key(cur_stmt):
-                    prv_stmt = x; break
-
-            def _fill_from(src: dict):
-                d = {}
-                d["net_income"] = _pick_num(src, ["NetIncomeLoss","Profit","ProfitAttributableToOwnersOfParent","NetIncome"])
-                d["operating_cash_flow"] = _pick_num(src, ["NetCashProvidedByUsedInOperatingActivities","CashFlowsFromOperatingActivities"])
-                d["revenue"] = _pick_num(src, ["NetSales","Revenue","OperatingRevenue"])
-                d["total_assets"] = _pick_num(src, ["TotalAssets"])
-                d["equity"] = _pick_num(src, ["EquityAttributableToOwnersOfParent","Equity","NetAssets"])
-                d["current_assets"] = _pick_num(src, ["CurrentAssets"])
-                d["current_liabilities"] = _pick_num(src, ["CurrentLiabilities"])
-                gross = _pick_num(src, ["GrossProfit"])
-                sales = _pick_num(src, ["NetSales","Revenue"])
-                d["gross_profit_margin"] = (gross / sales) if (gross and sales and sales>0) else None
-                d["shares_outstanding"] = _pick_num(src, [
-                    "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
-                    "NumberOfIssuedAndOutstandingShares"])
-                return d
-
-            if cur_stmt: cur_fin = _fill_from(cur_stmt)
-            if prv_stmt: prv_fin = _fill_from(prv_stmt)
+        financial_history = build_financial_history_from_statements(stmts if isinstance(stmts, list) else [], max_years=5)
+        cur_fin = financial_history[0].copy() if financial_history else {}
+        prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
 
         fin = {"current": cur_fin, "previous": prv_fin, "current_price": current_price, "sector": sector}
         fin = fdm._fill_missing_fields(fin)
@@ -1143,6 +1319,31 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             current_price=current_price, mas=mas, stock_code=code
         )
 
+        shares_outstanding = fin["current"].get("shares_outstanding")
+        market_cap = None
+        if current_price is not None and shares_outstanding not in (None, 0):
+            market_cap = current_price * shares_outstanding
+
+        max_dd = calculate_max_drawdown(close, lookback_days=LOOKBACK_DAYS) if len(close) > 0 else None
+        sales_cagr = compute_sales_cagr(financial_history, years=3) if financial_history else None
+        cash_eq = fin["current"].get("cash_and_equivalents")
+        equity_ratio = fin["current"].get("equity_ratio")
+        if equity_ratio is None:
+            ta = fin["current"].get("total_assets")
+            eq = fin["current"].get("equity")
+            if ta not in (None, 0) and eq is not None:
+                equity_ratio = eq / ta
+
+        safety_criteria = calculate_safety_criteria_v1(
+            ps_ratio=val.get("ps_ratio"),
+            cash_and_equivalents=cash_eq,
+            market_cap=market_cap,
+            operating_cash_flow=fin["current"].get("operating_cash_flow"),
+            equity_ratio=equity_ratio,
+            sales_cagr=sales_cagr,
+            max_drawdown=max_dd,
+        )
+
         return {
             "stock_code": code, "company_name": name, "sector_name": sector,
             "current_price": current_price, "mas": mas, "rsi": rsi, "adx": adx,
@@ -1152,7 +1353,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "piotroski": piot,
             "ps_ratio": val.get("ps_ratio"), "peg_ratio": val.get("peg_ratio"), "per": val.get("per"),
             "revenue_per_share": val.get("revenue_per_share"),
-            "safety": safety, "speculation": spec, "success": True
+            "safety": safety, "speculation": spec, "success": True,
+            "avg_volume_30d": avg_volume,
+            "financial_history": financial_history,
+            "market_cap": market_cap,
+            "shares_outstanding": shares_outstanding,
+            "max_drawdown": max_dd,
+            "sales_cagr": sales_cagr,
+            "safety_criteria": safety_criteria,
         }
     except Exception as e:
         return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
@@ -1194,19 +1402,23 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
 # ------------------------------------------------------------
 # レポート出力
 # ------------------------------------------------------------
-def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> None:
+def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
         return
-    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx"]:
+    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score"]:
         ok[c] = pd.to_numeric(ok[c], errors="coerce")
+    suffix = f"_{timestamp}" if timestamp else ""
     rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
-    rec.to_csv(outdir / "top_recommended.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / "top_safety.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / "top_speculative.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / "top_piotroski.csv", index=False, encoding="utf-8-sig")
+    rec.to_csv(outdir / f"top_recommended{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_safety{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / f"top_speculative{suffix}.csv", index=False, encoding="utf-8-sig")
+    ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_piotroski{suffix}.csv", index=False, encoding="utf-8-sig")
+    # 長期向けスコア（条件ベース）
+    if "safety_criteria_score" in ok.columns:
+        ok.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(outdir / f"top_safe_long_term{suffix}.csv", index=False, encoding="utf-8-sig")
 
-def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> None:
+def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty: return
     ok["safety"] = pd.to_numeric(ok["safety"], errors="coerce")
@@ -1214,9 +1426,13 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10) -> N
     ok["spec_score"] = pd.to_numeric(ok["spec_score"], errors="coerce")
     rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
     lines = ["# おすすめトップテン", ""]
+    if timestamp:
+        lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
+        lines.append("")
     for _, r in rec.iterrows():
         lines.append(f"- **{r['code']} {r['name']}** | 安全 {r['safety']} | Pio {r['piot']} | 仕手 {r['spec_score']} | PER {r['per']} | PEG {r['peg']} | PS {r['ps']}")
-    (outdir / "report_top10.md").write_text("\n".join(lines), encoding="utf-8")
+    suffix = f"_{timestamp}" if timestamp else ""
+    (outdir / f"report_top10{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
 
 # ==== 投資助言レポート生成 ====
 
@@ -1299,7 +1515,7 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
-                                   topn: int = 15, details_n: int = 30) -> None:
+                                   topn: int = 15, details_n: int = 30, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty: return
     ranked = _build_ranked(ok)
@@ -1334,6 +1550,30 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append(f"  - B: {grade_counts['B']}銘柄")
     lines.append(f"  - C: {grade_counts['C']}銘柄")
     lines.append("")
+    # 長期向け（条件ベース）ランキング
+    if "safety_criteria_score" in ok.columns:
+        ok_lt = ok.copy()
+        ok_lt["safety_criteria_score"] = pd.to_numeric(ok_lt["safety_criteria_score"], errors="coerce")
+        lt = ok_lt.sort_values("safety_criteria_score", ascending=False).head(topn)
+        lines.append(f"## 🧱 長期投資向け 安全基準Top{topn}（条件ベース）")
+        lines.append("")
+        lines.append("| 順位 | 銘柄コード | 銘柄名 | セクター | 基準スコア | PS<1 | OCF+ | 自己資本>=50% | DD正常 | 売上CAGR |")
+        lines.append("|------|------------|--------|----------|-----------:|:----:|:---:|:-------------:|:------:|---------:|")
+        for i, r in enumerate(lt.itertuples(index=False), 1):
+            cagr = getattr(r, "sales_cagr", None)
+            cagr_str = f"{cagr:.2%}" if (cagr is not None and np.isfinite(cagr)) else "N/A"
+            score = getattr(r, "safety_criteria_score", None)
+            score_str = f"{score:.1f}" if (score is not None and np.isfinite(score)) else "N/A"
+            lines.append(
+                f"| {i} | {getattr(r,'code','')} | {getattr(r,'name','')} | {getattr(r,'sector','')} | {score_str} | "
+                f"{'✅' if getattr(r,'ps_under_1', False) else '—'} | "
+                f"{'✅' if getattr(r,'positive_ocf', False) else '—'} | "
+                f"{'✅' if getattr(r,'equity_ratio_50plus', False) else '—'} | "
+                f"{'✅' if getattr(r,'no_speculative_drop', False) else '—'} | "
+                f"{cagr_str} |"
+            )
+        lines.append("")
+
     lines.append("## 💰 バリュエーション分析")
     lines.append("")
     lines.append("### PSレシオ（セクター比）")
@@ -1371,9 +1611,10 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append(f"- 仕手株ペナルティ: {r.spec_penalty:.1f}点")
         lines.append("")
 
-    outdir.mkdir(exist_ok=True)
-    (outdir / "ranked_with_scores.csv").write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
-    (outdir / "report_investment_advice.md").write_text("\n".join(lines), encoding="utf-8")
+    outdir.mkdir(exist_ok=True, parents=True)
+    suffix = f"_{timestamp}" if timestamp else ""
+    (outdir / f"ranked_with_scores{suffix}.csv").write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
+    (outdir / f"report_investment_advice{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
 
 def build_offline_analysis_tasks(session: requests.Session) -> list[tuple[str, str, str, str | None]]:
     """
@@ -1420,6 +1661,8 @@ def lookup_company_name(session: requests.Session, code: str) -> str:
 # ------------------------------------------------------------
 def _flatten_result(d: dict) -> dict:
     pio = d.get("piotroski") or {}; saf = d.get("safety") or {}; spc = d.get("speculation") or {}
+    safety_criteria = d.get("safety_criteria") or {}
+    criteria = safety_criteria.get("criteria", {}) if isinstance(safety_criteria, dict) else {}
     return {
         "code": d.get("stock_code"), "name": d.get("company_name"), "sector": d.get("sector_name"),
         "price": d.get("current_price"), "ps": d.get("ps_ratio"), "peg": d.get("peg_ratio"), "per": d.get("per"),
@@ -1427,6 +1670,19 @@ def _flatten_result(d: dict) -> dict:
         "piot": pio.get("score"), "piot_eval": pio.get("evaluation"),
         "safety": saf.get("total_score"), "safety_level": saf.get("safety_level"),
         "spec_score": spc.get("score"), "spec_level": spc.get("level"),
+        "safety_criteria_score": safety_criteria.get("total_score") if isinstance(safety_criteria, dict) else None,
+        "ps_under_1": criteria.get("ps_under_1", False),
+        "cash_rich": criteria.get("cash_rich", False),
+        "positive_ocf": criteria.get("positive_ocf", False),
+        "equity_ratio_50plus": criteria.get("equity_ratio_50plus", False),
+        "equity_ratio_70plus": criteria.get("equity_ratio_70plus", False),
+        "growth_potential": criteria.get("growth_potential", False),
+        "no_speculative_drop": criteria.get("no_speculative_drop", False),
+        "equity_ratio": safety_criteria.get("equity_ratio") if isinstance(safety_criteria, dict) else None,
+        "max_drawdown": safety_criteria.get("max_drawdown") if isinstance(safety_criteria, dict) else None,
+        "sales_cagr": safety_criteria.get("sales_cagr") if isinstance(safety_criteria, dict) else None,
+        "market_cap": d.get("market_cap"),
+        "avg_volume_30d": d.get("avg_volume_30d"),
         "ok": d.get("success"), "error": d.get("error"),
     }
 
@@ -1434,7 +1690,8 @@ def _flatten_result(d: dict) -> dict:
 def run_interactive():
     session = get_authenticated_session_jquants()
     sector_avgs = DynamicSectorAverages(session).get_sector_averages()
-    outdir = Path("output"); outdir.mkdir(exist_ok=True)
+    outdir = REPORTS_DIR
+    outdir.mkdir(exist_ok=True, parents=True)
 
     while True:
         print("=== メニュー ===")
@@ -1474,13 +1731,32 @@ def run_interactive():
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             outfile = outdir / f"screening_offline_{ts}.csv"
             flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-            write_reports(flat, outdir, topn=10)
-            write_markdown_report(flat, outdir, topn=10)
             try:
-                write_investment_advice_report(flat, outdir, topn=15)
-            except Exception:
-                pass
+                write_reports(flat, outdir, topn=10, timestamp=ts)
+                write_markdown_report(flat, outdir, topn=10, timestamp=ts)
+                write_investment_advice_report(flat, outdir, topn=15, timestamp=ts)
+            except Exception as e:
+                logger.exception("レポート生成で例外: %s", e)
+                print(f"⚠️ レポート生成でエラー: {e}")
             print(f"✅ 出力: {outfile}")
+            print(f"✅ 出力先: {outdir}")
+            expected = [
+                f"top_recommended_{ts}.csv",
+                f"top_safety_{ts}.csv",
+                f"top_speculative_{ts}.csv",
+                f"top_piotroski_{ts}.csv",
+                f"top_safe_long_term_{ts}.csv",
+                f"ranked_with_scores_{ts}.csv",
+                f"report_top10_{ts}.md",
+                f"report_investment_advice_{ts}.md",
+            ]
+            print("=== 生成物 ===")
+            for fn in expected:
+                p = outdir / fn
+                if p.exists():
+                    print(f"  - {p}")
+                else:
+                    print(f"  - (missing) {p}")
         elif choice == "3":
             code = input("銘柄コード4桁: ").strip()
             name = lookup_company_name(session, code)
@@ -1559,7 +1835,8 @@ def main():
 
     session = get_authenticated_session_jquants()
     sector_avgs = DynamicSectorAverages(session).get_sector_averages()
-    outdir = Path("output"); outdir.mkdir(exist_ok=True)
+    outdir = REPORTS_DIR
+    outdir.mkdir(exist_ok=True, parents=True)
 
     if args.phase == "collect_all":
         collect_all_daemon(session,
@@ -1608,13 +1885,15 @@ def main():
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         outfile = outdir / f"screening_offline_{ts}.csv"
         flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-        write_reports(flat, outdir, topn=max(10, args.top))
-        write_markdown_report(flat, outdir, topn=max(10, args.top))
         try:
-            write_investment_advice_report(flat, outdir, topn=max(10, args.top))
-        except Exception:
-            pass
+            write_reports(flat, outdir, topn=max(10, args.top), timestamp=ts)
+            write_markdown_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
+            write_investment_advice_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
+        except Exception as e:
+            logger.exception("レポート生成で例外: %s", e)
+            print(f"⚠️ レポート生成でエラー: {e}")
         print(f"✅ オフライン分析出力: {outfile}")
+        print(f"✅ 出力先: {outdir}")
 
 
 
