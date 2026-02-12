@@ -883,6 +883,51 @@ def calculate_volatility(prices: pd.Series, period: int = 20) -> Tuple[Optional[
     avg = returns.std() * np.sqrt(252)
     return float(cur), float(avg)
 
+def calculate_max_drawdown(prices: pd.Series, lookback_days: Optional[int] = None) -> Optional[float]:
+    """
+    価格履歴から最大下落幅（最大ドローダウン）を計算する。
+    
+    Args:
+        prices: 価格の時系列データ（時系列順、古い順または新しい順どちらでも可）
+        lookback_days: 過去何日分を見るか（Noneの場合は全期間）
+    
+    Returns:
+        最大下落幅（パーセンテージ、負の値）。例: -0.5 は50%下落を意味する。
+        仕手株の可能性がある異常な下落を検出するために使用。
+    """
+    if prices is None or len(prices) < 2:
+        return None
+    
+    try:
+        prices_series = prices.copy()
+        if lookback_days is not None:
+            prices_series = prices_series.head(lookback_days)
+        
+        if len(prices_series) < 2:
+            return None
+        
+        # 時系列を古い順に並び替え（累積最大値を計算するため）
+        # インデックスが日付の場合は時系列順に、そうでない場合はそのまま
+        if prices_series.index.dtype == 'datetime64[ns]' or isinstance(prices_series.index[0], (datetime.datetime, pd.Timestamp)):
+            prices_sorted = prices_series.sort_index()
+        else:
+            # インデックスが数値の場合は、時系列が新しい順（最後が最新）と仮定
+            # 古い順に並び替える
+            prices_sorted = prices_series.iloc[::-1].reset_index(drop=True)
+        
+        # 累積最大値を計算
+        cumulative_max = prices_sorted.expanding().max()
+        
+        # 各時点での下落率を計算
+        drawdowns = (prices_sorted - cumulative_max) / cumulative_max
+        
+        # 最大下落幅を取得（最も負の値）
+        max_dd = float(drawdowns.min())
+        
+        return max_dd if np.isfinite(max_dd) else None
+    except Exception:
+        return None
+
 
 # ------------------------------------------------------------
 # Piotroski（実データのみ）
@@ -1074,6 +1119,28 @@ def build_financial_history_from_statements(stmts: List[dict], max_years: int = 
                 ],
             ),
         }
+        # 現金及び現金同等物の抽出（複数のフィールド名を試行）
+        cash_and_equivalents = _pick_numeric_field(
+            stmt,
+            [
+                "CashAndCashEquivalents",
+                "CashAndCashEquivalentsAtEndOfPeriod",
+                "Cash",
+                "CashEquivalents",
+                "CashAndDeposits",
+            ],
+        )
+        # 取得できない場合はcurrent_assetsを代用
+        if cash_and_equivalents is None:
+            cash_and_equivalents = rec["current_assets"]
+        rec["cash_and_equivalents"] = cash_and_equivalents
+        
+        # 自己資本比率の計算
+        if rec["total_assets"] is not None and rec["total_assets"] > 0 and rec["equity"] is not None:
+            rec["equity_ratio"] = rec["equity"] / rec["total_assets"]
+        else:
+            rec["equity_ratio"] = None
+        
         gross_profit = _pick_numeric_field(stmt, ["GrossProfit"])
         if rec["revenue"] and gross_profit and rec["revenue"] != 0:
             rec["gross_profit_margin"] = gross_profit / rec["revenue"]
@@ -1156,6 +1223,128 @@ def compute_policy_stress_score(history: Sequence[dict]) -> int:
 # ------------------------------------------------------------
 # 安全性・投機性
 # ------------------------------------------------------------
+def calculate_safety_criteria_v1(
+    ps_ratio: Optional[float],
+    cash_and_equivalents: Optional[float],
+    market_cap: Optional[float],
+    operating_cash_flow: Optional[float],
+    equity_ratio: Optional[float],
+    sales_cagr: Optional[float],
+    max_drawdown: Optional[float],
+) -> dict:
+    """
+    安全・長期投資向けの新しい基準を評価する。
+    
+    Args:
+        ps_ratio: PSR（時価総額 ÷ 売上高）
+        cash_and_equivalents: 保有キャッシュ（現金及び現金同等物）
+        market_cap: 時価総額
+        operating_cash_flow: 営業キャッシュフロー
+        equity_ratio: 自己資本比率（equity / total_assets）
+        sales_cagr: 売上高CAGR（成長ポテンシャルの指標）
+        max_drawdown: 最大下落幅（負の値、例: -0.5は50%下落）
+    
+    Returns:
+        各条件の合否とスコアを含む辞書
+    """
+    criteria = {
+        "ps_under_1": False,
+        "cash_rich": False,
+        "positive_ocf": False,
+        "equity_ratio_50plus": False,
+        "equity_ratio_70plus": False,
+        "growth_potential": False,
+        "no_speculative_drop": False,
+    }
+    
+    scores = {}
+    total_score = 0.0
+    max_score = 100.0
+    
+    # 1. PSR < 1.0（必須条件、25点）
+    if ps_ratio is not None and ps_ratio < 1.0:
+        criteria["ps_under_1"] = True
+        scores["ps_under_1"] = 25.0
+        total_score += 25.0
+    else:
+        scores["ps_under_1"] = 0.0
+    
+    # 2. キャッシュリッチ（保有キャッシュ > 時価総額）（推奨条件、20点）
+    if (cash_and_equivalents is not None and market_cap is not None and 
+        market_cap > 0 and cash_and_equivalents > market_cap):
+        criteria["cash_rich"] = True
+        scores["cash_rich"] = 20.0
+        total_score += 20.0
+    else:
+        scores["cash_rich"] = 0.0
+    
+    # 3. 営業キャッシュフロー > 0（必須条件、20点）
+    if operating_cash_flow is not None and operating_cash_flow > 0:
+        criteria["positive_ocf"] = True
+        scores["positive_ocf"] = 20.0
+        total_score += 20.0
+    else:
+        scores["positive_ocf"] = 0.0
+    
+    # 4. 自己資本比率 >= 50%（必須条件、15点）
+    if equity_ratio is not None and equity_ratio >= 0.5:
+        criteria["equity_ratio_50plus"] = True
+        scores["equity_ratio_50plus"] = 15.0
+        total_score += 15.0
+    else:
+        scores["equity_ratio_50plus"] = 0.0
+    
+    # 5. 自己資本比率 >= 70%（理想、10点）
+    if equity_ratio is not None and equity_ratio >= 0.7:
+        criteria["equity_ratio_70plus"] = True
+        scores["equity_ratio_70plus"] = 10.0
+        total_score += 10.0
+    else:
+        scores["equity_ratio_70plus"] = 0.0
+    
+    # 6. 成長ポテンシャル（売上高CAGR > 0）（推奨条件、5点）
+    if sales_cagr is not None and sales_cagr > 0:
+        criteria["growth_potential"] = True
+        scores["growth_potential"] = 5.0
+        total_score += 5.0
+    else:
+        scores["growth_potential"] = 0.0
+    
+    # 7. 仕手株除外（最大下落幅が異常でない）（必須条件、5点）
+    # 最大下落幅が-80%以下（80%以上下落）の場合は仕手株の可能性が高い
+    if max_drawdown is not None:
+        if max_drawdown > -0.8:  # -80%より浅い下落
+            criteria["no_speculative_drop"] = True
+            scores["no_speculative_drop"] = 5.0
+            total_score += 5.0
+        else:
+            scores["no_speculative_drop"] = 0.0
+    else:
+        # データがない場合は警告なしでスコアを与える
+        scores["no_speculative_drop"] = 2.5
+        total_score += 2.5
+    
+    # 必須条件のチェック
+    required_conditions_met = (
+        criteria["ps_under_1"] and
+        criteria["positive_ocf"] and
+        criteria["equity_ratio_50plus"] and
+        criteria["no_speculative_drop"]
+    )
+    
+    return {
+        "criteria": criteria,
+        "scores": scores,
+        "total_score": round(total_score, 1),
+        "max_score": max_score,
+        "required_conditions_met": required_conditions_met,
+        "ps_ratio": ps_ratio,
+        "cash_and_equivalents": cash_and_equivalents,
+        "equity_ratio": equity_ratio,
+        "sales_cagr": sales_cagr,
+        "max_drawdown": max_drawdown,
+    }
+
 def calculate_safety_score_v3(
     margin_ratio: float = None,
     short_selling_change_rate: float = None,
@@ -1362,6 +1551,23 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         if current_price is not None and shares_outstanding not in (None, 0):
             market_cap = current_price * shares_outstanding
 
+        # 最大下落幅の計算
+        max_dd = calculate_max_drawdown(close, lookback_days=700) if len(close) > 0 else None
+
+        # 売上高CAGRの計算
+        sales_cagr = compute_sales_cagr(financial_history, years=3) if financial_history else None
+
+        # 新しい安全基準の評価
+        safety_criteria = calculate_safety_criteria_v1(
+            ps_ratio=val.get("ps_ratio"),
+            cash_and_equivalents=cur_fin.get("cash_and_equivalents"),
+            market_cap=market_cap,
+            operating_cash_flow=cur_fin.get("operating_cash_flow"),
+            equity_ratio=cur_fin.get("equity_ratio"),
+            sales_cagr=sales_cagr,
+            max_drawdown=max_dd,
+        )
+
         return {
             "stock_code": code, "company_name": name, "sector_name": sector,
             "current_price": current_price, "mas": mas, "rsi": rsi, "adx": adx,
@@ -1376,6 +1582,9 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "financial_history": financial_history,
             "market_cap": market_cap,
             "shares_outstanding": shares_outstanding,
+            "max_drawdown": max_dd,
+            "sales_cagr": sales_cagr,
+            "safety_criteria": safety_criteria,
         }
     except Exception as e:
         return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
@@ -1421,7 +1630,7 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
         return
-    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx"]:
+    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score"]:
         ok[c] = pd.to_numeric(ok[c], errors="coerce")
     suffix = f"_{timestamp}" if timestamp else ""
     rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
@@ -1429,6 +1638,9 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
     ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_safety{suffix}.csv", index=False, encoding="utf-8-sig")
     ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / f"top_speculative{suffix}.csv", index=False, encoding="utf-8-sig")
     ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_piotroski{suffix}.csv", index=False, encoding="utf-8-sig")
+    # 新しい安全基準でソートしたCSVも追加
+    if "safety_criteria_score" in ok.columns:
+        ok.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(outdir / f"top_safe_long_term{suffix}.csv", index=False, encoding="utf-8-sig")
 
 def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
     ok = flat[flat["ok"] == True].copy()
@@ -1817,6 +2029,35 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append(f"- 財務健全性: {r.financial_score:.1f}点")
         lines.append(f"- テクニカル: {r.technical_score:.1f}点")
         lines.append(f"- 仕手株ペナルティ: {r.spec_penalty:.1f}点")
+        
+        # 新しい安全基準の評価結果を追加
+        if hasattr(r, 'safety_criteria_score') and pd.notna(r.safety_criteria_score):
+            lines.append("")
+            lines.append("**安全・長期投資基準:**")
+            lines.append(f"- 安全基準スコア: {r.safety_criteria_score:.1f}/100点")
+            criteria_status = []
+            if hasattr(r, 'ps_under_1') and r.ps_under_1:
+                criteria_status.append("✅ PSR < 1.0")
+            if hasattr(r, 'cash_rich') and r.cash_rich:
+                criteria_status.append("✅ キャッシュリッチ")
+            if hasattr(r, 'positive_ocf') and r.positive_ocf:
+                criteria_status.append("✅ 営業CFプラス")
+            if hasattr(r, 'equity_ratio_50plus') and r.equity_ratio_50plus:
+                criteria_status.append("✅ 自己資本比率50%以上")
+            if hasattr(r, 'equity_ratio_70plus') and r.equity_ratio_70plus:
+                criteria_status.append("✅ 自己資本比率70%以上（理想）")
+            if hasattr(r, 'growth_potential') and r.growth_potential:
+                criteria_status.append("✅ 成長ポテンシャル")
+            if hasattr(r, 'no_speculative_drop') and r.no_speculative_drop:
+                criteria_status.append("✅ 仕手株除外")
+            if criteria_status:
+                for status in criteria_status:
+                    lines.append(f"  - {status}")
+            if hasattr(r, 'equity_ratio') and pd.notna(r.equity_ratio):
+                lines.append(f"- 自己資本比率: {r.equity_ratio*100:.1f}%")
+            if hasattr(r, 'max_drawdown') and pd.notna(r.max_drawdown):
+                lines.append(f"- 最大下落幅: {r.max_drawdown*100:.1f}%")
+        
         lines.append("")
 
     outdir.mkdir(exist_ok=True)
@@ -1977,6 +2218,120 @@ def screen_aging_dx_alpha(session: requests.Session,
     return ordered
 
 
+def screen_safe_long_term_investment(session: requests.Session,
+                                     sector_averages: Optional[dict] = None,
+                                     *,
+                                     topn: int = 20,
+                                     output_dir: Path = Path("output")) -> pd.DataFrame:
+    """
+    安全・長期投資向けのスクリーニングを実行し、結果DataFrameを返す。
+    
+    必須条件:
+    - PSR < 1.0
+    - 営業キャッシュフロー > 0
+    - 自己資本比率 >= 50%
+    - 仕手株除外（最大下落幅が異常でない）
+    
+    推奨条件（スコアに反映）:
+    - キャッシュリッチ（保有キャッシュ > 時価総額）
+    - 自己資本比率 >= 70%（理想）
+    - 成長ポテンシャル（売上高CAGR > 0）
+    """
+    if sector_averages is None:
+        sector_averages = DynamicSectorAverages(session).get_sector_averages()
+
+    tasks = build_offline_analysis_tasks(session)
+    if not tasks:
+        print("[警告] キャッシュデータが不足しています。先に収集を実行してください。")
+        return pd.DataFrame()
+
+    results: list[dict] = []
+    max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
+    outdir = Path(output_dir)
+    outdir.mkdir(exist_ok=True)
+    
+    print(f"[分析] 安全・長期投資向けスクリーニング開始: {len(tasks)}銘柄を分析中...")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(
+                analyze_single_stock_complete_v3,
+                session, sector_averages, code, name, market, sector,
+                offline=True
+            ) for (code, name, market, sector) in tasks
+        ]
+        for i, fut in enumerate(as_completed(futures), 1):
+            res = fut.result()
+            if not res.get("success"):
+                continue
+            
+            safety_criteria = res.get("safety_criteria")
+            if not safety_criteria:
+                continue
+            
+            # 必須条件をすべて満たす必要がある
+            if not safety_criteria.get("required_conditions_met", False):
+                continue
+            
+            code = res.get("stock_code")
+            name = res.get("company_name", "")
+            sector = res.get("sector_name", "")
+            
+            criteria = safety_criteria.get("criteria", {})
+            scores = safety_criteria.get("scores", {})
+            
+            results.append({
+                "code": code,
+                "name": name,
+                "sector": sector,
+                "ps_ratio": res.get("ps_ratio"),
+                "cash_and_equivalents": safety_criteria.get("cash_and_equivalents"),
+                "market_cap": res.get("market_cap"),
+                "operating_cash_flow": res.get("financial_history", [{}])[0].get("operating_cash_flow") if res.get("financial_history") else None,
+                "equity_ratio": safety_criteria.get("equity_ratio"),
+                "sales_cagr": safety_criteria.get("sales_cagr"),
+                "max_drawdown": safety_criteria.get("max_drawdown"),
+                "safety_criteria_score": safety_criteria.get("total_score", 0),
+                "ps_under_1": criteria.get("ps_under_1", False),
+                "cash_rich": criteria.get("cash_rich", False),
+                "positive_ocf": criteria.get("positive_ocf", False),
+                "equity_ratio_50plus": criteria.get("equity_ratio_50plus", False),
+                "equity_ratio_70plus": criteria.get("equity_ratio_70plus", False),
+                "growth_potential": criteria.get("growth_potential", False),
+                "no_speculative_drop": criteria.get("no_speculative_drop", False),
+                "current_price": res.get("current_price"),
+                "piotroski_score": (res.get("piotroski") or {}).get("score"),
+                "safety_score": (res.get("safety") or {}).get("total_score"),
+            })
+            
+            if i % 100 == 0:
+                print(f"  ⏱ {i}/{len(futures)} 完了 (合格={len(results)})")
+
+    if not results:
+        print("[警告] 安全・長期投資向け条件を満たす銘柄がありませんでした。")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results)
+    df = df.sort_values("safety_criteria_score", ascending=False).head(topn)
+    
+    output_columns = [
+        "code", "name", "sector",
+        "ps_ratio", "cash_and_equivalents", "market_cap", "operating_cash_flow",
+        "equity_ratio", "sales_cagr", "max_drawdown",
+        "safety_criteria_score",
+        "ps_under_1", "cash_rich", "positive_ocf",
+        "equity_ratio_50plus", "equity_ratio_70plus", "growth_potential", "no_speculative_drop",
+        "current_price", "piotroski_score", "safety_score",
+    ]
+    
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = outdir / f"safe_long_term_investment_{ts}.csv"
+    ordered = df[output_columns].copy()
+    ordered.to_csv(outfile, index=False, encoding="utf-8-sig")
+    print(f"[OK] 安全・長期投資向けスクリーニング出力: {outfile} ({len(df)}銘柄)")
+    return ordered
+
+
 def lookup_company_name(session: requests.Session, code: str) -> str:
     """
     単銘柄分析用。コード→CompanyName を株主名簿から解決。
@@ -1997,6 +2352,8 @@ def lookup_company_name(session: requests.Session, code: str) -> str:
 # ------------------------------------------------------------
 def _flatten_result(d: dict) -> dict:
     pio = d.get("piotroski") or {}; saf = d.get("safety") or {}; spc = d.get("speculation") or {}
+    safety_criteria = d.get("safety_criteria") or {}
+    criteria = safety_criteria.get("criteria", {})
     return {
         "code": d.get("stock_code"), "name": d.get("company_name"), "sector": d.get("sector_name"),
         "price": d.get("current_price"), "ps": d.get("ps_ratio"), "peg": d.get("peg_ratio"), "per": d.get("per"),
@@ -2004,6 +2361,17 @@ def _flatten_result(d: dict) -> dict:
         "piot": pio.get("score"), "piot_eval": pio.get("evaluation"),
         "safety": saf.get("total_score"), "safety_level": saf.get("safety_level"),
         "spec_score": spc.get("score"), "spec_level": spc.get("level"),
+        "safety_criteria_score": safety_criteria.get("total_score"),
+        "ps_under_1": criteria.get("ps_under_1", False),
+        "cash_rich": criteria.get("cash_rich", False),
+        "positive_ocf": criteria.get("positive_ocf", False),
+        "equity_ratio_50plus": criteria.get("equity_ratio_50plus", False),
+        "equity_ratio_70plus": criteria.get("equity_ratio_70plus", False),
+        "growth_potential": criteria.get("growth_potential", False),
+        "no_speculative_drop": criteria.get("no_speculative_drop", False),
+        "equity_ratio": safety_criteria.get("equity_ratio"),
+        "max_drawdown": safety_criteria.get("max_drawdown"),
+        "sales_cagr": safety_criteria.get("sales_cagr"),
         "ok": d.get("success"), "error": d.get("error"),
     }
 

@@ -6,32 +6,40 @@ J-Quants 収集→凍結キャッシュ→完全オフライン分析ワーク�
 - 端末対話メニュー付き（引数未指定で起動するとメニュー表示）
 - CLI対応:
     収集:   python script.py --phase collect --budget 380
-    分析:   python script.py --phase analyze --top 10
+    解析:   python script.py --phase analyze --top 10
     単銘柄: python script.py --phase single --code 8035
+    全件:   python script.py --phase collect_all --budget 380
 環境変数:
     JQ_RPM=50  JQ_RPD=800  # 必要なら調整
+
+追加（スクリーニングの「必須」フィルタを実装）
+- 流動性フィルタ: avg_volume_30d >= MIN_AVG_VOLUME_30D かつ market_cap >= MIN_MARKET_CAP_JPY
+- バリュエーション健全性: PS<=MAX_PS_DEFENSIVE を core 条件、PER>MAX_PER_CORE は satellite 扱い
+- 収益安定性（営業利益）: 直近年で赤字を含まない + 直近が急落していない
+
+フィルタは core/satellite/excluded の3分類としてレポート出力にも反映します。
+
 必要: pandas, numpy, requests
 """
+
+from __future__ import annotations
 
 import os
 import re
 import sys
 import json
 import time
-import math
 import signal
 import logging
 import datetime
 import configparser
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import requests
-from math import isfinite
 
 # ------------------------------------------------------------
 # ロギング
@@ -49,126 +57,31 @@ CACHE_DIR.mkdir(exist_ok=True)
 LOOKBACK_DAYS = 700
 REPORTS_DIR = Path("output") / "reports"
 
-# ヘルパ（先頭のimport群の下あたり）
+# ------------------------------------------------------------
+# スクリーニング必須フィルタ（環境変数で上書き可）
+# ------------------------------------------------------------
+MIN_AVG_VOLUME_30D = int(os.getenv("MIN_AVG_VOLUME_30D", "50000"))
+MIN_MARKET_CAP_JPY = int(os.getenv("MIN_MARKET_CAP_JPY", "50000000000"))  # 50B JPY
+MAX_PS_DEFENSIVE = float(os.getenv("MAX_PS_DEFENSIVE", "2.0"))
+MAX_PER_CORE = float(os.getenv("MAX_PER_CORE", "60.0"))
+
+# 収益安定性（営業利益）判定
+OP_INCOME_YEARS = int(os.getenv("OP_INCOME_YEARS", "3"))                # 直近何年見るか（新しい年度順）
+OP_INCOME_DROP_FLOOR = float(os.getenv("OP_INCOME_DROP_FLOOR", "0.3"))  # 直近営業利益が過去年中央値の何倍以上ならOK
+EXCLUDE_OP_INCOME_DEFICIT = (os.getenv("EXCLUDE_OP_INCOME_DEFICIT", "1") != "0")  # 直近年に赤字があれば除外（デフォON）
+
+# ------------------------------------------------------------
+# ヘルパ
+# ------------------------------------------------------------
 def seconds_until_next_day(buffer_sec: int = 10) -> int:
     now = datetime.datetime.now()
     tomorrow = now + datetime.timedelta(days=1)
     reset = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
     return max(1, int((reset - now).total_seconds()) + buffer_sec)
 
-def collect_one_code(session: requests.Session, code: str, name: str = "", *, force_refresh: bool = False) -> bool:
-    fc = FrozenCache()
-    helper = DynamicSectorAverages(session)
-    try:
-        # 価格
-        price_df = helper.load_or_download_data_v2(
-            build_prices_endpoint(code),
-            f"prices_{code}",
-            bypass_cache=force_refresh
-        )
-        if price_df is not None and not price_df.empty:
-            fc.save_prices(code, price_df)
-        # 財務
-        fdm = FinancialDataManager(session)
-        stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
-        if stmts:
-            fc.save_statements(code, stmts)
-        return fc.has_all(code)
-    except RuntimeError as e:
-        if "日次レート制限到達" in str(e):
-            raise
-        return False
-    except Exception:
-        return False
-
-
-PENDING_FILE = CACHE_DIR / "pending_codes.json"
-
-def _load_pending(df: pd.DataFrame, *, force_full: bool = False, refresh_days: Optional[int] = None) -> list[str]:
-    fc = FrozenCache()
-    # 明示指定があれば優先
-    if force_full:
-        codes = [str(c) for c in df["Code"].astype(str)]
-        _save_pending(codes)
-        return codes
-    if refresh_days is not None:
-        codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c), max_age_days=refresh_days)]
-        _save_pending(codes)
-        return codes
-    # 既存pendingがあれば継続
-    if PENDING_FILE.exists():
-        try:
-            return json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
-        except Exception:
-            pass
-    # 通常初期化（未取得のみ）
-    codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
-    _save_pending(codes)
-    return codes
-
-
-def _save_pending(codes: list[str]) -> None:
-    PENDING_FILE.write_text(json.dumps({"codes": codes}, ensure_ascii=False), encoding="utf-8")
-
-def collect_all_daemon(session: requests.Session,
-                       daily_budget: Optional[int] = None,
-                       refresh_days: Optional[int] = None,
-                       force_full: bool = False,
-                       reset_pending: bool = False) -> None:
-    fdm = FinancialDataManager(session)
-    df = fdm.get_stock_list_v2(force_refresh=False)
-    df = df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName","")))[0], axis=1)].reset_index(drop=True)
-
-    # pending 初期化オプション
-    if reset_pending and PENDING_FILE.exists():
-        try:
-            PENDING_FILE.unlink()
-        except Exception:
-            pass
-
-    pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days)
-    if not pending:
-        print("📦 すでに全件取得済み"); return
-
-    # 1銘柄=価格+財務で概ね2リク。日次800→余裕をみて 380/日
-    if daily_budget is None:
-        rpd = int(os.getenv("JQ_RPD", "800"))
-        daily_budget = max(1, min(len(pending), rpd // 2 - 5))
-
-    mode = "強制再収集" if force_full else (f"{refresh_days}日超のみ再収集" if refresh_days is not None else "未取得のみ")
-    print(f"▶ 全自動収集開始  残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}")
-
-    while pending:
-        taken = 0
-        start = time.time()
-        try:
-            for code in list(pending):
-                if taken >= daily_budget:
-                    break
-                ok = collect_one_code(session, code, force_refresh=(force_full or refresh_days is not None))
-                if ok:
-                    pending.remove(code)
-                    _save_pending(pending)
-                taken += 1
-                if taken % 20 == 0 or taken == daily_budget:
-                    elapsed = time.time() - start
-                    print(f"  ⏱ 本日 {taken}/{daily_budget} 件  残り{len(pending)}  経過{int(elapsed)}s", flush=True)
-        except RuntimeError as e:
-            if "日次レート制限到達" in str(e):
-                pass
-            else:
-                raise
-
-        print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件")
-        if not pending:
-            print("✅ 全銘柄の凍結収集が完了"); break
-
-        wait_sec = seconds_until_next_day()
-        h, rem = divmod(wait_sec, 3600)
-        m, s = divmod(rem, 60)
-        print(f"⏳ 日次上限回復待ち: {h}h{m}m{s}s 待機")
-        time.sleep(wait_sec)
-
+def build_prices_endpoint(stock_code: str, lookback_days: int = LOOKBACK_DAYS) -> str:
+    start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    return f"prices/daily_quotes?code={stock_code}&from={start}"
 
 # ------------------------------------------------------------
 # Graceful Shutdown
@@ -181,6 +94,7 @@ class GracefulShutdown:
             signal.signal(signal.SIGTERM, self.exit_gracefully)
         except Exception:
             pass
+
     def exit_gracefully(self, signum, frame):
         print(f"\n⚠️ 中断シグナル受信: {signum}\n🛑 安全に終了します")
         self.shutdown = True
@@ -200,21 +114,24 @@ class APIRateLimiter:
         self.request_timestamps: List[datetime.datetime] = []
         self.daily_count = 0
         self.last_reset = datetime.date.today()
-        self.errs = 0
 
     def wait_if_needed(self):
         now = datetime.datetime.now()
         if now.date() > self.last_reset:
             self.daily_count = 0
             self.last_reset = now.date()
+
         if self.daily_count >= self.requests_per_day:
             raise RuntimeError("日次レート制限到達")
+
         one_minute_ago = now - datetime.timedelta(minutes=1)
         self.request_timestamps = [t for t in self.request_timestamps if t > one_minute_ago]
+
         if len(self.request_timestamps) >= self.requests_per_minute:
             wait = 61 - (now - min(self.request_timestamps)).total_seconds()
             if wait > 0:
                 time.sleep(wait)
+
         time.sleep(self.base_delay)
 
     def mark(self):
@@ -232,25 +149,23 @@ class AuthSession(requests.Session):
     def request(self, method, url, **kwargs):
         MAX = 5
         timeout = kwargs.pop("timeout", 30)
+
         for attempt in range(1, MAX + 1):
             self.limiter.wait_if_needed()
             try:
                 resp = super().request(method, url, timeout=timeout, **kwargs)
-            except requests.RequestException as e:
+            except requests.RequestException:
                 if attempt == MAX:
                     raise
                 time.sleep(1.5 * attempt)
                 continue
 
-            # 401→トークン更新
+            # 401: idToken refresh
             if resp.status_code == 401 and attempt == 1:
-                try:
-                    _refresh_id_token(self, ini_file=self.ini_file)
-                    continue
-                except Exception as e:
-                    raise RuntimeError(f"idToken refresh failed: {e}") from e
+                _refresh_id_token(self, ini_file=self.ini_file)
+                continue
 
-            # レート or サーバ
+            # Retryable
             if resp.status_code in (429,) or resp.status_code >= 500:
                 if attempt == MAX:
                     return resp
@@ -259,9 +174,10 @@ class AuthSession(requests.Session):
 
             self.limiter.mark()
             return resp
+
         raise RuntimeError(f"{method} {url} failed after {MAX} attempts")
 
-def get_authenticated_session_jquants(ini_file="api.ini") -> requests.Session:
+def get_authenticated_session_jquants(ini_file: str = "api.ini") -> requests.Session:
     token_cache = CACHE_DIR / "access_token.json"
     rpm = int(os.getenv("JQ_RPM", "50"))
     rpd = int(os.getenv("JQ_RPD", "800"))
@@ -284,16 +200,18 @@ def get_authenticated_session_jquants(ini_file="api.ini") -> requests.Session:
     print("✅ 認証成功")
     return session
 
-def _refresh_id_token(session: requests.Session, ini_file="api.ini") -> str:
+def _refresh_id_token(session: requests.Session, ini_file: str = "api.ini") -> str:
     config = configparser.ConfigParser()
     config.read(ini_file, encoding="utf-8")
+
     email = (config["DEFAULT"].get("MAIL_ADDRESS") or
              config["DEFAULT"].get("mail_address") or
              config["DEFAULT"].get("email"))
     password = (config["DEFAULT"].get("PASSWORD") or
                 config["DEFAULT"].get("password"))
+
     if not (email and password):
-        raise RuntimeError("メールアドレス／パスワード未設定")
+        raise RuntimeError("メールアドレス／パスワード未設定(api.ini)")
 
     auth_payload = {"mailaddress": email, "password": password}
     res = requests.post(f"{JQUANTS_API_BASE}/token/auth_user", json=auth_payload, timeout=20)
@@ -380,25 +298,45 @@ class DynamicSectorAverages:
         "電気機器": {"ca_ratio": 0.62, "cl_ratio": 0.38, "gpm": 0.31},
         "半導体":   {"ca_ratio": 0.55, "cl_ratio": 0.42, "gpm": 0.39},
         "銀行":     {"ca_ratio": 0.28, "cl_ratio": 0.90, "gpm": 0.20},
-        "情報・通信業":{"ca_ratio": 0.57, "cl_ratio": 0.32, "gpm": 0.34},
+        "情報・通信業": {"ca_ratio": 0.57, "cl_ratio": 0.32, "gpm": 0.34},
         "サービス": {"ca_ratio": 0.60, "cl_ratio": 0.35, "gpm": 0.29},
         "化学":     {"ca_ratio": 0.58, "cl_ratio": 0.37, "gpm": 0.27},
         "その他":   {"ca_ratio": 0.60, "cl_ratio": 0.40, "gpm": 0.25},
     }
+
     def __init__(self, session: requests.Session):
         self.session = session
-        self.sector_cache = {}
-        self.cache_timestamp = None
+        self.sector_cache: dict = {}
+        self.cache_timestamp: Optional[float] = None
         self.cache_duration = 3600
+
+    @staticmethod
+    def normalize_sector(sector: str) -> str:
+        s = (sector or "").strip()
+        if not s:
+            return "その他"
+        if "銀行" in s:
+            return "銀行"
+        if "情報" in s or "通信" in s:
+            return "情報・通信業"
+        if "電気機器" in s:
+            return "電気機器"
+        if "輸送用機器" in s or "自動車" in s:
+            return "自動車"
+        if "サービス" in s:
+            return "サービス"
+        if "化学" in s:
+            return "化学"
+        return s if s in DynamicSectorAverages.SECTOR_MEDIANS else "その他"
 
     @staticmethod
     def get_sector_static(stock_code: str) -> str:
         sector_mapping = {
             '7203': '自動車','7267':'自動車','7269':'自動車','7270':'自動車','7261':'自動車','7202':'自動車','7211':'自動車',
             '8035':'半導体','6861':'半導体','6594':'半導体','6503':'半導体','6723':'半導体','6752':'半導体','6981':'半導体',
-            '6758':'エレクトロニクス','6501':'エレクトロニクス','6954':'エレクトロニクス','6702':'エレクトロニクス','6976':'エレクトロニクス',
+            '6758':'電気機器','6501':'電気機器','6954':'電気機器','6702':'電気機器','6976':'電気機器',
             '8306':'銀行','8316':'銀行','8411':'銀行','8331':'銀行','8354':'銀行','8393':'銀行',
-            '9984':'通信','9432':'通信','9433':'通信','4689':'通信','3659':'通信','4751':'通信',
+            '9984':'情報・通信業','9432':'情報・通信業','9433':'情報・通信業','4689':'情報・通信業','3659':'情報・通信業','4751':'情報・通信業',
             '4568':'医薬品','4519':'医薬品','4523':'医薬品','4503':'医薬品','4506':'医薬品','4507':'医薬品',
             '8058':'商社','8031':'商社','2768':'商社','8002':'商社','8001':'商社','8053':'商社',
             '9983':'小売','3382':'小売','8267':'小売','3086':'小売','3099':'小売','8233':'小売',
@@ -416,25 +354,25 @@ class DynamicSectorAverages:
         }
         return sector_mapping.get(stock_code, "その他")
 
-    def is_cache_valid(self):
+    def is_cache_valid(self) -> bool:
         if not self.cache_timestamp:
             return False
         return (time.time() - self.cache_timestamp) < self.cache_duration
 
-    def get_default_sector_average(self, sector):
+    def get_default_sector_average(self, sector: str) -> dict:
         defaults = {
             '自動車': {'ps': 0.8, 'peg': 1.2, 'eps_growth': 8.5},
             '半導体': {'ps': 4.5, 'peg': 1.8, 'eps_growth': 12.2},
-            'エレクトロニクス': {'ps': 1.8, 'peg': 1.5, 'eps_growth': 12.3},
+            '電気機器': {'ps': 1.8, 'peg': 1.5, 'eps_growth': 12.3},
             '銀行': {'ps': 2.5, 'peg': 0.8, 'eps_growth': 10.6},
-            '通信': {'ps': 1.2, 'peg': 1.3, 'eps_growth': 11.2},
+            '情報・通信業': {'ps': 1.2, 'peg': 1.3, 'eps_growth': 11.2},
             '医薬品': {'ps': 3.8, 'peg': 1.6, 'eps_growth': 10.5},
             '商社': {'ps': 0.4, 'peg': 0.9, 'eps_growth': 10.2},
             '小売': {'ps': 0.8, 'peg': 1.4, 'eps_growth': 11.1},
             'サービス': {'ps': 2.2, 'peg': 1.7, 'eps_growth': 12.1},
             'ゲーム': {'ps': 3.5, 'peg': 1.4, 'eps_growth': 12.3},
             '化学': {'ps': 1.0, 'peg': 1.4, 'eps_growth': 9.1},
-            'その他': {'ps': 1.5, 'peg': 1.5, 'eps_growth': 10.0}
+            'その他': {'ps': 1.5, 'peg': 1.5, 'eps_growth': 10.0},
         }
         default = defaults.get(sector, defaults['その他'])
         return {
@@ -444,10 +382,11 @@ class DynamicSectorAverages:
             'data_source': 'static_default'
         }
 
-    def get_sector_averages(self, force_refresh=False):
+    def get_sector_averages(self, force_refresh: bool = False) -> dict:
         if not force_refresh and self.is_cache_valid() and self.sector_cache:
             print("📊 セクター平均: メモリキャッシュ")
             return self.sector_cache
+
         cache_file = CACHE_DIR / "sector_averages.json"
         if cache_file.exists() and not force_refresh:
             try:
@@ -459,93 +398,21 @@ class DynamicSectorAverages:
                     return self.sector_cache
             except Exception:
                 pass
+
         print("📊 セクター平均: 静的デフォルト")
-        sectors = ['自動車','半導体','エレクトロニクス','銀行','通信','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+        sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
         data = {s: self.get_default_sector_average(s) for s in sectors}
         cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
         self.sector_cache = data
         self.cache_timestamp = time.time()
         return data
 
-    def calculate_sector_averages_from_cache(self, max_samples_per_sector: int = 100) -> dict:
-        """
-        キャッシュされたデータから実際のセクター平均を計算する。
-        複数銘柄の分析結果からセクター別のPS、PEG、PERなどの中央値を算出。
-        """
-        try:
-            tasks = build_offline_analysis_tasks(self.session)
-            if not tasks:
-                print("📊 セクター平均計算: キャッシュデータが不足しています")
-                return {}
-            
-            print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...")
-            results = []
-            max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [
-                    ex.submit(
-                        analyze_single_stock_complete_v3,
-                        self.session, {}, code, name, market, sector,
-                        offline=True
-                    ) for (code, name, market, sector) in tasks[:max_samples_per_sector * 20]  # 全セクター分のサンプル
-                ]
-                for i, fut in enumerate(as_completed(futs), 1):
-                    res = fut.result()
-                    if res.get("success") and res.get("ps_ratio") is not None:
-                        results.append(res)
-                    if i % 100 == 0:
-                        print(f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})")
-            
-            if not results:
-                print("📊 セクター平均計算: 有効なデータがありません")
-                return {}
-            
-            # DataFrameに変換
-            df = pd.DataFrame([
-                {
-                    "sector": r.get("sector_name") or DynamicSectorAverages.get_sector_static(r.get("stock_code", "")),
-                    "ps": r.get("ps_ratio"),
-                    "peg": r.get("peg_ratio"),
-                    "per": r.get("per"),
-                }
-                for r in results
-            ])
-            
-            # セクター別に集計
-            sector_stats = {}
-            for sector in df["sector"].unique():
-                sector_df = df[df["sector"] == sector]
-                if len(sector_df) < 3:  # サンプル数が少なすぎる場合はスキップ
-                    continue
-                
-                ps_values = sector_df["ps"].dropna()
-                peg_values = sector_df["peg"].dropna()
-                per_values = sector_df["per"].dropna()
-                
-                sector_stats[sector] = {
-                    "ps": float(ps_values.median()) if len(ps_values) > 0 else None,
-                    "peg": float(peg_values.median()) if len(peg_values) > 0 else None,
-                    "per": float(per_values.median()) if len(per_values) > 0 else None,
-                    "sample_count": len(sector_df),
-                    "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "data_source": "calculated_from_cache"
-                }
-            
-            print(f"📊 セクター平均計算完了: {len(sector_stats)}セクター")
-            return sector_stats
-            
-        except Exception as e:
-            print(f"⚠️ セクター平均計算エラー: {e}")
-            import traceback
-            traceback.print_exc()
-            return {}
-
-    def load_or_download_data_v2(self, endpoint, cache_name, bypass_cache: bool = False):
+    def load_or_download_data_v2(self, endpoint: str, cache_name: str, bypass_cache: bool = False) -> pd.DataFrame:
         """当日CSVキャッシュ→API→CSV保存。bypass_cache=True なら当日キャッシュを無視して取り直す。"""
         try:
             today = datetime.date.today().strftime("%Y%m%d")
             cache_file = CACHE_DIR / f"{cache_name}_{today}.csv"
+
             if cache_file.exists() and not bypass_cache:
                 try:
                     df = pd.read_csv(cache_file)
@@ -553,10 +420,12 @@ class DynamicSectorAverages:
                         return df
                 except Exception:
                     pass
+
             url = f"{JQUANTS_API_BASE}/{endpoint}"
             res = self.session.get(url, timeout=30)
             if res.status_code != 200:
                 return pd.DataFrame()
+
             response_data = res.json()
             keys = ["info", "daily_quotes", "statements", "data", "results", "items", "companies", "stocks"]
             data = None
@@ -566,6 +435,7 @@ class DynamicSectorAverages:
                     break
             if data is None:
                 data = response_data
+
             if isinstance(data, list) and len(data) > 0:
                 df = pd.DataFrame(data)
                 try:
@@ -573,12 +443,12 @@ class DynamicSectorAverages:
                 except Exception:
                     pass
                 return df
+
             return pd.DataFrame()
         except Exception:
             return pd.DataFrame()
 
-
-    def get_fallback_stock_list_v2(self):
+    def get_fallback_stock_list_v2(self) -> list[dict]:
         return [
             {"Code":"7203","CompanyName":"トヨタ自動車","Sector33Name":"輸送用機器","MarketCode":"111"},
             {"Code":"8306","CompanyName":"三菱UFJフィナンシャルG","Sector33Name":"銀行業","MarketCode":"111"},
@@ -593,6 +463,7 @@ class DynamicSectorAverages:
             cache_file = CACHE_DIR / f"sector_stock_list_{today}.csv"
             if cache_file.exists() and not force_refresh:
                 return pd.read_csv(cache_file)
+
             print("📋 銘柄リスト取得…")
             df = self.load_or_download_data_v2("listed/info", "sector_listed_info")
             if not df.empty:
@@ -603,6 +474,7 @@ class DynamicSectorAverages:
                 df = enhance_stock_list_with_sectors(df)
                 df.to_csv(cache_file, index=False)
                 return df
+
             fb = pd.DataFrame(self.get_fallback_stock_list_v2())
             fb = enhance_stock_list_with_sectors(fb)
             fb.to_csv(cache_file, index=False)
@@ -611,6 +483,74 @@ class DynamicSectorAverages:
             fb = pd.DataFrame(self.get_fallback_stock_list_v2())
             fb = enhance_stock_list_with_sectors(fb)
             return fb
+
+    def calculate_sector_averages_from_cache(self, max_samples_per_sector: int = 100) -> dict:
+        try:
+            tasks = build_offline_analysis_tasks(self.session)
+            if not tasks:
+                print("📊 セクター平均計算: キャッシュデータが不足しています")
+                return {}
+
+            print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...")
+            results = []
+            max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [
+                    ex.submit(
+                        analyze_single_stock_complete_v3,
+                        self.session, {}, code, name, market, sector,
+                        offline=True
+                    ) for (code, name, market, sector) in tasks[:max_samples_per_sector * 20]
+                ]
+                for i, fut in enumerate(as_completed(futs), 1):
+                    res = fut.result()
+                    if res.get("success") and res.get("ps_ratio") is not None:
+                        results.append(res)
+                    if i % 100 == 0:
+                        print(f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})")
+
+            if not results:
+                print("📊 セクター平均計算: 有効なデータがありません")
+                return {}
+
+            df = pd.DataFrame([
+                {
+                    "sector": self.normalize_sector(r.get("sector_name") or ""),
+                    "ps": r.get("ps_ratio"),
+                    "peg": r.get("peg_ratio"),
+                    "per": r.get("per"),
+                }
+                for r in results
+            ])
+
+            sector_stats = {}
+            for sector in df["sector"].unique():
+                sector_df = df[df["sector"] == sector]
+                if len(sector_df) < 3:
+                    continue
+
+                ps_values = sector_df["ps"].dropna()
+                peg_values = sector_df["peg"].dropna()
+                per_values = sector_df["per"].dropna()
+
+                sector_stats[sector] = {
+                    "ps": float(ps_values.median()) if len(ps_values) > 0 else None,
+                    "peg": float(peg_values.median()) if len(peg_values) > 0 else None,
+                    "per": float(per_values.median()) if len(per_values) > 0 else None,
+                    "sample_count": len(sector_df),
+                    "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data_source": "calculated_from_cache"
+                }
+
+            print(f"📊 セクター平均計算完了: {len(sector_stats)}セクター")
+            return sector_stats
+
+        except Exception as e:
+            print(f"⚠️ セクター平均計算エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
 
 # ------------------------------------------------------------
 # FinancialDataManager（最小）
@@ -625,27 +565,29 @@ class FinancialDataManager:
         helper = DynamicSectorAverages(self.session)
         return helper.get_stock_list_v2(force_refresh=force_refresh)
 
-    def load_or_download_data_v2(self, endpoint, cache_name):
+    def load_or_download_data_v2(self, endpoint: str, cache_name: str) -> pd.DataFrame:
         helper = DynamicSectorAverages(self.session)
         return helper.load_or_download_data_v2(endpoint, cache_name)
 
-    def _load_json_cached(self, endpoint: str, cache_name: str, ttl_hours: int = 24):
+    def _load_json_cached(self, endpoint: str, cache_name: str, ttl_hours: int = 24) -> dict:
         f = self.cache_dir / f"{cache_name}.json"
         if f.exists():
             mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime)
             if (datetime.datetime.now() - mtime).total_seconds() < ttl_hours * 3600:
                 try:
-                    with open(f, "r", encoding="utf-8") as fp:
-                        return json.load(fp)
+                    return json.loads(f.read_text(encoding="utf-8"))
                 except Exception:
                     pass
+
         url = f"{self.base_url}/{endpoint}"
         try:
             res = self.session.get(url, timeout=30)
             if res.status_code == 200:
                 data = res.json()
-                with open(f, "w", encoding="utf-8") as fp:
-                    json.dump(data, fp, ensure_ascii=False)
+                try:
+                    f.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
                 return data
             return {}
         except Exception:
@@ -657,6 +599,7 @@ class FinancialDataManager:
             cached = self._load_json_cached(f"fins/statements?code={code}", cache_key, ttl_hours=12)
             if cached and cached.get("statements"):
                 return cached["statements"]
+
         url = f"{self.base_url}/fins/statements?code={code}"
         for attempt in range(1, 6):
             resp = self.session.get(url, timeout=30)
@@ -667,42 +610,54 @@ class FinancialDataManager:
             except Exception:
                 stmts = []
                 data = {}
+
             if status == 200:
                 try:
-                    with open(self.cache_dir / f"{cache_key}.json", "w", encoding="utf-8") as fp:
-                        json.dump(data, fp, ensure_ascii=False, separators=(",", ":"))
+                    (self.cache_dir / f"{cache_key}.json").write_text(
+                        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                        encoding="utf-8"
+                    )
                 except Exception:
                     pass
                 return stmts
+
             if status in (402, 403):
                 return []
+
             if status == 429:
                 time.sleep(2 ** attempt)
                 continue
+
             if status >= 500:
                 time.sleep(1.5 * attempt)
                 continue
+
         return []
 
-
     def _fill_missing_fields(self, fin: dict) -> dict:
-        # セクタ中央値での軽微な補完のみ（モック生成はしない）
-        to_f = lambda v: float(v) if v not in (None, "", "NA") else None
-        cur, prev = fin["current"], fin["previous"]
+        cur, prev = fin.get("current", {}), fin.get("previous", {})
+
         for fld in ("current_assets", "current_liabilities", "gross_profit_margin", "shares_outstanding"):
             if cur.get(fld) is None and prev.get(fld) is not None:
-                cur[fld] = prev[fld]
-        sector = fin.get("sector", "その他")
+                cur[fld] = prev.get(fld)
+
+        sector = DynamicSectorAverages.normalize_sector(fin.get("sector", "その他"))
         med = DynamicSectorAverages.SECTOR_MEDIANS.get(sector, DynamicSectorAverages.SECTOR_MEDIANS["その他"])
         ca_ratio = med.get("ca_ratio")
         cl_ratio = med.get("cl_ratio")
         gpm_med  = med.get("gpm")
+
         if (cur.get("current_assets") is None and cur.get("total_assets") and ca_ratio):
             cur["current_assets"] = cur["total_assets"] * ca_ratio
+
         if (cur.get("current_liabilities") is None and cur.get("total_assets") and cur.get("equity") and cl_ratio):
             cur["current_liabilities"] = (cur["total_assets"] - cur["equity"]) * cl_ratio
+
         if cur.get("gross_profit_margin") is None and gpm_med:
             cur["gross_profit_margin"] = gpm_med * 0.95
+
+        fin["current"] = cur
+        fin["previous"] = prev
         for k, v in cur.items():
             fin[f"current_{k}"] = v
         return fin
@@ -710,10 +665,6 @@ class FinancialDataManager:
 # ------------------------------------------------------------
 # ユーティリティ
 # ------------------------------------------------------------
-def build_prices_endpoint(stock_code: str, lookback_days: int = LOOKBACK_DAYS) -> str:
-    start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    return f"prices/daily_quotes?code={stock_code}&from={start}"
-
 def enhance_stock_list_with_sectors(df: pd.DataFrame) -> pd.DataFrame:
     if "Code" not in df.columns:
         return df
@@ -723,7 +674,7 @@ def enhance_stock_list_with_sectors(df: pd.DataFrame) -> pd.DataFrame:
         df["MarketCode"] = ""
     if "CompanyName" not in df.columns:
         df["CompanyName"] = ""
-    return df[["Code","CompanyName","Sector33Name","MarketCode"]]
+    return df[["Code", "CompanyName", "Sector33Name", "MarketCode"]]
 
 # ------------------------------------------------------------
 # 銘柄名フィルタ
@@ -756,31 +707,40 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
     v = rsi.iloc[-1]
     return float(v) if np.isfinite(v) else 50.0
 
-def calculate_adx_and_di(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> Tuple[float,float,float]:
+def calculate_adx_and_di(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> Tuple[float, float, float]:
     if min(len(high), len(low), len(close)) < period + 5:
         return 20.0, 20.0, 20.0
+
     df = pd.DataFrame({"high": high, "low": low, "close": close}).dropna()
     if len(df) < period + 1:
         return 20.0, 20.0, 20.0
+
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.concat([
         (high - low),
         (high - close.shift(1)).abs(),
         (low - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
-    plus_dm  = (high.diff().where(lambda x: x > 0, 0.0))
-    minus_dm = (-low.diff().where(lambda x: x < 0, 0.0))
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > 0) & (up_move > down_move), 0.0)
+    minus_dm = down_move.where((down_move > 0) & (down_move > up_move), 0.0)
+
     atr = tr.ewm(span=period, adjust=False).mean()
     plus_di  = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr.replace(0, np.nan))
     minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr.replace(0, np.nan))
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(span=period, adjust=False).mean()
-    def clamp(x, lo, hi): 
-        return float(max(lo, min(hi, x))) if np.isfinite(x) else float(lo)
-    return clamp(adx.iloc[-1],5,80), clamp(plus_di.iloc[-1],5,95), clamp(minus_di.iloc[-1],5,95)
 
-def calculate_moving_averages(prices: pd.Series, periods=[25,75,200]) -> Dict[str, float]:
-    out = {}
+    def clamp(x, lo, hi):
+        return float(max(lo, min(hi, x))) if np.isfinite(x) else float(lo)
+
+    return clamp(adx.iloc[-1], 5, 80), clamp(plus_di.iloc[-1], 5, 95), clamp(minus_di.iloc[-1], 5, 95)
+
+def calculate_moving_averages(prices: pd.Series, periods: Tuple[int, ...] = (25, 75, 200)) -> Dict[str, float]:
+    out: Dict[str, float] = {}
     for p in periods:
         if len(prices) >= p:
             ma = prices.rolling(window=p).mean().iloc[-1]
@@ -791,48 +751,37 @@ def calculate_moving_averages(prices: pd.Series, periods=[25,75,200]) -> Dict[st
             out[f"ma_{p}"] = None
     return out
 
-# 置き換え: calculate_volatility 全体
 def calculate_volatility(prices: pd.Series, period: int = 20) -> Tuple[Optional[float], Optional[float]]:
     if len(prices) < max(5, period):
         return None, None
     try:
         returns = prices.pct_change(fill_method=None).dropna()
     except TypeError:
-        # 古いpandas互換
         returns = prices.pct_change().dropna()
     cur = returns.tail(period).std() * np.sqrt(252) if len(returns) >= period else returns.std() * np.sqrt(252)
     avg = returns.std() * np.sqrt(252)
     return float(cur), float(avg)
 
-
 # ------------------------------------------------------------
 # 長期投資向け: 最大DD / 売上CAGR / 安全基準
 # ------------------------------------------------------------
 def calculate_max_drawdown(prices: pd.Series, lookback_days: Optional[int] = None) -> Optional[float]:
-    """
-    価格履歴から最大下落幅（最大ドローダウン）を計算する。
-    Returns: 最大下落幅（負の値）。例: -0.5 は50%下落。
-    """
     if prices is None or len(prices) < 2:
         return None
     try:
         prices_series = prices.copy()
-        if lookback_days is not None:
-            prices_series = prices_series.head(lookback_days)
+        if lookback_days is not None and lookback_days > 1:
+            prices_series = prices_series.tail(lookback_days)
         if len(prices_series) < 2:
             return None
-        # 時系列を古い順に並べる（累積最大値計算のため）
-        if prices_series.index.dtype == "datetime64[ns]" or isinstance(prices_series.index[0], (datetime.datetime, pd.Timestamp)):
-            prices_sorted = prices_series.sort_index()
-        else:
-            prices_sorted = prices_series.iloc[::-1].reset_index(drop=True)
-        cumulative_max = prices_sorted.expanding().max()
+
+        prices_sorted = prices_series.sort_index() if hasattr(prices_series.index, "is_monotonic_increasing") else prices_series
+        cumulative_max = prices_sorted.cummax()
         drawdowns = (prices_sorted - cumulative_max) / cumulative_max
         max_dd = float(drawdowns.min())
         return max_dd if np.isfinite(max_dd) else None
     except Exception:
         return None
-
 
 def _pick_numeric_field(record: dict, keys: List[str]) -> Optional[float]:
     for key in keys:
@@ -843,7 +792,6 @@ def _pick_numeric_field(record: dict, keys: List[str]) -> Optional[float]:
                 continue
     return None
 
-
 def _fiscal_year_from_statement(record: dict) -> int:
     for ky in ("fiscalYear", "FiscalYear", "period", "CurrentFiscalYearEndDate", "DisclosedDate"):
         value = str(record.get(ky) or "")
@@ -852,11 +800,7 @@ def _fiscal_year_from_statement(record: dict) -> int:
             return int(match[0])
     return -1
 
-
 def build_financial_history_from_statements(stmts: List[dict], max_years: int = 5) -> List[dict]:
-    """
-    財務諸表リストから最大 max_years 件の整形済み辞書を生成する（新しい年度順）。
-    """
     if not stmts:
         return []
     sorted_stmts = sorted(stmts, key=_fiscal_year_from_statement, reverse=True)
@@ -881,6 +825,7 @@ def build_financial_history_from_statements(stmts: List[dict], max_years: int = 
                 ],
             ),
         }
+
         cash_and_equivalents = _pick_numeric_field(
             stmt,
             [
@@ -909,20 +854,59 @@ def build_financial_history_from_statements(stmts: List[dict], max_years: int = 
             break
     return history
 
-
 def compute_sales_cagr(history: List[dict], years: int = 3) -> Optional[float]:
-    revenues = [rec.get("revenue") for rec in history if rec.get("revenue")]
-    if len(revenues) <= years:
+    if not history or len(history) <= years:
         return None
-    latest = revenues[0]
-    past = revenues[years]
-    if not past or past <= 0 or not latest or latest <= 0:
+    latest = history[0].get("revenue")
+    past = history[years].get("revenue") if len(history) > years else None
+    if not latest or not past or past <= 0 or latest <= 0:
         return None
     try:
         return (latest / past) ** (1 / years) - 1
     except (ZeroDivisionError, OverflowError):
         return None
 
+def evaluate_operating_income_stability(history: List[dict],
+                                        years: int = OP_INCOME_YEARS,
+                                        drop_floor: float = OP_INCOME_DROP_FLOOR,
+                                        exclude_deficit: bool = EXCLUDE_OP_INCOME_DEFICIT) -> dict:
+    out = {"stable": None, "reason": "insufficient", "years_checked": years, "latest": None, "median_prev": None}
+    if not history:
+        return out
+
+    op: list[Optional[float]] = []
+    for rec in history[:max(1, years)]:
+        v = rec.get("operating_income")
+        op.append(None if v is None else float(v))
+
+    if len(op) < 1 or op[0] is None:
+        out["reason"] = "latest_missing"
+        return out
+
+    out["latest"] = op[0]
+
+    if any(v is None for v in op):
+        out["reason"] = "missing_in_window"
+        out["stable"] = None
+        return out
+
+    if exclude_deficit and any(v <= 0 for v in op):
+        out["stable"] = False
+        out["reason"] = "deficit_in_window"
+        return out
+
+    prev = op[1:] if len(op) > 1 else []
+    if prev:
+        med_prev = float(np.median(prev))
+        out["median_prev"] = med_prev
+        if med_prev > 0 and op[0] < med_prev * float(drop_floor):
+            out["stable"] = False
+            out["reason"] = f"drop_below_floor({drop_floor})"
+            return out
+
+    out["stable"] = True
+    out["reason"] = "ok"
+    return out
 
 def calculate_safety_criteria_v1(
     ps_ratio: Optional[float],
@@ -933,9 +917,6 @@ def calculate_safety_criteria_v1(
     sales_cagr: Optional[float],
     max_drawdown: Optional[float],
 ) -> dict:
-    """
-    安全・長期投資向けの基準を評価する（必須条件: PS<1, OCF>0, 自己資本比率>=50%, 異常DDなし）。
-    """
     criteria = {
         "ps_under_1": False,
         "cash_rich": False,
@@ -1022,7 +1003,6 @@ def calculate_safety_criteria_v1(
         "max_drawdown": max_drawdown,
     }
 
-
 # ------------------------------------------------------------
 # Piotroski（実データのみ）
 # ------------------------------------------------------------
@@ -1103,11 +1083,13 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
     rps = None
     if revenue_current and shares_outstanding and shares_outstanding > 0:
         rps = revenue_current / shares_outstanding
+
     per = None
     if net_income_current and shares_outstanding and shares_outstanding > 0:
         eps = net_income_current / shares_outstanding
         if eps > 0 and current_price and current_price > 0:
             per = current_price / eps
+
     eps_growth = estimate_eps_growth_rate(net_income_current, net_income_previous, shares_outstanding)
     ps_ratio = calculate_ps_ratio(current_price, revenue_per_share=rps)
     peg_ratio = calculate_peg_ratio(per, eps_growth)
@@ -1141,26 +1123,22 @@ def calculate_safety_score_v3(
     w = {'margin_ratio':4.0,'short_selling':4.0,'earnings_stability':3.5,'dividend_stability':3.0,
          'liquidity':2.5,'momentum_stability':2.5,'volatility_stability':2.5,'technical_strength':3.0}
 
-    # 信用・空売り
     margin_score = w['margin_ratio'] * (0.6 if margin_ratio is None else 1.0 if margin_ratio<=3 else 0.8 if margin_ratio<=5 else 0.6 if margin_ratio<=10 else 0.3 if margin_ratio<=20 else 0)
     short_score  = w['short_selling'] * (0.6 if short_selling_change_rate is None else 1.0 if short_selling_change_rate<=5 else 0.8 if short_selling_change_rate<=15 else 0.5 if short_selling_change_rate<=30 else 0.2 if short_selling_change_rate<=50 else 0)
     safety_score += margin_score + short_score
     details['信用安全性'] = f"{'不明' if margin_ratio is None else f'{margin_ratio:.1f}倍'} ({margin_score:.1f})"
     details['空売り安全性'] = f"{'不明' if short_selling_change_rate is None else f'{short_selling_change_rate:.1f}%'} ({short_score:.1f})"
 
-    # 業績・配当
     eps_score = w['earnings_stability'] * (0.5 if yoy_eps_growth is None else 1.0 if yoy_eps_growth>=20 else 0.8 if yoy_eps_growth>=10 else 0.7 if yoy_eps_growth>=0 else 0.4 if yoy_eps_growth>=-10 else 0.2 if yoy_eps_growth>=-20 else 0)
     div_score = w['dividend_stability'] * (0.5 if not dividend_status else 1.0 if dividend_status=='増配' else 0.8 if dividend_status=='維持' else 0.3 if dividend_status=='未定' else 0.1 if dividend_status=='減配' else 0)
     safety_score += eps_score + div_score
     details['業績安定性'] = f"{'不明' if yoy_eps_growth is None else f'EPS成長率{yoy_eps_growth:.1f}%'} ({eps_score:.1f})"
     details['配当安定性'] = f"{dividend_status or '不明'} ({div_score:.1f})"
 
-    # 流動性
     volume_score = w['liquidity'] * (0.5 if avg_volume is None else 1.0 if avg_volume>=500000 else 0.8 if avg_volume>=200000 else 0.6 if avg_volume>=100000 else 0.3 if avg_volume>=50000 else 0)
     safety_score += volume_score
     details['流動性'] = f"{'不明' if avg_volume is None else f'{avg_volume:,}株'} ({volume_score:.1f})"
 
-    # モメンタム・ボラ
     stagnant_score = w['momentum_stability'] * (0.6 if stagnant_days_after_spike is None else 1.0 if stagnant_days_after_spike==0 else 0.8 if stagnant_days_after_spike<=2 else 0.5 if stagnant_days_after_spike<=4 else 0.2 if stagnant_days_after_spike<=6 else 0)
     if current_volatility is not None and average_volatility not in (None, 0):
         vr = current_volatility / average_volatility
@@ -1173,7 +1151,6 @@ def calculate_safety_score_v3(
     details['モメンタム安定性'] = f"{'不明' if stagnant_days_after_spike is None else f'{stagnant_days_after_spike}日'} ({stagnant_score:.1f})"
     details['ボラティリティ安定性'] = f"{vol_note} ({vol_score:.1f})"
 
-    # テクニカル
     if not below_ma25 and not below_ma75:
         tech_score = w['technical_strength']
         tech_note = "25日・75日線上方"
@@ -1245,7 +1222,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                                      offline: bool = False) -> dict:
     try:
         fdm = FinancialDataManager(session)
-        sector = sector_hint or DynamicSectorAverages.get_sector_static(code)
+        sector_raw = sector_hint or DynamicSectorAverages.get_sector_static(code)
+        sector = DynamicSectorAverages.normalize_sector(sector_raw)
         fc = FrozenCache()
 
         # 価格
@@ -1260,7 +1238,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             lc = {c.lower(): c for c in df.columns}
             for c in cands:
                 for k, v in lc.items():
-                    if k == c.lower(): return v
+                    if k == c.lower():
+                        return v
             return None
 
         c_close = _col(price_df, "Close","ClosePrice","EndPrice","AdjustmentClose","AdjClose")
@@ -1268,7 +1247,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         c_low   = _col(price_df, "Low","LowPrice")
         c_vol   = _col(price_df, "Volume","TradingVolume")
         c_date  = _col(price_df, "Date","TradingDate")
-        if c_date: price_df = price_df.sort_values(c_date)
+        if c_date:
+            price_df = price_df.sort_values(c_date)
 
         close = price_df[c_close].astype(float) if c_close in price_df.columns else pd.Series([], dtype=float)
         high  = price_df[c_high].astype(float)  if c_high  in price_df.columns else close
@@ -1280,8 +1260,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         rsi = float(calculate_rsi(close)) if len(close) else None
         adx, plus_di, minus_di = calculate_adx_and_di(high, low, close) if len(close) else (None, None, None)
         cur_vol, avg_vol = calculate_volatility(close) if len(close) else (None, None)
-        below_ma25 = bool(current_price is not None and mas.get("ma_25") not in (None,) and current_price < mas["ma_25"])
-        below_ma75 = bool(current_price is not None and mas.get("ma_75") not in (None,) and current_price < mas["ma_75"])
+
+        below_ma25 = bool(current_price is not None and mas.get("ma_25") is not None and current_price < mas["ma_25"])
+        below_ma75 = bool(current_price is not None and mas.get("ma_75") is not None and current_price < mas["ma_75"])
+        below_ma200 = bool(current_price is not None and mas.get("ma_200") is not None and current_price < mas["ma_200"])
         avg_volume = int(vol_s.tail(30).mean()) if isinstance(vol_s, pd.Series) and len(vol_s) else None
 
         # 財務
@@ -1289,6 +1271,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             stmts = fc.load_statements(code)
         else:
             stmts = fdm.fetch_statements(code)
+
         financial_history = build_financial_history_from_statements(stmts if isinstance(stmts, list) else [], max_years=5)
         cur_fin = financial_history[0].copy() if financial_history else {}
         prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
@@ -1344,14 +1327,57 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             max_drawdown=max_dd,
         )
 
+        # ★必須フィルタ
+        liquidity_ok = (avg_volume is not None and avg_volume >= MIN_AVG_VOLUME_30D)
+        market_cap_ok = (market_cap is not None and market_cap >= MIN_MARKET_CAP_JPY)
+
+        ps_ratio = val.get("ps_ratio")
+        per = val.get("per")
+
+        defensive_ps_ok = (ps_ratio is not None and np.isfinite(ps_ratio) and ps_ratio <= MAX_PS_DEFENSIVE)
+        per_satellite = (per is not None and np.isfinite(per) and per > MAX_PER_CORE)  # per=None(EPS<=0等)は除外しない
+
+        op_income_eval = evaluate_operating_income_stability(
+            financial_history,
+            years=OP_INCOME_YEARS,
+            drop_floor=OP_INCOME_DROP_FLOOR,
+            exclude_deficit=EXCLUDE_OP_INCOME_DEFICIT
+        )
+        op_income_stable = (op_income_eval.get("stable") is True)
+
+        base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
+        core_candidate = bool(base_ok and defensive_ps_ok and (not per_satellite))
+        satellite_candidate = bool(base_ok and (not core_candidate))
+
+        filter_details = {
+            "liquidity_ok": liquidity_ok,
+            "market_cap_ok": market_cap_ok,
+            "defensive_ps_ok": defensive_ps_ok,
+            "per_satellite": per_satellite,
+            "op_income_stable": op_income_stable,
+            "op_income_reason": op_income_eval.get("reason"),
+            "base_ok": base_ok,
+            "core_candidate": core_candidate,
+            "satellite_candidate": satellite_candidate,
+            "thresholds": {
+                "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
+                "MIN_MARKET_CAP_JPY": MIN_MARKET_CAP_JPY,
+                "MAX_PS_DEFENSIVE": MAX_PS_DEFENSIVE,
+                "MAX_PER_CORE": MAX_PER_CORE,
+                "OP_INCOME_YEARS": OP_INCOME_YEARS,
+                "OP_INCOME_DROP_FLOOR": OP_INCOME_DROP_FLOOR,
+                "EXCLUDE_OP_INCOME_DEFICIT": EXCLUDE_OP_INCOME_DEFICIT,
+            }
+        }
+
         return {
             "stock_code": code, "company_name": name, "sector_name": sector,
             "current_price": current_price, "mas": mas, "rsi": rsi, "adx": adx,
             "plus_di": plus_di, "minus_di": minus_di,
             "volatility": cur_vol, "avg_volatility": avg_vol,
-            "below_ma25": below_ma25, "below_ma75": below_ma75,
+            "below_ma25": below_ma25, "below_ma75": below_ma75, "below_ma200": below_ma200,
             "piotroski": piot,
-            "ps_ratio": val.get("ps_ratio"), "peg_ratio": val.get("peg_ratio"), "per": val.get("per"),
+            "ps_ratio": ps_ratio, "peg_ratio": val.get("peg_ratio"), "per": per,
             "revenue_per_share": val.get("revenue_per_share"),
             "safety": safety, "speculation": spec, "success": True,
             "avg_volume_30d": avg_volume,
@@ -1361,81 +1387,362 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "max_drawdown": max_dd,
             "sales_cagr": sales_cagr,
             "safety_criteria": safety_criteria,
+            "filters": filter_details,
         }
     except Exception as e:
         return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
 
-def cache_status(session: requests.Session):
+# ------------------------------------------------------------
+# 収集（単体/全体）
+# ------------------------------------------------------------
+def collect_one_code(session: requests.Session, code: str, name: str = "", *, force_refresh: bool = False) -> bool:
+    fc = FrozenCache()
+    helper = DynamicSectorAverages(session)
+    try:
+        # 価格
+        price_df = helper.load_or_download_data_v2(
+            build_prices_endpoint(code),
+            f"prices_{code}",
+            bypass_cache=force_refresh
+        )
+        if price_df is not None and not price_df.empty:
+            fc.save_prices(code, price_df)
+
+        # 財務
+        fdm = FinancialDataManager(session)
+        stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
+        if stmts:
+            fc.save_statements(code, stmts)
+
+        return fc.has_all(code)
+    except RuntimeError as e:
+        if "日次レート制限到達" in str(e):
+            raise
+        return False
+    except Exception:
+        return False
+
+PENDING_FILE = CACHE_DIR / "pending_codes.json"
+
+def _save_pending(codes: list[str]) -> None:
+    PENDING_FILE.write_text(json.dumps({"codes": codes}, ensure_ascii=False), encoding="utf-8")
+
+def _load_pending(df: pd.DataFrame, *, force_full: bool = False, refresh_days: Optional[int] = None) -> list[str]:
+    fc = FrozenCache()
+    if force_full:
+        codes = [str(c) for c in df["Code"].astype(str)]
+        _save_pending(codes)
+        return codes
+
+    if refresh_days is not None:
+        codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c), max_age_days=refresh_days)]
+        _save_pending(codes)
+        return codes
+
+    if PENDING_FILE.exists():
+        try:
+            return json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
+        except Exception:
+            pass
+
+    codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
+    _save_pending(codes)
+    return codes
+
+def collect_all_daemon(session: requests.Session,
+                       daily_budget: Optional[int] = None,
+                       refresh_days: Optional[int] = None,
+                       force_full: bool = False,
+                       reset_pending: bool = False) -> None:
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
-    fc = FrozenCache()
-    total = len(df)
-    cached = sum(1 for c in df["Code"].astype(str) if fc.has_all(str(c)))
-    print(f"📦 キャッシュ {cached}/{total} 銘柄  ({cached/total*100:.1f}%)")
+    df = df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName","")))[0], axis=1)].reset_index(drop=True)
 
+    if reset_pending and PENDING_FILE.exists():
+        try:
+            PENDING_FILE.unlink()
+        except Exception:
+            pass
 
+    pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days)
+    if not pending:
+        print("📦 すでに全件取得済み")
+        return
 
-# ------------------------------------------------------------
-# 収集フェーズ
-# ------------------------------------------------------------
+    if daily_budget is None:
+        rpd = int(os.getenv("JQ_RPD", "800"))
+        daily_budget = max(1, min(len(pending), rpd // 2 - 5))
 
+    mode = "強制再収集" if force_full else (f"{refresh_days}日超のみ再収集" if refresh_days is not None else "未取得のみ")
+    print(f"▶ 全自動収集開始  残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}")
+
+    while pending:
+        taken = 0
+        start = time.time()
+        try:
+            for code in list(pending):
+                if taken >= daily_budget:
+                    break
+                ok = collect_one_code(session, code, force_refresh=(force_full or refresh_days is not None))
+                if ok:
+                    pending.remove(code)
+                    _save_pending(pending)
+                taken += 1
+                if taken % 20 == 0 or taken == daily_budget:
+                    elapsed = time.time() - start
+                    print(f"  ⏱ 本日 {taken}/{daily_budget} 件  残り{len(pending)}  経過{int(elapsed)}s", flush=True)
+        except RuntimeError as e:
+            if "日次レート制限到達" in str(e):
+                pass
+            else:
+                raise
+
+        print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件")
+        if not pending:
+            print("✅ 全銘柄の凍結収集が完了")
+            break
+
+        wait_sec = seconds_until_next_day()
+        h, rem = divmod(wait_sec, 3600)
+        m, s = divmod(rem, 60)
+        print(f"⏳ 日次上限回復待ち: {h}h{m}m{s}s 待機")
+        time.sleep(wait_sec)
 
 def collect_batch(session: requests.Session, max_codes: int) -> dict:
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName","")))[0], axis=1)].reset_index(drop=True)
     fc = FrozenCache()
+
     pending = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
     picked  = pending[:max_codes]
-    ok = 0; fail = 0
+    ok = 0
+    fail = 0
     start = time.time()
+
     for i, code in enumerate(picked, 1):
         ok_flag = collect_one_code(session, code)
-        if ok_flag: ok += 1
-        else: fail += 1
+        if ok_flag:
+            ok += 1
+        else:
+            fail += 1
         if i % 20 == 0 or i == len(picked):
             elapsed = time.time() - start
             print(f"  ⏱ {i}/{len(picked)} 収集中 (OK={ok} FAIL={fail}) 経過{elapsed:.0f}s", flush=True)
+
     return {"tried": len(picked), "ok": ok, "fail": fail}
 
+# ------------------------------------------------------------
+# オフライン分析タスク生成 / 銘柄名取得
+# ------------------------------------------------------------
+def build_offline_analysis_tasks(session: requests.Session) -> list[tuple[str, str, str, str | None]]:
+    fdm = FinancialDataManager(session)
+    df_list = fdm.get_stock_list_v2(force_refresh=False)
+    fc = FrozenCache()
+
+    df_list = df_list.copy()
+    df_list["Code"] = df_list["Code"].astype(str)
+    mask = df_list["Code"].apply(lambda c: fc.has_all(c))
+    rows = df_list[mask][["Code", "CompanyName", "MarketCode", "Sector33Name"]]
+
+    tasks: list[tuple[str, str, str, str | None]] = []
+    for row in rows.itertuples(index=False):
+        code   = str(row.Code)
+        name   = str(getattr(row, "CompanyName", "") or "")
+        market = str(getattr(row, "MarketCode", "") or "")
+        sector = str(getattr(row, "Sector33Name", "") or "") or None
+        tasks.append((code, name, market, sector))
+    return tasks
+
+def lookup_company_name(session: requests.Session, code: str) -> str:
+    fdm = FinancialDataManager(session)
+    df_list = fdm.get_stock_list_v2(force_refresh=False)
+    df_list = df_list.copy()
+    df_list["Code"] = df_list["Code"].astype(str)
+    hit = df_list[df_list["Code"] == str(code)]
+    if not hit.empty:
+        return str(hit.iloc[0].get("CompanyName") or "")
+    return ""
 
 # ------------------------------------------------------------
-# レポート出力
+# レポート出力（flatten / csv / md）
 # ------------------------------------------------------------
-def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
+def _safe_bool(x) -> bool:
+    return bool(x) if x is not None else False
+
+def _extract_filters(d: dict) -> dict:
+    f = d.get("filters") or {}
+    return {
+        "liquidity_ok": _safe_bool(f.get("liquidity_ok")),
+        "market_cap_ok": _safe_bool(f.get("market_cap_ok")),
+        "defensive_ps_ok": _safe_bool(f.get("defensive_ps_ok")),
+        "per_satellite": _safe_bool(f.get("per_satellite")),
+        "op_income_stable": _safe_bool(f.get("op_income_stable")),
+        "op_income_reason": f.get("op_income_reason"),
+        "base_ok": _safe_bool(f.get("base_ok")),
+        "core_candidate": _safe_bool(f.get("core_candidate")),
+        "satellite_candidate": _safe_bool(f.get("satellite_candidate")),
+    }
+
+def _flatten_result(d: dict) -> dict:
+    pio = d.get("piotroski") or {}
+    saf = d.get("safety") or {}
+    spc = d.get("speculation") or {}
+    safety_criteria = d.get("safety_criteria") or {}
+    criteria = safety_criteria.get("criteria", {}) if isinstance(safety_criteria, dict) else {}
+    flt = _extract_filters(d)
+
+    return {
+        "code": d.get("stock_code"),
+        "name": d.get("company_name"),
+        "sector": d.get("sector_name"),
+        "price": d.get("current_price"),
+        "ps": d.get("ps_ratio"),
+        "peg": d.get("peg_ratio"),
+        "per": d.get("per"),
+        "rsi": d.get("rsi"),
+        "adx": d.get("adx"),
+        "below_ma200": d.get("below_ma200"),
+        "piot": pio.get("score"),
+        "piot_eval": pio.get("evaluation"),
+        "safety": saf.get("total_score"),
+        "safety_level": saf.get("safety_level"),
+        "spec_score": spc.get("score"),
+        "spec_level": spc.get("level"),
+        "safety_criteria_score": safety_criteria.get("total_score") if isinstance(safety_criteria, dict) else None,
+        "ps_under_1": criteria.get("ps_under_1", False),
+        "cash_rich": criteria.get("cash_rich", False),
+        "positive_ocf": criteria.get("positive_ocf", False),
+        "equity_ratio_50plus": criteria.get("equity_ratio_50plus", False),
+        "equity_ratio_70plus": criteria.get("equity_ratio_70plus", False),
+        "growth_potential": criteria.get("growth_potential", False),
+        "no_speculative_drop": criteria.get("no_speculative_drop", False),
+        "equity_ratio": safety_criteria.get("equity_ratio") if isinstance(safety_criteria, dict) else None,
+        "max_drawdown": safety_criteria.get("max_drawdown") if isinstance(safety_criteria, dict) else None,
+        "sales_cagr": safety_criteria.get("sales_cagr") if isinstance(safety_criteria, dict) else None,
+        "market_cap": d.get("market_cap"),
+        "avg_volume_30d": d.get("avg_volume_30d"),
+        **flt,
+        "ok": d.get("success"),
+        "error": d.get("error"),
+    }
+
+def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: str) -> list[Path]:
+    outdir.mkdir(exist_ok=True, parents=True)
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
-        return
-    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score"]:
-        ok[c] = pd.to_numeric(ok[c], errors="coerce")
-    suffix = f"_{timestamp}" if timestamp else ""
-    rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
-    rec.to_csv(outdir / f"top_recommended{suffix}.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_safety{suffix}.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(outdir / f"top_speculative{suffix}.csv", index=False, encoding="utf-8-sig")
-    ok.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(outdir / f"top_piotroski{suffix}.csv", index=False, encoding="utf-8-sig")
-    # 長期向けスコア（条件ベース）
-    if "safety_criteria_score" in ok.columns:
-        ok.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(outdir / f"top_safe_long_term{suffix}.csv", index=False, encoding="utf-8-sig")
+        return []
 
-def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> None:
+    core = ok[ok["core_candidate"] == True].copy()
+    sat = ok[ok["satellite_candidate"] == True].copy()
+    exc = ok[(ok["base_ok"] != True) | (ok["op_income_stable"] != True) | (ok["liquidity_ok"] != True) | (ok["market_cap_ok"] != True)].copy()
+
+    p_core = outdir / f"core_candidates_{timestamp}.csv"
+    p_sat  = outdir / f"satellite_candidates_{timestamp}.csv"
+    p_exc  = outdir / f"excluded_{timestamp}.csv"
+    core.to_csv(p_core, index=False, encoding="utf-8-sig")
+    sat.to_csv(p_sat, index=False, encoding="utf-8-sig")
+    exc.to_csv(p_exc, index=False, encoding="utf-8-sig")
+
+    summary = {
+        "total_ok": int(len(ok)),
+        "core": int(len(core)),
+        "satellite": int(len(sat)),
+        "excluded": int(len(exc)),
+        "thresholds": {
+            "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
+            "MIN_MARKET_CAP_JPY": MIN_MARKET_CAP_JPY,
+            "MAX_PS_DEFENSIVE": MAX_PS_DEFENSIVE,
+            "MAX_PER_CORE": MAX_PER_CORE,
+            "OP_INCOME_YEARS": OP_INCOME_YEARS,
+            "OP_INCOME_DROP_FLOOR": OP_INCOME_DROP_FLOOR,
+            "EXCLUDE_OP_INCOME_DEFICIT": EXCLUDE_OP_INCOME_DEFICIT,
+        }
+    }
+    p_sum = outdir / f"filter_summary_{timestamp}.json"
+    p_sum.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return [p_core, p_sat, p_exc, p_sum]
+
+def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> list[Path]:
+    outdir.mkdir(exist_ok=True, parents=True)
     ok = flat[flat["ok"] == True].copy()
-    if ok.empty: return
-    ok["safety"] = pd.to_numeric(ok["safety"], errors="coerce")
-    ok["piot"]   = pd.to_numeric(ok["piot"], errors="coerce")
-    ok["spec_score"] = pd.to_numeric(ok["spec_score"], errors="coerce")
-    rec = ok.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
-    lines = ["# おすすめトップテン", ""]
+    if ok.empty:
+        return []
+
+    suffix = f"_{timestamp}" if timestamp else ""
+    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score","market_cap","avg_volume_30d"]:
+        if c in ok.columns:
+            ok[c] = pd.to_numeric(ok[c], errors="coerce")
+
+    core = ok[ok["core_candidate"] == True].copy()
+    sat = ok[ok["satellite_candidate"] == True].copy()
+
+    outs: list[Path] = []
+
+    if not core.empty:
+        p1 = outdir / f"top_recommended_core{suffix}.csv"
+        core.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p1, index=False, encoding="utf-8-sig")
+        outs.append(p1)
+
+        p2 = outdir / f"top_safety_core{suffix}.csv"
+        core.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(p2, index=False, encoding="utf-8-sig")
+        outs.append(p2)
+
+        p3 = outdir / f"top_speculative_core{suffix}.csv"
+        core.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(p3, index=False, encoding="utf-8-sig")
+        outs.append(p3)
+
+        p4 = outdir / f"top_piotroski_core{suffix}.csv"
+        core.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(p4, index=False, encoding="utf-8-sig")
+        outs.append(p4)
+
+        if "safety_criteria_score" in core.columns:
+            p5 = outdir / f"top_safe_long_term_core{suffix}.csv"
+            core.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(p5, index=False, encoding="utf-8-sig")
+            outs.append(p5)
+
+    if not sat.empty:
+        p6 = outdir / f"top_recommended_satellite{suffix}.csv"
+        sat.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p6, index=False, encoding="utf-8-sig")
+        outs.append(p6)
+
+    return outs
+
+def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> Optional[Path]:
+    outdir.mkdir(exist_ok=True, parents=True)
+    ok = flat[flat["ok"] == True].copy()
+    core = ok[ok["core_candidate"] == True].copy()
+    if core.empty:
+        return None
+
+    for c in ["safety","piot","spec_score","ps","per","market_cap","avg_volume_30d"]:
+        if c in core.columns:
+            core[c] = pd.to_numeric(core[c], errors="coerce")
+
+    rec = core.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
+
+    lines = ["# おすすめトップテン（Core候補）", ""]
     if timestamp:
         lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
         lines.append("")
+    lines.append(f"**フィルタ:** avg_volume_30d>={MIN_AVG_VOLUME_30D}, market_cap>={MIN_MARKET_CAP_JPY:,}JPY, PS<={MAX_PS_DEFENSIVE}, PER<={MAX_PER_CORE}, 営業利益安定")
+    lines.append("")
     for _, r in rec.iterrows():
-        lines.append(f"- **{r['code']} {r['name']}** | 安全 {r['safety']} | Pio {r['piot']} | 仕手 {r['spec_score']} | PER {r['per']} | PEG {r['peg']} | PS {r['ps']}")
+        mc = r.get("market_cap")
+        mc_str = f"{mc/1e9:.1f}B" if pd.notna(mc) else "N/A"
+        vol = r.get("avg_volume_30d")
+        vol_str = f"{int(vol):,}" if pd.notna(vol) else "N/A"
+        lines.append(
+            f"- **{r['code']} {r['name']}** | 安全 {r['safety']} | Pio {r['piot']} | 仕手 {r['spec_score']} | "
+            f"PER {r['per']} | PS {r['ps']} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
+        )
+
     suffix = f"_{timestamp}" if timestamp else ""
-    (outdir / f"report_top10{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
+    p = outdir / f"report_core_top{topn}{suffix}.md"
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
 
 # ==== 投資助言レポート生成 ====
-
 def _grade_from_score(s: float) -> str:
     if s >= 85: return "A+"
     if s >= 75: return "A"
@@ -1461,8 +1768,7 @@ def _val_score_from_peg(x: Optional[float]) -> float:
     if x <= 3.0: return 2.0
     return 0.0
 
-def _tech_score(rsi: Optional[float], adx: Optional[float]) -> float:
-    # RSI 15点 + ADX 10点 = 25点満点
+def _tech_score(rsi: Optional[float], adx: Optional[float], below_ma200: Optional[bool]) -> float:
     r = 0.0
     if rsi is not None and np.isfinite(rsi):
         if 45 <= rsi <= 60: r += 15.0
@@ -1471,6 +1777,7 @@ def _tech_score(rsi: Optional[float], adx: Optional[float]) -> float:
         else: r += 0.0
     else:
         r += 7.5
+
     if adx is not None and np.isfinite(adx):
         if 20 <= adx <= 40: r += 10.0
         elif 15 <= adx < 20 or 40 < adx <= 50: r += 6.0
@@ -1478,67 +1785,92 @@ def _tech_score(rsi: Optional[float], adx: Optional[float]) -> float:
         else: r += 0.0
     else:
         r += 5.0
+
+    if below_ma200 is True:
+        r = max(0.0, r - 3.0)
     return r
 
 def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df = flat.copy()
-    # 数値化
-    for c in ["ps","peg","per","rsi","adx","piot","safety","spec_score"]:
+    for c in ["ps","peg","per","rsi","adx","piot","safety","spec_score","below_ma200"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # セクター別PS中央値
+
     sec_med = df.groupby("sector")["ps"].median()
+
     def _ps_vs_sector(row):
         ps = row.get("ps")
         med = sec_med.get(row.get("sector"), np.nan)
-        if pd.isna(ps) or pd.isna(med) or med <= 0: return np.nan
+        if pd.isna(ps) or pd.isna(med) or med <= 0:
+            return np.nan
         return float(ps) / float(med)
+
     df["ps_vs_sector"] = df.apply(_ps_vs_sector, axis=1)
 
-    # コンポーネント
     df["valuation_ps"]  = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
     df["valuation_peg"] = df["peg"].apply(_val_score_from_peg)
     df["valuation_score"] = df["valuation_ps"] + df["valuation_peg"]                      # 0-25
     df["safety_score_scaled"] = df["safety"].fillna(12.0) * (20.0/25.0)                  # 0-20
     df["financial_score"] = df["piot"].fillna(4.5) * (22.5/9.0)                          # 0-22.5
-    df["technical_score"] = [_tech_score(rsi, adx) for rsi, adx in zip(df["rsi"], df["adx"])]  # 0-25
-    df["spec_penalty"] = df["spec_score"].fillna(0.0).clip(lower=0, upper=100) * (10.0/100.0)  # 0-10
 
-    # 総合
+    bm200 = df.get("below_ma200", pd.Series([np.nan]*len(df)))
+    df["technical_score"] = [
+        _tech_score(rsi, adx, (False if pd.isna(x) else bool(x)))
+        for rsi, adx, x in zip(df["rsi"], df["adx"], bm200)
+    ]  # 0-25
+
+    df["spec_penalty"] = df["spec_score"].fillna(0.0).clip(lower=0, upper=100) * (10.0/100.0)  # 0-10
+    df["per_penalty"] = np.where(df["per"].notna() & (df["per"] > MAX_PER_CORE), 3.0, 0.0)
+
     df["total_score"] = (df["valuation_score"] + df["safety_score_scaled"] +
-                         df["financial_score"] + df["technical_score"] - df["spec_penalty"])
+                         df["financial_score"] + df["technical_score"] - df["spec_penalty"] - df["per_penalty"])
     df["total_score"] = df["total_score"].clip(lower=0, upper=100)
     df["grade"] = df["total_score"].apply(_grade_from_score)
-
-    # 表示補助
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
     return df
 
 def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
-                                   topn: int = 15, details_n: int = 30, timestamp: Optional[str] = None) -> None:
-    ok = flat[flat["ok"] == True].copy()
-    if ok.empty: return
-    ranked = _build_ranked(ok)
+                                   topn: int = 15, details_n: int = 30, timestamp: Optional[str] = None) -> list[Path]:
+    outdir.mkdir(exist_ok=True, parents=True)
 
-    # 概況
+    ok = flat[flat["ok"] == True].copy()
+    core = ok[ok["core_candidate"] == True].copy()
+    sat = ok[ok["satellite_candidate"] == True].copy()
+    if core.empty:
+        return []
+
+    ranked = _build_ranked(core)
+
     now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M")
     n = len(ranked)
     avg_score = ranked["total_score"].mean()
     grade_counts = ranked["grade"].value_counts().reindex(["A+","A","B+","B","C"]).fillna(0).astype(int)
 
-    # 分布
-    ps_avg, ps_med = ranked["ps_vs_sector"].mean(skipna=True), ranked["ps_vs_sector"].median(skipna=True)
-    ps_min, ps_max = ranked["ps_vs_sector"].min(skipna=True), ranked["ps_vs_sector"].max(skipna=True)
-    peg_avg, peg_med = ranked["peg"].mean(skipna=True), ranked["peg"].median(skipna=True)
-    peg_min, peg_max = ranked["peg"].min(skipna=True), ranked["peg"].max(skipna=True)
+    ps_avg = ranked["ps_vs_sector"].mean(skipna=True)
+    ps_med = ranked["ps_vs_sector"].median(skipna=True)
+    ps_min = ranked["ps_vs_sector"].min(skipna=True)
+    ps_max = ranked["ps_vs_sector"].max(skipna=True)
 
-    # Topテーブル
+    peg_avg = ranked["peg"].mean(skipna=True)
+    peg_med = ranked["peg"].median(skipna=True)
+    peg_min = ranked["peg"].min(skipna=True)
+    peg_max = ranked["peg"].max(skipna=True)
+
     top = ranked.sort_values("total_score", ascending=False).head(topn)
-    lines = []
-    lines.append("# 🏆 PS・PEGレシオ対応 投資銘柄スクリーニング レポート")
+
+    lines: list[str] = []
+    lines.append("# 🏆 PS・PEGレシオ対応 投資銘柄スクリーニング レポート（Core候補）")
     lines.append("")
     lines.append(f"**📅 生成日時:** {now}")
-    lines.append(f"**📊 分析対象:** {n}銘柄")
+    lines.append(f"**📊 分析対象(Core):** {n}銘柄")
+    lines.append("")
+    lines.append("## ✅ 必須フィルタ（Core前提）")
+    lines.append("")
+    lines.append(f"- avg_volume_30d >= {MIN_AVG_VOLUME_30D:,}")
+    lines.append(f"- market_cap >= {MIN_MARKET_CAP_JPY:,} JPY")
+    lines.append(f"- 営業利益安定（直近{OP_INCOME_YEARS}年・赤字除外={EXCLUDE_OP_INCOME_DEFICIT}・急落floor={OP_INCOME_DROP_FLOOR}）")
+    lines.append(f"- PS <= {MAX_PS_DEFENSIVE}")
+    lines.append(f"- PER <= {MAX_PER_CORE}（超はSatellite扱い）")
     lines.append("")
     lines.append("## 📋 エグゼクティブサマリー")
     lines.append("")
@@ -1550,30 +1882,6 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append(f"  - B: {grade_counts['B']}銘柄")
     lines.append(f"  - C: {grade_counts['C']}銘柄")
     lines.append("")
-    # 長期向け（条件ベース）ランキング
-    if "safety_criteria_score" in ok.columns:
-        ok_lt = ok.copy()
-        ok_lt["safety_criteria_score"] = pd.to_numeric(ok_lt["safety_criteria_score"], errors="coerce")
-        lt = ok_lt.sort_values("safety_criteria_score", ascending=False).head(topn)
-        lines.append(f"## 🧱 長期投資向け 安全基準Top{topn}（条件ベース）")
-        lines.append("")
-        lines.append("| 順位 | 銘柄コード | 銘柄名 | セクター | 基準スコア | PS<1 | OCF+ | 自己資本>=50% | DD正常 | 売上CAGR |")
-        lines.append("|------|------------|--------|----------|-----------:|:----:|:---:|:-------------:|:------:|---------:|")
-        for i, r in enumerate(lt.itertuples(index=False), 1):
-            cagr = getattr(r, "sales_cagr", None)
-            cagr_str = f"{cagr:.2%}" if (cagr is not None and np.isfinite(cagr)) else "N/A"
-            score = getattr(r, "safety_criteria_score", None)
-            score_str = f"{score:.1f}" if (score is not None and np.isfinite(score)) else "N/A"
-            lines.append(
-                f"| {i} | {getattr(r,'code','')} | {getattr(r,'name','')} | {getattr(r,'sector','')} | {score_str} | "
-                f"{'✅' if getattr(r,'ps_under_1', False) else '—'} | "
-                f"{'✅' if getattr(r,'positive_ocf', False) else '—'} | "
-                f"{'✅' if getattr(r,'equity_ratio_50plus', False) else '—'} | "
-                f"{'✅' if getattr(r,'no_speculative_drop', False) else '—'} | "
-                f"{cagr_str} |"
-            )
-        lines.append("")
-
     lines.append("## 💰 バリュエーション分析")
     lines.append("")
     lines.append("### PSレシオ（セクター比）")
@@ -1588,14 +1896,15 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append(f"- 最小: {peg_min:.2f}")
     lines.append(f"- 最大: {peg_max:.2f}")
     lines.append("")
-    lines.append(f"## 🏆 投資推奨 Top{topn}銘柄")
+    lines.append(f"## 🏆 投資推奨 Top{topn}銘柄（Core）")
     lines.append("")
     lines.append("| 順位 | 銘柄コード | 銘柄名 | グレード | スコア | セクター | PS比 | PEG | ピオトロスキー |")
     lines.append("|------|------------|--------|----------|--------|----------|------|-----|---------------|")
     for i, r in enumerate(top.itertuples(index=False), 1):
+        ps_vs = 0 if pd.isna(r.ps_vs_sector) else r.ps_vs_sector
+        peg = 0 if pd.isna(r.peg) else r.peg
         lines.append(f"| {i} | {r.code} | {r.name} | {r.grade} | {r.total_score:.1f} | {r.sector} | "
-                     f"{(0 if pd.isna(r.ps_vs_sector) else r.ps_vs_sector):.2f} | "
-                     f"{(0 if pd.isna(r.peg) else r.peg):.2f} | {r.pio_disp} |")
+                     f"{ps_vs:.2f} | {peg:.2f} | {r.pio_disp} |")
     lines.append("")
     lines.append(f"## 📊 詳細分析（上位{details_n}銘柄）")
     lines.append("")
@@ -1609,84 +1918,62 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append(f"- 財務健全性: {r.financial_score:.1f}点")
         lines.append(f"- テクニカル: {r.technical_score:.1f}点")
         lines.append(f"- 仕手株ペナルティ: {r.spec_penalty:.1f}点")
+        lines.append(f"- PERペナルティ: {r.per_penalty:.1f}点")
         lines.append("")
 
-    outdir.mkdir(exist_ok=True, parents=True)
+    if not sat.empty:
+        lines.append("## 🛰 Satellite候補（参考）")
+        lines.append("")
+        lines.append(f"- 件数: {len(sat)}（base_okだがPS/PER条件でcore外）")
+        lines.append("")
+
     suffix = f"_{timestamp}" if timestamp else ""
-    (outdir / f"ranked_with_scores{suffix}.csv").write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
-    (outdir / f"report_investment_advice{suffix}.md").write_text("\n".join(lines), encoding="utf-8")
+    p_csv = outdir / f"ranked_with_scores_core{suffix}.csv"
+    p_md  = outdir / f"report_investment_advice_core{suffix}.md"
+    p_csv.write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
+    p_md.write_text("\n".join(lines), encoding="utf-8")
+    return [p_csv, p_md]
 
-def build_offline_analysis_tasks(session: requests.Session) -> list[tuple[str, str, str, str | None]]:
-    """
-    凍結キャッシュが揃っている銘柄だけを抽出し、(code, name, market, sector_hint) のタスク配列を返す。
-    これを使って analyze_single_stock_complete_v3 に“name”を渡す。
-    """
-    fdm = FinancialDataManager(session)
-    df_list = fdm.get_stock_list_v2(force_refresh=False)
-    fc = FrozenCache()
+# ------------------------------------------------------------
+# ★ 追加: master CSVから一括レポート生成（外部モジュール不要）
+# ------------------------------------------------------------
+def _infer_timestamp_from_master_csv(path: Path) -> str:
+    m = re.search(r"screening_offline_(\d{8}_\d{6})\.csv", path.name)
+    if m:
+        return m.group(1)
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # キャッシュが両方あるコードだけ残す
-    df_list = df_list.copy()
-    df_list["Code"] = df_list["Code"].astype(str)
-    mask = df_list["Code"].apply(lambda c: fc.has_all(c))
-    rows = df_list[mask][["Code", "CompanyName", "MarketCode", "Sector33Name"]]
+def generate_reports_from_master_csv(
+    master_csv_path: str | Path,
+    reports_dir: str | Path = REPORTS_DIR,
+    topn: int = 30,
+) -> list[Path]:
+    master_csv_path = Path(master_csv_path)
+    reports_dir = Path(reports_dir)
+    reports_dir.mkdir(exist_ok=True, parents=True)
 
-    tasks: list[tuple[str, str, str, str | None]] = []
-    for row in rows.itertuples(index=False):
-        code   = str(row.Code)
-        name   = str(getattr(row, "CompanyName", "") or "")
-        market = str(getattr(row, "MarketCode", "") or "")
-        sector = str(getattr(row, "Sector33Name", "") or "") or None
-        tasks.append((code, name, market, sector))
-    return tasks
+    if not master_csv_path.exists():
+        raise FileNotFoundError(f"master_csv_path not found: {master_csv_path}")
 
+    flat = pd.read_csv(master_csv_path, encoding="utf-8-sig")
+    ts = _infer_timestamp_from_master_csv(master_csv_path)
 
-def lookup_company_name(session: requests.Session, code: str) -> str:
-    """
-    単銘柄分析用。コード→CompanyName を株主名簿から解決。
-    見つからなければ空文字を返す。
-    """
-    fdm = FinancialDataManager(session)
-    df_list = fdm.get_stock_list_v2(force_refresh=False)
-    df_list = df_list.copy()
-    df_list["Code"] = df_list["Code"].astype(str)
-    hit = df_list[df_list["Code"] == str(code)]
-    if not hit.empty:
-        return str(hit.iloc[0].get("CompanyName") or "")
-    return ""
+    outputs: list[Path] = []
+    outputs.append(master_csv_path)
 
+    outputs += write_candidate_sets(flat, reports_dir, timestamp=ts)
+    outputs += write_reports(flat, reports_dir, topn=topn, timestamp=ts)
+
+    p_md = write_markdown_report(flat, reports_dir, topn=min(10, topn), timestamp=ts)
+    if p_md:
+        outputs.append(p_md)
+
+    outputs += write_investment_advice_report(flat, reports_dir, topn=max(15, min(topn, 30)), details_n=max(30, topn), timestamp=ts)
+    return outputs
 
 # ------------------------------------------------------------
 # インタラクティブUI / CLI
 # ------------------------------------------------------------
-def _flatten_result(d: dict) -> dict:
-    pio = d.get("piotroski") or {}; saf = d.get("safety") or {}; spc = d.get("speculation") or {}
-    safety_criteria = d.get("safety_criteria") or {}
-    criteria = safety_criteria.get("criteria", {}) if isinstance(safety_criteria, dict) else {}
-    return {
-        "code": d.get("stock_code"), "name": d.get("company_name"), "sector": d.get("sector_name"),
-        "price": d.get("current_price"), "ps": d.get("ps_ratio"), "peg": d.get("peg_ratio"), "per": d.get("per"),
-        "rsi": d.get("rsi"), "adx": d.get("adx"),
-        "piot": pio.get("score"), "piot_eval": pio.get("evaluation"),
-        "safety": saf.get("total_score"), "safety_level": saf.get("safety_level"),
-        "spec_score": spc.get("score"), "spec_level": spc.get("level"),
-        "safety_criteria_score": safety_criteria.get("total_score") if isinstance(safety_criteria, dict) else None,
-        "ps_under_1": criteria.get("ps_under_1", False),
-        "cash_rich": criteria.get("cash_rich", False),
-        "positive_ocf": criteria.get("positive_ocf", False),
-        "equity_ratio_50plus": criteria.get("equity_ratio_50plus", False),
-        "equity_ratio_70plus": criteria.get("equity_ratio_70plus", False),
-        "growth_potential": criteria.get("growth_potential", False),
-        "no_speculative_drop": criteria.get("no_speculative_drop", False),
-        "equity_ratio": safety_criteria.get("equity_ratio") if isinstance(safety_criteria, dict) else None,
-        "max_drawdown": safety_criteria.get("max_drawdown") if isinstance(safety_criteria, dict) else None,
-        "sales_cagr": safety_criteria.get("sales_cagr") if isinstance(safety_criteria, dict) else None,
-        "market_cap": d.get("market_cap"),
-        "avg_volume_30d": d.get("avg_volume_30d"),
-        "ok": d.get("success"), "error": d.get("error"),
-    }
-
-
 def run_interactive():
     session = get_authenticated_session_jquants()
     sector_avgs = DynamicSectorAverages(session).get_sector_averages()
@@ -1696,7 +1983,7 @@ def run_interactive():
     while True:
         print("=== メニュー ===")
         print("1) 収集（価格+財務を凍結保存）")
-        print("2) オフライン一括分析（トップ10出力）")
+        print("2) オフライン一括分析（core/satellite/excluded 出力）")
         print("3) 単銘柄分析（キャッシュ使用）")
         print("4) セクター平均を更新（キャッシュから計算）")
         print("5) 全銘柄ゆっくり収集（自動待機・再開可）")
@@ -1710,10 +1997,13 @@ def run_interactive():
             budget = int(budget) if budget.isdigit() else 380
             s = collect_batch(session, budget)
             print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}")
+
         elif choice == "2":
             tasks = build_offline_analysis_tasks(session)
             if not tasks:
-                print("キャッシュ不足。先に収集を実行してください。"); continue
+                print("キャッシュ不足。先に収集を実行してください。")
+                continue
+
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1727,36 +2017,19 @@ def run_interactive():
                     if i % 200 == 0 or i == len(futs):
                         ok_cnt = sum(1 for r in results if r.get("success"))
                         print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
+
             flat = pd.DataFrame([_flatten_result(r) for r in results])
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            outfile = outdir / f"screening_offline_{ts}.csv"
-            flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-            try:
-                write_reports(flat, outdir, topn=10, timestamp=ts)
-                write_markdown_report(flat, outdir, topn=10, timestamp=ts)
-                write_investment_advice_report(flat, outdir, topn=15, timestamp=ts)
-            except Exception as e:
-                logger.exception("レポート生成で例外: %s", e)
-                print(f"⚠️ レポート生成でエラー: {e}")
-            print(f"✅ 出力: {outfile}")
+            master = outdir / f"screening_offline_{ts}.csv"
+            flat.to_csv(master, index=False, encoding="utf-8-sig")
+
+            outputs = generate_reports_from_master_csv(master, outdir, topn=30)
+            print(f"✅ 出力: {master}")
             print(f"✅ 出力先: {outdir}")
-            expected = [
-                f"top_recommended_{ts}.csv",
-                f"top_safety_{ts}.csv",
-                f"top_speculative_{ts}.csv",
-                f"top_piotroski_{ts}.csv",
-                f"top_safe_long_term_{ts}.csv",
-                f"ranked_with_scores_{ts}.csv",
-                f"report_top10_{ts}.md",
-                f"report_investment_advice_{ts}.md",
-            ]
             print("=== 生成物 ===")
-            for fn in expected:
-                p = outdir / fn
-                if p.exists():
-                    print(f"  - {p}")
-                else:
-                    print(f"  - (missing) {p}")
+            for p in outputs:
+                print(f"  - {p}")
+
         elif choice == "3":
             code = input("銘柄コード4桁: ").strip()
             name = lookup_company_name(session, code)
@@ -1766,14 +2039,14 @@ def run_interactive():
             fp = outdir / f"single_{code}_{ts}.csv"
             df.to_csv(fp, index=False, encoding="utf-8-sig")
             print(f"✅ 出力: {fp}")
+
         elif choice == "4":
             print("📊 セクター平均をキャッシュから計算中...")
             sector_avgs_obj = DynamicSectorAverages(session)
             updated_avgs = sector_avgs_obj.calculate_sector_averages_from_cache()
             if updated_avgs:
-                # キャッシュを更新
                 cache_file = CACHE_DIR / "sector_averages.json"
-                sectors = ['自動車','半導体','エレクトロニクス','銀行','通信','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+                sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
                 data = {}
                 for sector in sectors:
                     if sector in updated_avgs:
@@ -1794,25 +2067,29 @@ def run_interactive():
                     print(f"  {sector}: PS={ps_str}, PEG={peg_str}, サンプル数={sample_count}")
             else:
                 print("⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。")
+
         elif choice == "5":
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
             collect_all_daemon(session, daily_budget=budget)
+
         elif choice == "6":
             days = input("何日より古ければ取り直すか（日数。例: 7）: ").strip()
             days = int(days) if days.isdigit() else 7
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
             collect_all_daemon(session, daily_budget=budget, refresh_days=days, reset_pending=True)
+
         elif choice == "7":
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
             collect_all_daemon(session, daily_budget=budget, force_full=True, reset_pending=True)
+
         elif choice == "q":
             break
+
         else:
             print("無効な選択")
-
 
 def main():
     import argparse
@@ -1823,7 +2100,6 @@ def main():
     parser.add_argument("--code")
     parser.add_argument("--budget", type=int, default=380)
     parser.add_argument("--top", type=int, default=10)
-    # 追加フラグ
     parser.add_argument("--reset-pending", action="store_true")
     parser.add_argument("--refresh-days", type=int)
     parser.add_argument("--force-full", action="store_true")
@@ -1868,6 +2144,7 @@ def main():
         if not tasks:
             print("キャッシュ不足。先に --phase collect か collect_all を実行してください。")
             return
+
         results = []
         max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1881,22 +2158,18 @@ def main():
                 if i % 200 == 0 or i == len(futs):
                     ok_cnt = sum(1 for r in results if r.get("success"))
                     print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
+
         flat = pd.DataFrame([_flatten_result(r) for r in results])
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        outfile = outdir / f"screening_offline_{ts}.csv"
-        flat.to_csv(outfile, index=False, encoding="utf-8-sig")
-        try:
-            write_reports(flat, outdir, topn=max(10, args.top), timestamp=ts)
-            write_markdown_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
-            write_investment_advice_report(flat, outdir, topn=max(10, args.top), timestamp=ts)
-        except Exception as e:
-            logger.exception("レポート生成で例外: %s", e)
-            print(f"⚠️ レポート生成でエラー: {e}")
-        print(f"✅ オフライン分析出力: {outfile}")
+        master = outdir / f"screening_offline_{ts}.csv"
+        flat.to_csv(master, index=False, encoding="utf-8-sig")
+
+        outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
+        print(f"✅ オフライン分析出力: {master}")
         print(f"✅ 出力先: {outdir}")
-
-
+        print("=== 生成物 ===")
+        for p in outputs:
+            print(f"  - {p}")
 
 if __name__ == "__main__":
-    # 引数未指定で△ボタン実行→メニュー表示
     main()
