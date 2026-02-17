@@ -1627,7 +1627,51 @@ def _flatten_result(d: dict) -> dict:
         "error": d.get("error"),
     }
 
-def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: str) -> list[Path]:
+def _report_file_base(path: Path) -> str:
+    """レポートファイルの正規化ベース名。top_recommended_core と top_recommended_* を同一グループに"""
+    stem = path.stem
+    m = re.match(r"^(.+)_\d{8}_\d{6}$", stem)
+    base = m.group(1) if m else stem
+    if base.endswith("_core"):
+        return base[:-5]
+    return base
+
+def _cleanup_old_files_by_ext(outdir: Path, ext: str) -> int:
+    """指定拡張子のファイルを種類ごとに最新1件だけ残し、古いものを削除。削除件数を返す"""
+    files = list(outdir.glob(f"*{ext}"))
+    if not files:
+        return 0
+    by_base: Dict[str, list] = {}
+    for f in files:
+        base = _report_file_base(f)
+        by_base.setdefault(base, []).append(f)
+    deleted = 0
+    for base, flist in by_base.items():
+        if len(flist) <= 1:
+            continue
+        latest = max(flist, key=lambda p: p.stat().st_mtime)
+        for f in flist:
+            if f != latest:
+                try:
+                    f.unlink()
+                    deleted += 1
+                except OSError as e:
+                    logger.warning("古いファイル削除失敗: %s (%s)", f, e)
+    return deleted
+
+def cleanup_old_report_files(outdir: Path) -> None:
+    """各レポート種類ごとに最新1件だけ残し、古いCSV/MD/JSONを削除してストレージを節約する"""
+    outdir = Path(outdir)
+    if not outdir.exists():
+        return
+    total = 0
+    total += _cleanup_old_files_by_ext(outdir, ".csv")
+    total += _cleanup_old_files_by_ext(outdir, ".md")
+    total += _cleanup_old_files_by_ext(outdir, ".json")
+    if total > 0:
+        print(f"🗑️ 古いレポート {total}件を削除しました ({outdir})")
+
+def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[str] = None) -> list[Path]:
     outdir.mkdir(exist_ok=True, parents=True)
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
@@ -1637,9 +1681,10 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: str) -> li
     sat = ok[ok["satellite_candidate"] == True].copy()
     exc = ok[(ok["base_ok"] != True) | (ok["op_income_stable"] != True) | (ok["liquidity_ok"] != True) | (ok["market_cap_ok"] != True)].copy()
 
-    p_core = outdir / f"core_candidates_{timestamp}.csv"
-    p_sat  = outdir / f"satellite_candidates_{timestamp}.csv"
-    p_exc  = outdir / f"excluded_{timestamp}.csv"
+    # 固定名で上書き（ストレージ節約）
+    p_core = outdir / "core_candidates.csv"
+    p_sat  = outdir / "satellite_candidates.csv"
+    p_exc  = outdir / "excluded.csv"
     core.to_csv(p_core, index=False, encoding="utf-8-sig")
     sat.to_csv(p_sat, index=False, encoding="utf-8-sig")
     exc.to_csv(p_exc, index=False, encoding="utf-8-sig")
@@ -1659,7 +1704,7 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: str) -> li
             "EXCLUDE_OP_INCOME_DEFICIT": EXCLUDE_OP_INCOME_DEFICIT,
         }
     }
-    p_sum = outdir / f"filter_summary_{timestamp}.json"
+    p_sum = outdir / "filter_summary.json"
     p_sum.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return [p_core, p_sat, p_exc, p_sum]
 
@@ -1669,7 +1714,7 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
     if ok.empty:
         return []
 
-    suffix = f"_{timestamp}" if timestamp else ""
+    # 固定名で上書き（ストレージ節約）
     for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score","market_cap","avg_volume_30d"]:
         if c in ok.columns:
             ok[c] = pd.to_numeric(ok[c], errors="coerce")
@@ -1680,29 +1725,29 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
     outs: list[Path] = []
 
     if not core.empty:
-        p1 = outdir / f"top_recommended_core{suffix}.csv"
+        p1 = outdir / "top_recommended_core.csv"
         core.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p1, index=False, encoding="utf-8-sig")
         outs.append(p1)
 
-        p2 = outdir / f"top_safety_core{suffix}.csv"
+        p2 = outdir / "top_safety_core.csv"
         core.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(p2, index=False, encoding="utf-8-sig")
         outs.append(p2)
 
-        p3 = outdir / f"top_speculative_core{suffix}.csv"
+        p3 = outdir / "top_speculative_core.csv"
         core.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(p3, index=False, encoding="utf-8-sig")
         outs.append(p3)
 
-        p4 = outdir / f"top_piotroski_core{suffix}.csv"
+        p4 = outdir / "top_piotroski_core.csv"
         core.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(p4, index=False, encoding="utf-8-sig")
         outs.append(p4)
 
         if "safety_criteria_score" in core.columns:
-            p5 = outdir / f"top_safe_long_term_core{suffix}.csv"
+            p5 = outdir / "top_safe_long_term_core.csv"
             core.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(p5, index=False, encoding="utf-8-sig")
             outs.append(p5)
 
     if not sat.empty:
-        p6 = outdir / f"top_recommended_satellite{suffix}.csv"
+        p6 = outdir / "top_recommended_satellite.csv"
         sat.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p6, index=False, encoding="utf-8-sig")
         outs.append(p6)
 
@@ -1737,8 +1782,7 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
             f"PER {r['per']} | PS {r['ps']} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
-    suffix = f"_{timestamp}" if timestamp else ""
-    p = outdir / f"report_core_top{topn}{suffix}.md"
+    p = outdir / f"report_core_top{topn}.md"
     p.write_text("\n".join(lines), encoding="utf-8")
     return p
 
@@ -1927,9 +1971,8 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append(f"- 件数: {len(sat)}（base_okだがPS/PER条件でcore外）")
         lines.append("")
 
-    suffix = f"_{timestamp}" if timestamp else ""
-    p_csv = outdir / f"ranked_with_scores_core{suffix}.csv"
-    p_md  = outdir / f"report_investment_advice_core{suffix}.md"
+    p_csv = outdir / "ranked_with_scores_core.csv"
+    p_md  = outdir / "report_investment_advice_core.md"
     p_csv.write_text(ranked.to_csv(index=False, encoding="utf-8-sig"), encoding="utf-8")
     p_md.write_text("\n".join(lines), encoding="utf-8")
     return [p_csv, p_md]
@@ -1969,6 +2012,10 @@ def generate_reports_from_master_csv(
         outputs.append(p_md)
 
     outputs += write_investment_advice_report(flat, reports_dir, topn=max(15, min(topn, 30)), details_n=max(30, topn), timestamp=ts)
+    # 全レポート出力後に古いCSVを削除（output/ と output/reports/ の両方、ストレージ節約）
+    cleanup_old_report_files(reports_dir)
+    if reports_dir.parent != reports_dir:
+        cleanup_old_report_files(reports_dir.parent)
     return outputs
 
 # ------------------------------------------------------------
@@ -2019,8 +2066,7 @@ def run_interactive():
                         print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
 
             flat = pd.DataFrame([_flatten_result(r) for r in results])
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            master = outdir / f"screening_offline_{ts}.csv"
+            master = outdir / "screening_offline.csv"
             flat.to_csv(master, index=False, encoding="utf-8-sig")
 
             outputs = generate_reports_from_master_csv(master, outdir, topn=30)
@@ -2035,9 +2081,10 @@ def run_interactive():
             name = lookup_company_name(session, code)
             res = analyze_single_stock_complete_v3(session, sector_avgs, code, name=name, offline=True)
             df = pd.DataFrame([_flatten_result(res)])
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            fp = outdir / f"single_{code}_{ts}.csv"
+            fp = outdir / f"single_{code}.csv"
             df.to_csv(fp, index=False, encoding="utf-8-sig")
+            cleanup_old_report_files(outdir)
+            cleanup_old_report_files(outdir.parent)
             print(f"✅ 出力: {fp}")
 
         elif choice == "4":
@@ -2133,9 +2180,10 @@ def main():
         name = lookup_company_name(session, args.code)
         res = analyze_single_stock_complete_v3(session, sector_avgs, args.code, name=name, offline=True)
         df = pd.DataFrame([_flatten_result(res)])
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fp = outdir / f"single_{args.code}_{ts}.csv"
+        fp = outdir / f"single_{args.code}.csv"
         df.to_csv(fp, index=False, encoding="utf-8-sig")
+        cleanup_old_report_files(outdir)
+        cleanup_old_report_files(outdir.parent)
         print(f"✅ 単銘柄出力: {fp}")
         return
 
@@ -2160,8 +2208,7 @@ def main():
                     print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
 
         flat = pd.DataFrame([_flatten_result(r) for r in results])
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        master = outdir / f"screening_offline_{ts}.csv"
+        master = outdir / "screening_offline.csv"
         flat.to_csv(master, index=False, encoding="utf-8-sig")
 
         outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
