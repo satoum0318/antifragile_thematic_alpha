@@ -1050,12 +1050,18 @@ def calculate_ps_ratio(current_price: Optional[float], revenue_per_share: Option
         return None
 
 def calculate_peg_ratio(per: Optional[float], eps_growth_rate_pct: Optional[float]) -> Optional[float]:
+    """PEG=PER/EPS成長率。0や極小値は欠損扱い（成長率異常・データ不備の可能性）"""
     try:
         if per is None or eps_growth_rate_pct is None:
             return None
         if per <= 0 or eps_growth_rate_pct <= 0:
             return None
-        return float(per) / float(eps_growth_rate_pct)
+        peg = float(per) / float(eps_growth_rate_pct)
+        if peg <= 0 or not np.isfinite(peg):
+            return None
+        if peg < 0.01:
+            return None
+        return peg
     except Exception:
         return None
 
@@ -1335,7 +1341,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         per = val.get("per")
 
         defensive_ps_ok = (ps_ratio is not None and np.isfinite(ps_ratio) and ps_ratio <= MAX_PS_DEFENSIVE)
-        per_satellite = (per is not None and np.isfinite(per) and per > MAX_PER_CORE)  # per=None(EPS<=0等)は除外しない
+        per_satellite = (per is not None and np.isfinite(per) and per > MAX_PER_CORE)
+        per_core_ok = (per is not None and np.isfinite(per) and per <= MAX_PER_CORE)
 
         op_income_eval = evaluate_operating_income_stability(
             financial_history,
@@ -1346,7 +1353,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         op_income_stable = (op_income_eval.get("stable") is True)
 
         base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
-        core_candidate = bool(base_ok and defensive_ps_ok and (not per_satellite))
+        core_candidate = bool(base_ok and defensive_ps_ok and per_core_ok)
         satellite_candidate = bool(base_ok and (not core_candidate))
 
         filter_details = {
@@ -1354,6 +1361,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "market_cap_ok": market_cap_ok,
             "defensive_ps_ok": defensive_ps_ok,
             "per_satellite": per_satellite,
+            "per_core_ok": per_core_ok,
             "op_income_stable": op_income_stable,
             "op_income_reason": op_income_eval.get("reason"),
             "base_ok": base_ok,
@@ -1804,7 +1812,9 @@ def _val_score_from_ps_vs_sector(x: Optional[float]) -> float:
     return 0.0
 
 def _val_score_from_peg(x: Optional[float]) -> float:
+    """PEGが取れた銘柄のみ加点。0/欠損は中立（誤判定防止）"""
     if x is None or not np.isfinite(x): return 6.0
+    if x <= 0: return 6.0
     if x <= 0.5: return 12.5
     if x <= 1.0: return 10.0
     if x <= 1.5: return 8.0
