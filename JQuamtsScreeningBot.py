@@ -1204,7 +1204,12 @@ def calculate_piotroski_real(fin: dict) -> dict:
     def nz(x, default=0.0):
         if x in (None, "", "NA") or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
             return default
-        return float(x)
+        try:
+            if isinstance(x, str):
+                x = x.replace(",", "").strip()
+            return float(x)
+        except (TypeError, ValueError):
+            return default
     def safe_ratio(a, b):
         a, b = nz(a, 0.0), nz(b, 0.0)
         return a / b if b != 0 else 0.0
