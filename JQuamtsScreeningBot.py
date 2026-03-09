@@ -29,6 +29,7 @@ import re
 import sys
 import json
 import time
+import copy
 import signal
 import logging
 import datetime
@@ -61,6 +62,7 @@ REPORTS_DIR = Path("output") / "reports"
 # スクリーニング必須フィルタ（環境変数で上書き可）
 # ------------------------------------------------------------
 MIN_AVG_VOLUME_30D = int(os.getenv("MIN_AVG_VOLUME_30D", "50000"))
+MIN_ADV_JPY_20D = int(os.getenv("MIN_ADV_JPY_20D", "300000000"))
 MIN_MARKET_CAP_JPY = int(os.getenv("MIN_MARKET_CAP_JPY", "50000000000"))  # 50B JPY
 MAX_PS_DEFENSIVE = float(os.getenv("MAX_PS_DEFENSIVE", "2.0"))
 MAX_PER_CORE = float(os.getenv("MAX_PER_CORE", "60.0"))
@@ -359,7 +361,8 @@ class DynamicSectorAverages:
             return False
         return (time.time() - self.cache_timestamp) < self.cache_duration
 
-    def get_default_sector_average(self, sector: str) -> dict:
+    @staticmethod
+    def default_sector_average(sector: str) -> dict:
         defaults = {
             '自動車': {'ps': 0.8, 'peg': 1.2, 'eps_growth': 8.5},
             '半導体': {'ps': 4.5, 'peg': 1.8, 'eps_growth': 12.2},
@@ -382,6 +385,9 @@ class DynamicSectorAverages:
             'data_source': 'static_default'
         }
 
+    def get_default_sector_average(self, sector: str) -> dict:
+        return self.default_sector_average(sector)
+
     def get_sector_averages(self, force_refresh: bool = False) -> dict:
         if not force_refresh and self.is_cache_valid() and self.sector_cache:
             print("📊 セクター平均: メモリキャッシュ")
@@ -401,7 +407,7 @@ class DynamicSectorAverages:
 
         print("📊 セクター平均: 静的デフォルト")
         sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
-        data = {s: self.get_default_sector_average(s) for s in sectors}
+        data = {s: self.default_sector_average(s) for s in sectors}
         cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
         self.sector_cache = data
         self.cache_timestamp = time.time()
@@ -636,10 +642,12 @@ class FinancialDataManager:
 
     def _fill_missing_fields(self, fin: dict) -> dict:
         cur, prev = fin.get("current", {}), fin.get("previous", {})
+        imputed: dict[str, str] = {}
 
         for fld in ("current_assets", "current_liabilities", "gross_profit_margin", "shares_outstanding"):
             if cur.get(fld) is None and prev.get(fld) is not None:
                 cur[fld] = prev.get(fld)
+                imputed[fld] = "previous_period"
 
         sector = DynamicSectorAverages.normalize_sector(fin.get("sector", "その他"))
         med = DynamicSectorAverages.SECTOR_MEDIANS.get(sector, DynamicSectorAverages.SECTOR_MEDIANS["その他"])
@@ -649,17 +657,25 @@ class FinancialDataManager:
 
         if (cur.get("current_assets") is None and cur.get("total_assets") and ca_ratio):
             cur["current_assets"] = cur["total_assets"] * ca_ratio
+            imputed["current_assets"] = "sector_ratio"
 
         if (cur.get("current_liabilities") is None and cur.get("total_assets") and cur.get("equity") and cl_ratio):
             cur["current_liabilities"] = (cur["total_assets"] - cur["equity"]) * cl_ratio
+            imputed["current_liabilities"] = "sector_ratio"
 
         if cur.get("gross_profit_margin") is None and gpm_med:
             cur["gross_profit_margin"] = gpm_med * 0.95
+            imputed["gross_profit_margin"] = "sector_median_discounted"
 
         fin["current"] = cur
         fin["previous"] = prev
         for k, v in cur.items():
             fin[f"current_{k}"] = v
+        fin["_imputation"] = {
+            "has_imputation": bool(imputed),
+            "field_count": len(imputed),
+            "fields": imputed,
+        }
         return fin
 
 # ------------------------------------------------------------
@@ -800,14 +816,120 @@ def _fiscal_year_from_statement(record: dict) -> int:
             return int(match[0])
     return -1
 
-def build_financial_history_from_statements(stmts: List[dict], max_years: int = 5) -> List[dict]:
+def _parse_optional_date(value: Any) -> Optional[datetime.date]:
+    if value in (None, "", "NA"):
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) >= 10:
+        text = text[:10]
+    text = text.replace("/", "-")
+    for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y.%m.%d"):
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+def _statement_period_type(record: dict) -> str:
+    parts = [
+        str(record.get(k) or "")
+        for k in (
+            "TypeOfDocument", "DocumentType", "ReportType",
+            "CurrentPeriodType", "CurrentFiscalYearEndDate", "CurrentPeriodEndDate"
+        )
+    ]
+    text = " ".join(parts).lower()
+    if any(x in text for x in ("q1", "1q", "第1四半期")):
+        return "q1"
+    if any(x in text for x in ("q2", "2q", "第2四半期", "半期", "interim")):
+        return "q2"
+    if any(x in text for x in ("q3", "3q", "第3四半期")):
+        return "q3"
+    if any(x in text for x in ("annual", "fy", "通期", "本決算", "年度")):
+        return "annual"
+    return "unknown"
+
+def _statement_disclosed_date(record: dict) -> Optional[datetime.date]:
+    for key in ("DisclosedDate", "DisclosureDate", "PublishedDate", "Date"):
+        dt = _parse_optional_date(record.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+def _statement_period_end_date(record: dict) -> Optional[datetime.date]:
+    for key in ("CurrentPeriodEndDate", "CurrentFiscalYearEndDate", "FiscalYearEnd", "PeriodEnd", "DisclosedDate"):
+        dt = _parse_optional_date(record.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+def _statement_sort_key(record: dict) -> tuple:
+    disclosed = _statement_disclosed_date(record) or datetime.date.min
+    period_end = _statement_period_end_date(record) or datetime.date.min
+    return (disclosed, period_end, _fiscal_year_from_statement(record))
+
+def build_financial_history_from_statements(
+    stmts: List[dict],
+    max_years: int = 5,
+    as_of_date: Optional[datetime.date] = None,
+) -> List[dict]:
     if not stmts:
         return []
-    sorted_stmts = sorted(stmts, key=_fiscal_year_from_statement, reverse=True)
-    history: list[dict] = []
+    filtered_stmts = []
+    for stmt in stmts:
+        disclosed = _statement_disclosed_date(stmt)
+        if as_of_date is not None and disclosed is not None and disclosed > as_of_date:
+            continue
+        filtered_stmts.append(stmt)
+    source_stmts = filtered_stmts if as_of_date is not None else stmts
+    if not source_stmts:
+        return []
+    sorted_stmts = sorted(source_stmts, key=_statement_sort_key, reverse=True)
+
+    primary_type = "unknown"
     for stmt in sorted_stmts:
+        candidate_type = _statement_period_type(stmt)
+        if candidate_type != "unknown":
+            primary_type = candidate_type
+            break
+
+    comparable = [
+        stmt for stmt in sorted_stmts
+        if primary_type == "unknown" or _statement_period_type(stmt) == primary_type
+    ]
+    if comparable:
+        sorted_stmts = comparable
+
+    history: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for stmt in sorted_stmts:
+        fiscal_year = _fiscal_year_from_statement(stmt)
+        period_type = _statement_period_type(stmt)
+        period_end = _statement_period_end_date(stmt)
+        dedupe_key = (fiscal_year, period_type, period_end)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
         rec = {
-            "fiscal_year": _fiscal_year_from_statement(stmt),
+            "fiscal_year": fiscal_year,
             "revenue": _pick_numeric_field(stmt, ["NetSales", "Revenue", "OperatingRevenue"]),
             "operating_income": _pick_numeric_field(stmt, ["OperatingIncome", "OperatingIncomeLoss", "OperatingProfit"]),
             "net_income": _pick_numeric_field(stmt, ["NetIncomeLoss", "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome"]),
@@ -817,6 +939,9 @@ def build_financial_history_from_statements(stmts: List[dict], max_years: int = 
             "current_assets": _pick_numeric_field(stmt, ["CurrentAssets"]),
             "current_liabilities": _pick_numeric_field(stmt, ["CurrentLiabilities"]),
             "gross_profit_margin": None,
+            "disclosed_date": _statement_disclosed_date(stmt).isoformat() if _statement_disclosed_date(stmt) else None,
+            "period_end_date": period_end.isoformat() if period_end else None,
+            "statement_type": period_type,
             "shares_outstanding": _pick_numeric_field(
                 stmt,
                 [
@@ -853,6 +978,75 @@ def build_financial_history_from_statements(stmts: List[dict], max_years: int = 
         if len(history) >= max_years:
             break
     return history
+
+def calculate_liquidity_metrics(
+    close: pd.Series,
+    volume: Optional[pd.Series],
+) -> dict:
+    out = {
+        "avg_volume_30d": None,
+        "adv_jpy_20d": None,
+        "adv_jpy_60d": None,
+        "traded_days_60d": None,
+    }
+    if not isinstance(volume, pd.Series) or volume.empty or close is None or len(close) == 0:
+        return out
+    try:
+        vol = volume.astype(float).clip(lower=0)
+        px = close.astype(float)
+        out["avg_volume_30d"] = int(vol.tail(30).mean()) if len(vol.tail(30)) else None
+        traded_value = (px * vol).replace([np.inf, -np.inf], np.nan)
+        adv20 = traded_value.tail(20).mean()
+        adv60 = traded_value.tail(60).mean()
+        out["adv_jpy_20d"] = float(adv20) if pd.notna(adv20) else None
+        out["adv_jpy_60d"] = float(adv60) if pd.notna(adv60) else None
+        out["traded_days_60d"] = int((vol.tail(60) > 0).sum())
+        return out
+    except Exception:
+        return out
+
+def calculate_medium_term_momentum(prices: pd.Series) -> dict:
+    out = {
+        "return_21d": None,
+        "return_63d": None,
+        "return_126d": None,
+        "return_252d": None,
+        "momentum_6m_1m": None,
+        "momentum_6m_3m": None,
+        "momentum_3m_1m": None,
+    }
+    if prices is None or len(prices) < 2:
+        return out
+    series = prices.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(series) < 2:
+        return out
+
+    def _ret(lookback: int) -> Optional[float]:
+        if len(series) <= lookback:
+            return None
+        base = series.iloc[-lookback - 1]
+        last = series.iloc[-1]
+        if base <= 0:
+            return None
+        return float(last / base - 1.0)
+
+    def _window_ret(long_lookback: int, short_lookback: int) -> Optional[float]:
+        if len(series) <= long_lookback or len(series) <= short_lookback:
+            return None
+        start = series.iloc[-long_lookback - 1]
+        end = series.iloc[-short_lookback - 1]
+        if start <= 0 or end <= 0:
+            return None
+        return float(end / start - 1.0)
+
+    out["return_21d"] = _ret(21)
+    out["return_63d"] = _ret(63)
+    out["return_126d"] = _ret(126)
+    out["return_252d"] = _ret(252)
+    out["momentum_6m_1m"] = _window_ret(126, 21)
+    out["momentum_6m_3m"] = _window_ret(126, 63)
+    out["momentum_3m_1m"] = _window_ret(63, 21)
+    return out
 
 def compute_sales_cagr(history: List[dict], years: int = 3) -> Optional[float]:
     if not history or len(history) <= years:
@@ -1117,6 +1311,7 @@ def calculate_safety_score_v3(
     yoy_eps_growth: float = None,
     dividend_status: str = None,
     avg_volume: int = None,
+    avg_trading_value: float = None,
     stagnant_days_after_spike: int = None,
     current_volatility: float = None,
     average_volatility: float = None,
@@ -1142,8 +1337,16 @@ def calculate_safety_score_v3(
     details['配当安定性'] = f"{dividend_status or '不明'} ({div_score:.1f})"
 
     volume_score = w['liquidity'] * (0.5 if avg_volume is None else 1.0 if avg_volume>=500000 else 0.8 if avg_volume>=200000 else 0.6 if avg_volume>=100000 else 0.3 if avg_volume>=50000 else 0)
+    if avg_trading_value is not None and np.isfinite(avg_trading_value):
+        adv_score = 1.0 if avg_trading_value >= 1_000_000_000 else 0.8 if avg_trading_value >= 500_000_000 else 0.6 if avg_trading_value >= 300_000_000 else 0.3 if avg_trading_value >= 100_000_000 else 0.0
+        volume_score = w['liquidity'] * max(volume_score / max(w['liquidity'], 1e-9), adv_score)
     safety_score += volume_score
-    details['流動性'] = f"{'不明' if avg_volume is None else f'{avg_volume:,}株'} ({volume_score:.1f})"
+    liq_note = '不明'
+    if avg_volume is not None:
+        liq_note = f'{avg_volume:,}株'
+    if avg_trading_value is not None and np.isfinite(avg_trading_value):
+        liq_note += f' / ADV{avg_trading_value/1e6:.0f}MJPY'
+    details['流動性'] = f"{liq_note} ({volume_score:.1f})"
 
     stagnant_score = w['momentum_stability'] * (0.6 if stagnant_days_after_spike is None else 1.0 if stagnant_days_after_spike==0 else 0.8 if stagnant_days_after_spike<=2 else 0.5 if stagnant_days_after_spike<=4 else 0.2 if stagnant_days_after_spike<=6 else 0)
     if current_volatility is not None and average_volatility not in (None, 0):
@@ -1266,11 +1469,19 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         rsi = float(calculate_rsi(close)) if len(close) else None
         adx, plus_di, minus_di = calculate_adx_and_di(high, low, close) if len(close) else (None, None, None)
         cur_vol, avg_vol = calculate_volatility(close) if len(close) else (None, None)
+        momentum = calculate_medium_term_momentum(close) if len(close) else {}
 
         below_ma25 = bool(current_price is not None and mas.get("ma_25") is not None and current_price < mas["ma_25"])
         below_ma75 = bool(current_price is not None and mas.get("ma_75") is not None and current_price < mas["ma_75"])
         below_ma200 = bool(current_price is not None and mas.get("ma_200") is not None and current_price < mas["ma_200"])
-        avg_volume = int(vol_s.tail(30).mean()) if isinstance(vol_s, pd.Series) and len(vol_s) else None
+        latest_price_date = None
+        if c_date and c_date in price_df.columns and len(price_df[c_date]):
+            latest_price_date = _parse_optional_date(price_df[c_date].iloc[-1])
+        liquidity = calculate_liquidity_metrics(close, vol_s)
+        avg_volume = liquidity.get("avg_volume_30d")
+        adv_jpy_20d = liquidity.get("adv_jpy_20d")
+        adv_jpy_60d = liquidity.get("adv_jpy_60d")
+        traded_days_60d = liquidity.get("traded_days_60d")
 
         # 財務
         if offline:
@@ -1278,25 +1489,36 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         else:
             stmts = fdm.fetch_statements(code)
 
-        financial_history = build_financial_history_from_statements(stmts if isinstance(stmts, list) else [], max_years=5)
+        financial_history = build_financial_history_from_statements(
+            stmts if isinstance(stmts, list) else [],
+            max_years=5,
+            as_of_date=latest_price_date,
+        )
         cur_fin = financial_history[0].copy() if financial_history else {}
         prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
+        raw_fin = {"current": cur_fin.copy(), "previous": prv_fin.copy(), "current_price": current_price, "sector": sector}
+        fin = fdm._fill_missing_fields(copy.deepcopy(raw_fin))
+        imputation = fin.get("_imputation", {}) if isinstance(fin, dict) else {}
 
-        fin = {"current": cur_fin, "previous": prv_fin, "current_price": current_price, "sector": sector}
-        fin = fdm._fill_missing_fields(fin)
+        sector_benchmark = (
+            sector_averages.get(sector)
+            or sector_averages.get(sector_raw or "")
+            or DynamicSectorAverages.default_sector_average(sector)
+        ) if isinstance(sector_averages, dict) else DynamicSectorAverages.default_sector_average(sector)
 
         # 指標
-        piot = calculate_piotroski_real(fin)
+        piot = calculate_piotroski_real(raw_fin)
         val = calculate_valuation_metrics_ps_peg(
             current_price=current_price,
-            net_income_current=fin["current"].get("net_income"),
-            net_income_previous=fin["previous"].get("net_income"),
-            revenue_current=fin["current"].get("revenue"),
-            shares_outstanding=fin["current"].get("shares_outstanding"),
+            net_income_current=raw_fin["current"].get("net_income"),
+            net_income_previous=raw_fin["previous"].get("net_income"),
+            revenue_current=raw_fin["current"].get("revenue"),
+            shares_outstanding=raw_fin["current"].get("shares_outstanding"),
         )
         safety = calculate_safety_score_v3(
             yoy_eps_growth=val.get("eps_growth_rate"),
             avg_volume=avg_volume,
+            avg_trading_value=adv_jpy_20d,
             current_volatility=cur_vol, average_volatility=avg_vol,
             below_ma25=below_ma25, below_ma75=below_ma75
         )
@@ -1308,18 +1530,18 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             current_price=current_price, mas=mas, stock_code=code
         )
 
-        shares_outstanding = fin["current"].get("shares_outstanding")
+        shares_outstanding = raw_fin["current"].get("shares_outstanding")
         market_cap = None
         if current_price is not None and shares_outstanding not in (None, 0):
             market_cap = current_price * shares_outstanding
 
         max_dd = calculate_max_drawdown(close, lookback_days=LOOKBACK_DAYS) if len(close) > 0 else None
         sales_cagr = compute_sales_cagr(financial_history, years=3) if financial_history else None
-        cash_eq = fin["current"].get("cash_and_equivalents")
-        equity_ratio = fin["current"].get("equity_ratio")
+        cash_eq = raw_fin["current"].get("cash_and_equivalents")
+        equity_ratio = raw_fin["current"].get("equity_ratio")
         if equity_ratio is None:
-            ta = fin["current"].get("total_assets")
-            eq = fin["current"].get("equity")
+            ta = raw_fin["current"].get("total_assets")
+            eq = raw_fin["current"].get("equity")
             if ta not in (None, 0) and eq is not None:
                 equity_ratio = eq / ta
 
@@ -1327,14 +1549,17 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             ps_ratio=val.get("ps_ratio"),
             cash_and_equivalents=cash_eq,
             market_cap=market_cap,
-            operating_cash_flow=fin["current"].get("operating_cash_flow"),
+            operating_cash_flow=raw_fin["current"].get("operating_cash_flow"),
             equity_ratio=equity_ratio,
             sales_cagr=sales_cagr,
             max_drawdown=max_dd,
         )
 
         # ★必須フィルタ
-        liquidity_ok = (avg_volume is not None and avg_volume >= MIN_AVG_VOLUME_30D)
+        liquidity_ok = bool(
+            avg_volume is not None and avg_volume >= MIN_AVG_VOLUME_30D and
+            adv_jpy_20d is not None and adv_jpy_20d >= MIN_ADV_JPY_20D
+        )
         market_cap_ok = (market_cap is not None and market_cap >= MIN_MARKET_CAP_JPY)
 
         ps_ratio = val.get("ps_ratio")
@@ -1351,6 +1576,40 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             exclude_deficit=EXCLUDE_OP_INCOME_DEFICIT
         )
         op_income_stable = (op_income_eval.get("stable") is True)
+
+        statement_type = financial_history[0].get("statement_type") if financial_history else None
+        statement_disclosed_date = financial_history[0].get("disclosed_date") if financial_history else None
+        statement_staleness_days = None
+        if latest_price_date and statement_disclosed_date:
+            disclosed_dt = _parse_optional_date(statement_disclosed_date)
+            if disclosed_dt:
+                statement_staleness_days = (latest_price_date - disclosed_dt).days
+
+        critical_missing = sum(
+            value is None for value in (
+                val.get("ps_ratio"),
+                val.get("per"),
+                piot.get("score") if isinstance(piot, dict) else None,
+                sales_cagr,
+                adv_jpy_20d,
+                statement_disclosed_date,
+            )
+        )
+        diagnostics = {
+            "latest_price_date": latest_price_date.isoformat() if latest_price_date else None,
+            "statement_disclosed_date": statement_disclosed_date,
+            "statement_type": statement_type,
+            "statement_staleness_days": statement_staleness_days,
+            "imputation": imputation,
+            "critical_missing_count": critical_missing,
+            "raw_financial_fields": {
+                "has_current_shares": raw_fin["current"].get("shares_outstanding") is not None,
+                "has_previous_net_income": raw_fin["previous"].get("net_income") is not None,
+                "has_current_assets": raw_fin["current"].get("current_assets") is not None,
+                "has_current_liabilities": raw_fin["current"].get("current_liabilities") is not None,
+                "has_gross_profit_margin": raw_fin["current"].get("gross_profit_margin") is not None,
+            },
+        }
 
         base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
         core_candidate = bool(base_ok and defensive_ps_ok and per_core_ok)
@@ -1369,6 +1628,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "satellite_candidate": satellite_candidate,
             "thresholds": {
                 "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
+                "MIN_ADV_JPY_20D": MIN_ADV_JPY_20D,
                 "MIN_MARKET_CAP_JPY": MIN_MARKET_CAP_JPY,
                 "MAX_PS_DEFENSIVE": MAX_PS_DEFENSIVE,
                 "MAX_PER_CORE": MAX_PER_CORE,
@@ -1384,17 +1644,29 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "plus_di": plus_di, "minus_di": minus_di,
             "volatility": cur_vol, "avg_volatility": avg_vol,
             "below_ma25": below_ma25, "below_ma75": below_ma75, "below_ma200": below_ma200,
+            "return_21d": momentum.get("return_21d"),
+            "return_63d": momentum.get("return_63d"),
+            "return_126d": momentum.get("return_126d"),
+            "return_252d": momentum.get("return_252d"),
+            "momentum_6m_1m": momentum.get("momentum_6m_1m"),
+            "momentum_6m_3m": momentum.get("momentum_6m_3m"),
+            "momentum_3m_1m": momentum.get("momentum_3m_1m"),
             "piotroski": piot,
             "ps_ratio": ps_ratio, "peg_ratio": val.get("peg_ratio"), "per": per,
             "revenue_per_share": val.get("revenue_per_share"),
             "safety": safety, "speculation": spec, "success": True,
             "avg_volume_30d": avg_volume,
+            "adv_jpy_20d": adv_jpy_20d,
+            "adv_jpy_60d": adv_jpy_60d,
+            "traded_days_60d": traded_days_60d,
             "financial_history": financial_history,
             "market_cap": market_cap,
             "shares_outstanding": shares_outstanding,
             "max_drawdown": max_dd,
             "sales_cagr": sales_cagr,
             "safety_criteria": safety_criteria,
+            "sector_benchmark": sector_benchmark,
+            "diagnostics": diagnostics,
             "filters": filter_details,
         }
     except Exception as e:
@@ -1598,6 +1870,9 @@ def _flatten_result(d: dict) -> dict:
     spc = d.get("speculation") or {}
     safety_criteria = d.get("safety_criteria") or {}
     criteria = safety_criteria.get("criteria", {}) if isinstance(safety_criteria, dict) else {}
+    diagnostics = d.get("diagnostics") or {}
+    imputation = diagnostics.get("imputation", {}) if isinstance(diagnostics, dict) else {}
+    sector_benchmark = d.get("sector_benchmark") or {}
     flt = _extract_filters(d)
 
     return {
@@ -1611,6 +1886,13 @@ def _flatten_result(d: dict) -> dict:
         "rsi": d.get("rsi"),
         "adx": d.get("adx"),
         "below_ma200": d.get("below_ma200"),
+        "return_21d": d.get("return_21d"),
+        "return_63d": d.get("return_63d"),
+        "return_126d": d.get("return_126d"),
+        "return_252d": d.get("return_252d"),
+        "momentum_6m_1m": d.get("momentum_6m_1m"),
+        "momentum_6m_3m": d.get("momentum_6m_3m"),
+        "momentum_3m_1m": d.get("momentum_3m_1m"),
         "piot": pio.get("score"),
         "piot_eval": pio.get("evaluation"),
         "safety": saf.get("total_score"),
@@ -1630,6 +1912,20 @@ def _flatten_result(d: dict) -> dict:
         "sales_cagr": safety_criteria.get("sales_cagr") if isinstance(safety_criteria, dict) else None,
         "market_cap": d.get("market_cap"),
         "avg_volume_30d": d.get("avg_volume_30d"),
+        "adv_jpy_20d": d.get("adv_jpy_20d"),
+        "adv_jpy_60d": d.get("adv_jpy_60d"),
+        "traded_days_60d": d.get("traded_days_60d"),
+        "sector_ps_benchmark": sector_benchmark.get("ps"),
+        "sector_peg_benchmark": sector_benchmark.get("peg"),
+        "sector_benchmark_source": sector_benchmark.get("data_source"),
+        "statement_type": diagnostics.get("statement_type"),
+        "statement_disclosed_date": diagnostics.get("statement_disclosed_date"),
+        "statement_staleness_days": diagnostics.get("statement_staleness_days"),
+        "price_asof_date": diagnostics.get("latest_price_date"),
+        "has_imputation": imputation.get("has_imputation"),
+        "imputed_field_count": imputation.get("field_count"),
+        "imputed_fields": ",".join(sorted((imputation.get("fields") or {}).keys())),
+        "critical_missing_count": diagnostics.get("critical_missing_count"),
         **flt,
         "ok": d.get("success"),
         "error": d.get("error"),
@@ -1704,6 +2000,7 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
         "excluded": int(len(exc)),
         "thresholds": {
             "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
+            "MIN_ADV_JPY_20D": MIN_ADV_JPY_20D,
             "MIN_MARKET_CAP_JPY": MIN_MARKET_CAP_JPY,
             "MAX_PS_DEFENSIVE": MAX_PS_DEFENSIVE,
             "MAX_PER_CORE": MAX_PER_CORE,
@@ -1729,34 +2026,36 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
 
     core = ok[ok["core_candidate"] == True].copy()
     sat = ok[ok["satellite_candidate"] == True].copy()
+    ranked_core = _build_ranked(core) if not core.empty else core
+    ranked_sat = _build_ranked(sat) if not sat.empty else sat
 
     outs: list[Path] = []
 
-    if not core.empty:
+    if not ranked_core.empty:
         p1 = outdir / "top_recommended_core.csv"
-        core.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p1, index=False, encoding="utf-8-sig")
+        ranked_core.sort_values(by=["total_score"], ascending=[False]).head(topn).to_csv(p1, index=False, encoding="utf-8-sig")
         outs.append(p1)
 
         p2 = outdir / "top_safety_core.csv"
-        core.sort_values(by=["safety","piot"], ascending=[False,False]).head(topn).to_csv(p2, index=False, encoding="utf-8-sig")
+        ranked_core.sort_values(by=["safety_score_scaled","resilience_score","financial_score"], ascending=[False,False,False]).head(topn).to_csv(p2, index=False, encoding="utf-8-sig")
         outs.append(p2)
 
         p3 = outdir / "top_speculative_core.csv"
-        core.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(p3, index=False, encoding="utf-8-sig")
+        ranked_core.sort_values(by=["spec_score"], ascending=False).head(topn).to_csv(p3, index=False, encoding="utf-8-sig")
         outs.append(p3)
 
         p4 = outdir / "top_piotroski_core.csv"
-        core.sort_values(by=["piot","safety"], ascending=[False,False]).head(topn).to_csv(p4, index=False, encoding="utf-8-sig")
+        ranked_core.sort_values(by=["piot","financial_score","total_score"], ascending=[False,False,False]).head(topn).to_csv(p4, index=False, encoding="utf-8-sig")
         outs.append(p4)
 
-        if "safety_criteria_score" in core.columns:
+        if "safety_criteria_score" in ranked_core.columns:
             p5 = outdir / "top_safe_long_term_core.csv"
-            core.sort_values(by=["safety_criteria_score"], ascending=False).head(topn).to_csv(p5, index=False, encoding="utf-8-sig")
+            ranked_core.sort_values(by=["resilience_score","safety_criteria_score"], ascending=[False,False]).head(topn).to_csv(p5, index=False, encoding="utf-8-sig")
             outs.append(p5)
 
-    if not sat.empty:
+    if not ranked_sat.empty:
         p6 = outdir / "top_recommended_satellite.csv"
-        sat.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn).to_csv(p6, index=False, encoding="utf-8-sig")
+        ranked_sat.sort_values(by=["total_score"], ascending=[False]).head(topn).to_csv(p6, index=False, encoding="utf-8-sig")
         outs.append(p6)
 
     return outs
@@ -1772,13 +2071,13 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         if c in core.columns:
             core[c] = pd.to_numeric(core[c], errors="coerce")
 
-    rec = core.sort_values(by=["safety","piot","spec_score"], ascending=[False,False,True]).head(topn)
+    rec = _build_ranked(core).sort_values(by=["total_score"], ascending=[False]).head(topn)
 
     lines = ["# おすすめトップテン（Core候補）", ""]
     if timestamp:
         lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
         lines.append("")
-    lines.append(f"**フィルタ:** avg_volume_30d>={MIN_AVG_VOLUME_30D}, market_cap>={MIN_MARKET_CAP_JPY:,}JPY, PS<={MAX_PS_DEFENSIVE}, PER<={MAX_PER_CORE}, 営業利益安定")
+    lines.append(f"**フィルタ:** avg_volume_30d>={MIN_AVG_VOLUME_30D}, ADV20>={MIN_ADV_JPY_20D:,}JPY, market_cap>={MIN_MARKET_CAP_JPY:,}JPY, PS<={MAX_PS_DEFENSIVE}, PER<={MAX_PER_CORE}, 営業利益安定")
     lines.append("")
     for _, r in rec.iterrows():
         mc = r.get("market_cap")
@@ -1786,7 +2085,7 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         vol = r.get("avg_volume_30d")
         vol_str = f"{int(vol):,}" if pd.notna(vol) else "N/A"
         lines.append(
-            f"- **{r['code']} {r['name']}** | 安全 {r['safety']} | Pio {r['piot']} | 仕手 {r['spec_score']} | "
+            f"- **{r['code']} {r['name']}** | 総合 {r['total_score']:.1f} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
             f"PER {r['per']} | PS {r['ps']} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
@@ -1803,50 +2102,115 @@ def _grade_from_score(s: float) -> str:
     return "C"
 
 def _val_score_from_ps_vs_sector(x: Optional[float]) -> float:
-    if x is None or not np.isfinite(x): return 6.0
-    if x <= 0.5: return 12.5
-    if x <= 1.0: return 10.0
-    if x <= 1.5: return 8.0
-    if x <= 2.0: return 5.0
-    if x <= 3.0: return 2.0
+    if x is None or not np.isfinite(x): return 0.0
+    if x <= 0.6: return 10.0
+    if x <= 0.9: return 8.0
+    if x <= 1.2: return 6.0
+    if x <= 1.6: return 3.0
+    if x <= 2.0: return 1.0
     return 0.0
 
 def _val_score_from_peg(x: Optional[float]) -> float:
-    """PEGが取れた銘柄のみ加点。0/欠損は中立（誤判定防止）"""
-    if x is None or not np.isfinite(x): return 6.0
-    if x <= 0: return 6.0
-    if x <= 0.5: return 12.5
-    if x <= 1.0: return 10.0
-    if x <= 1.5: return 8.0
-    if x <= 2.0: return 5.0
-    if x <= 3.0: return 2.0
+    if x is None or not np.isfinite(x): return 0.0
+    if x <= 0: return 0.0
+    if x <= 0.7: return 10.0
+    if x <= 1.0: return 8.0
+    if x <= 1.5: return 6.0
+    if x <= 2.0: return 3.0
+    if x <= 3.0: return 1.0
     return 0.0
 
-def _tech_score(rsi: Optional[float], adx: Optional[float], below_ma200: Optional[bool]) -> float:
-    r = 0.0
-    if rsi is not None and np.isfinite(rsi):
-        if 45 <= rsi <= 60: r += 15.0
-        elif (40 <= rsi < 45) or (60 < rsi <= 70): r += 10.0
-        elif (30 <= rsi < 40) or (70 < rsi <= 80): r += 5.0
-        else: r += 0.0
-    else:
-        r += 7.5
+def _quality_score_from_piotroski(x: Optional[float]) -> float:
+    if x is None or not np.isfinite(x):
+        return 0.0
+    x = float(x)
+    if x >= 8: return 14.0
+    if x >= 7: return 12.0
+    if x >= 6: return 10.0
+    if x >= 5: return 7.0
+    if x >= 4: return 4.0
+    return 0.0
 
-    if adx is not None and np.isfinite(adx):
-        if 20 <= adx <= 40: r += 10.0
-        elif 15 <= adx < 20 or 40 < adx <= 50: r += 6.0
-        elif 10 <= adx < 15 or 50 < adx <= 60: r += 3.0
-        else: r += 0.0
-    else:
-        r += 5.0
+def _growth_score_from_sales_cagr(x: Optional[float]) -> float:
+    if x is None or not np.isfinite(x):
+        return 0.0
+    if x >= 0.18: return 8.0
+    if x >= 0.12: return 6.5
+    if x >= 0.06: return 5.0
+    if x >= 0.00: return 3.0
+    if x >= -0.05: return 1.0
+    return 0.0
 
+def _resilience_score_from_drawdown(x: Optional[float]) -> float:
+    if x is None or not np.isfinite(x):
+        return 0.0
+    if x >= -0.15: return 8.0
+    if x >= -0.25: return 6.0
+    if x >= -0.35: return 4.0
+    if x >= -0.45: return 2.0
+    return 0.0
+
+def _momentum_score_from_returns(
+    ret_21d: Optional[float],
+    ret_63d: Optional[float],
+    ret_126d: Optional[float],
+    momentum_6m_1m: Optional[float],
+    momentum_6m_3m: Optional[float],
+    momentum_3m_1m: Optional[float],
+    below_ma200: Optional[bool],
+) -> float:
+    score = 0.0
+    if momentum_6m_1m is not None and np.isfinite(momentum_6m_1m):
+        if 0.08 <= momentum_6m_1m <= 0.45: score += 6.0
+        elif 0.00 <= momentum_6m_1m < 0.08 or 0.45 < momentum_6m_1m <= 0.65: score += 3.0
+        elif -0.08 <= momentum_6m_1m < 0.00: score += 1.0
+    if momentum_6m_3m is not None and np.isfinite(momentum_6m_3m):
+        if 0.03 <= momentum_6m_3m <= 0.25: score += 4.0
+        elif 0.00 <= momentum_6m_3m < 0.03 or 0.25 < momentum_6m_3m <= 0.40: score += 2.0
+    if momentum_3m_1m is not None and np.isfinite(momentum_3m_1m):
+        if -0.05 <= momentum_3m_1m <= 0.18: score += 2.0
+        elif 0.18 < momentum_3m_1m <= 0.30: score += 1.0
+    if ret_63d is not None and np.isfinite(ret_63d):
+        if 0.05 <= ret_63d <= 0.30: score += 4.0
+        elif 0.00 <= ret_63d < 0.05 or 0.30 < ret_63d <= 0.45: score += 2.0
+        elif -0.05 <= ret_63d < 0.00: score += 0.5
+    if ret_126d is not None and np.isfinite(ret_126d):
+        if 0.10 <= ret_126d <= 0.50: score += 4.0
+        elif 0.00 <= ret_126d < 0.10 or 0.50 < ret_126d <= 0.70: score += 2.0
+        elif -0.08 <= ret_126d < 0.00: score += 0.5
+    if ret_21d is not None and np.isfinite(ret_21d):
+        if -0.08 <= ret_21d <= 0.12:
+            score += 2.0
+        elif -0.15 <= ret_21d < -0.08 or 0.12 < ret_21d <= 0.20:
+            score += 0.5
+        elif ret_21d > 0.20:
+            score -= 1.0
     if below_ma200 is True:
-        r = max(0.0, r - 3.0)
-    return r
+        score = max(0.0, score - 3.0)
+    return score
+
+def _data_quality_penalty(imputed_field_count: Optional[float], critical_missing_count: Optional[float], statement_staleness_days: Optional[float]) -> float:
+    penalty = 0.0
+    if imputed_field_count is not None and np.isfinite(imputed_field_count):
+        penalty += min(float(imputed_field_count), 4.0) * 1.5
+    if critical_missing_count is not None and np.isfinite(critical_missing_count):
+        penalty += min(float(critical_missing_count), 4.0) * 1.5
+    if statement_staleness_days is not None and np.isfinite(statement_staleness_days):
+        if statement_staleness_days > 540:
+            penalty += 6.0
+        elif statement_staleness_days > 365:
+            penalty += 3.0
+    return min(penalty, 12.0)
 
 def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df = flat.copy()
-    for c in ["ps","peg","per","rsi","adx","piot","safety","spec_score","below_ma200"]:
+    for c in [
+        "ps", "peg", "per", "rsi", "adx", "piot", "safety", "spec_score", "below_ma200",
+        "return_21d", "return_63d", "return_126d", "return_252d",
+        "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "safety_criteria_score",
+        "max_drawdown", "sales_cagr", "adv_jpy_20d", "adv_jpy_60d", "sector_ps_benchmark",
+        "imputed_field_count", "critical_missing_count", "statement_staleness_days"
+    ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -1854,30 +2218,62 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
 
     def _ps_vs_sector(row):
         ps = row.get("ps")
-        med = sec_med.get(row.get("sector"), np.nan)
+        med = row.get("sector_ps_benchmark")
+        if pd.isna(med) or med <= 0:
+            med = sec_med.get(row.get("sector"), np.nan)
         if pd.isna(ps) or pd.isna(med) or med <= 0:
             return np.nan
         return float(ps) / float(med)
 
     df["ps_vs_sector"] = df.apply(_ps_vs_sector, axis=1)
 
-    df["valuation_ps"]  = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
+    df["valuation_ps"] = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
     df["valuation_peg"] = df["peg"].apply(_val_score_from_peg)
-    df["valuation_score"] = df["valuation_ps"] + df["valuation_peg"]                      # 0-25
-    df["safety_score_scaled"] = df["safety"].fillna(12.0) * (20.0/25.0)                  # 0-20
-    df["financial_score"] = df["piot"].fillna(4.5) * (22.5/9.0)                          # 0-22.5
+    df["valuation_score"] = df["valuation_ps"] + df["valuation_peg"]                     # 0-20
 
-    bm200 = df.get("below_ma200", pd.Series([np.nan]*len(df)))
+    df["quality_piotroski"] = df["piot"].apply(_quality_score_from_piotroski)
+    df["quality_op_income"] = np.where(df.get("op_income_stable", False) == True, 8.0, 0.0)
+    df["quality_growth"] = df["sales_cagr"].apply(_growth_score_from_sales_cagr)
+    df["financial_score"] = df["quality_piotroski"] + df["quality_op_income"] + df["quality_growth"]  # 0-30
+
+    df["resilience_safety_criteria"] = df["safety_criteria_score"].fillna(0.0).clip(lower=0, upper=100) * (12.0 / 100.0)
+    df["resilience_drawdown"] = df["max_drawdown"].apply(_resilience_score_from_drawdown)
+    df["resilience_score"] = df["resilience_safety_criteria"] + df["resilience_drawdown"]  # 0-20
+
+    bm200 = df.get("below_ma200", pd.Series([np.nan] * len(df)))
     df["technical_score"] = [
-        _tech_score(rsi, adx, (False if pd.isna(x) else bool(x)))
-        for rsi, adx, x in zip(df["rsi"], df["adx"], bm200)
-    ]  # 0-25
+        _momentum_score_from_returns(r21, r63, r126, m61, m63, m31, (False if pd.isna(x) else bool(x)))
+        for r21, r63, r126, m61, m63, m31, x in zip(
+            df["return_21d"], df["return_63d"], df["return_126d"],
+            df["momentum_6m_1m"], df["momentum_6m_3m"], df["momentum_3m_1m"], bm200
+        )
+    ]  # 0-22
 
-    df["spec_penalty"] = df["spec_score"].fillna(0.0).clip(lower=0, upper=100) * (10.0/100.0)  # 0-10
-    df["per_penalty"] = np.where(df["per"].notna() & (df["per"] > MAX_PER_CORE), 3.0, 0.0)
+    safety_base = df["safety"].fillna(0.0).clip(lower=0, upper=25.0)
+    adv_bonus = np.where(df["adv_jpy_20d"] >= 1_000_000_000, 2.0, np.where(df["adv_jpy_20d"] >= 500_000_000, 1.0, 0.0))
+    df["safety_score_scaled"] = (safety_base * (10.0 / 25.0) + adv_bonus).clip(lower=0, upper=12.0)  # 0-12
 
-    df["total_score"] = (df["valuation_score"] + df["safety_score_scaled"] +
-                         df["financial_score"] + df["technical_score"] - df["spec_penalty"] - df["per_penalty"])
+    df["spec_penalty"] = df["spec_score"].fillna(0.0).clip(lower=0, upper=100) * (8.0 / 100.0)  # 0-8
+    df["per_penalty"] = np.where(df["per"].notna() & (df["per"] > MAX_PER_CORE), 4.0, 0.0)
+    df["data_penalty"] = [
+        _data_quality_penalty(imputed, missing, stale)
+        for imputed, missing, stale in zip(
+            df["imputed_field_count"],
+            df["critical_missing_count"],
+            df["statement_staleness_days"],
+        )
+    ]
+
+    df["total_score"] = (
+        df["valuation_score"] +
+        df["financial_score"] +
+        df["resilience_score"] +
+        df["technical_score"] +
+        df["safety_score_scaled"] -
+        df["spec_penalty"] -
+        df["per_penalty"] -
+        df["data_penalty"]
+    )
     df["total_score"] = df["total_score"].clip(lower=0, upper=100)
     df["grade"] = df["total_score"].apply(_grade_from_score)
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
@@ -1921,6 +2317,7 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("## ✅ 必須フィルタ（Core前提）")
     lines.append("")
     lines.append(f"- avg_volume_30d >= {MIN_AVG_VOLUME_30D:,}")
+    lines.append(f"- adv_jpy_20d >= {MIN_ADV_JPY_20D:,} JPY")
     lines.append(f"- market_cap >= {MIN_MARKET_CAP_JPY:,} JPY")
     lines.append(f"- 営業利益安定（直近{OP_INCOME_YEARS}年・赤字除外={EXCLUDE_OP_INCOME_DEFICIT}・急落floor={OP_INCOME_DROP_FLOOR}）")
     lines.append(f"- PS <= {MAX_PS_DEFENSIVE}")
@@ -1968,11 +2365,13 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         lines.append(f"**総合スコア:** {r.total_score:.1f}点 | **グレード:** {r.grade}")
         lines.append("**スコア内訳:**")
         lines.append(f"- バリュエーション: {r.valuation_score:.1f}点")
-        lines.append(f"- 安全性: {r.safety_score_scaled:.1f}点")
         lines.append(f"- 財務健全性: {r.financial_score:.1f}点")
-        lines.append(f"- テクニカル: {r.technical_score:.1f}点")
+        lines.append(f"- レジリエンス: {r.resilience_score:.1f}点")
+        lines.append(f"- モメンタム: {r.technical_score:.1f}点")
+        lines.append(f"- 安全性: {r.safety_score_scaled:.1f}点")
         lines.append(f"- 仕手株ペナルティ: {r.spec_penalty:.1f}点")
         lines.append(f"- PERペナルティ: {r.per_penalty:.1f}点")
+        lines.append(f"- データ品質ペナルティ: {r.data_penalty:.1f}点")
         lines.append("")
 
     if not sat.empty:
