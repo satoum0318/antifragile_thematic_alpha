@@ -364,18 +364,18 @@ class DynamicSectorAverages:
     @staticmethod
     def default_sector_average(sector: str) -> dict:
         defaults = {
-            '自動車': {'ps': 0.8, 'peg': 1.2, 'eps_growth': 8.5},
-            '半導体': {'ps': 4.5, 'peg': 1.8, 'eps_growth': 12.2},
-            '電気機器': {'ps': 1.8, 'peg': 1.5, 'eps_growth': 12.3},
-            '銀行': {'ps': 2.5, 'peg': 0.8, 'eps_growth': 10.6},
-            '情報・通信業': {'ps': 1.2, 'peg': 1.3, 'eps_growth': 11.2},
-            '医薬品': {'ps': 3.8, 'peg': 1.6, 'eps_growth': 10.5},
-            '商社': {'ps': 0.4, 'peg': 0.9, 'eps_growth': 10.2},
-            '小売': {'ps': 0.8, 'peg': 1.4, 'eps_growth': 11.1},
-            'サービス': {'ps': 2.2, 'peg': 1.7, 'eps_growth': 12.1},
-            'ゲーム': {'ps': 3.5, 'peg': 1.4, 'eps_growth': 12.3},
-            '化学': {'ps': 1.0, 'peg': 1.4, 'eps_growth': 9.1},
-            'その他': {'ps': 1.5, 'peg': 1.5, 'eps_growth': 10.0},
+            '自動車': {'ps': 0.8},
+            '半導体': {'ps': 4.5},
+            '電気機器': {'ps': 1.8},
+            '銀行': {'ps': 2.5},
+            '情報・通信業': {'ps': 1.2},
+            '医薬品': {'ps': 3.8},
+            '商社': {'ps': 0.4},
+            '小売': {'ps': 0.8},
+            'サービス': {'ps': 2.2},
+            'ゲーム': {'ps': 3.5},
+            '化学': {'ps': 1.0},
+            'その他': {'ps': 1.5},
         }
         default = defaults.get(sector, defaults['その他'])
         return {
@@ -524,7 +524,6 @@ class DynamicSectorAverages:
                 {
                     "sector": self.normalize_sector(r.get("sector_name") or ""),
                     "ps": r.get("ps_ratio"),
-                    "peg": r.get("peg_ratio"),
                     "per": r.get("per"),
                 }
                 for r in results
@@ -537,12 +536,10 @@ class DynamicSectorAverages:
                     continue
 
                 ps_values = sector_df["ps"].dropna()
-                peg_values = sector_df["peg"].dropna()
                 per_values = sector_df["per"].dropna()
 
                 sector_stats[sector] = {
                     "ps": float(ps_values.median()) if len(ps_values) > 0 else None,
-                    "peg": float(peg_values.median()) if len(peg_values) > 0 else None,
                     "per": float(per_values.median()) if len(per_values) > 0 else None,
                     "sample_count": len(sector_df),
                     "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -890,18 +887,32 @@ def build_financial_history_from_statements(
     stmts: List[dict],
     max_years: int = 5,
     as_of_date: Optional[datetime.date] = None,
-) -> List[dict]:
+    statement_basis: str = "annual",
+) -> Tuple[List[dict], str]:
     if not stmts:
-        return []
+        return [], statement_basis
     filtered_stmts = []
     for stmt in stmts:
         disclosed = _statement_disclosed_date(stmt)
         if as_of_date is not None and disclosed is not None and disclosed > as_of_date:
             continue
         filtered_stmts.append(stmt)
-    source_stmts = filtered_stmts if as_of_date is not None else stmts
+
+    statement_basis_used: str
+    if statement_basis == "annual":
+        annual_only = [s for s in filtered_stmts if _statement_period_type(s) == "annual"]
+        if annual_only:
+            source_stmts = annual_only
+            statement_basis_used = "annual"
+        else:
+            source_stmts = filtered_stmts if as_of_date is not None else stmts
+            statement_basis_used = "fallback_primary_type"
+    else:
+        source_stmts = filtered_stmts if as_of_date is not None else stmts
+        statement_basis_used = statement_basis
+
     if not source_stmts:
-        return []
+        return [], statement_basis_used
     sorted_stmts = sorted(source_stmts, key=_statement_sort_key, reverse=True)
 
     primary_type = "unknown"
@@ -977,7 +988,7 @@ def build_financial_history_from_statements(
         history.append(rec)
         if len(history) >= max_years:
             break
-    return history
+    return history, statement_basis_used
 
 def calculate_liquidity_metrics(
     close: pd.Series,
@@ -1304,7 +1315,8 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
         "ps_ratio": ps_ratio,
         "eps_growth_rate": eps_growth,
         "peg_ratio": peg_ratio,
-        "peg_trusted": (peg_ratio is not None)
+        "reference_peg": peg_ratio,
+        "peg_trusted": False
     }
 
 # ------------------------------------------------------------
@@ -1494,16 +1506,17 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         else:
             stmts = fdm.fetch_statements(code)
 
-        financial_history = build_financial_history_from_statements(
+        financial_history, statement_basis_used = build_financial_history_from_statements(
             stmts if isinstance(stmts, list) else [],
             max_years=5,
             as_of_date=latest_price_date,
+            statement_basis="annual",
         )
         cur_fin = financial_history[0].copy() if financial_history else {}
         prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
         raw_fin = {"current": cur_fin.copy(), "previous": prv_fin.copy(), "current_price": current_price, "sector": sector}
-        fin = fdm._fill_missing_fields(copy.deepcopy(raw_fin))
-        imputation = fin.get("_imputation", {}) if isinstance(fin, dict) else {}
+        imputed_fin = fdm._fill_missing_fields(copy.deepcopy(raw_fin))
+        imputation = imputed_fin.get("_imputation", {}) if isinstance(imputed_fin, dict) else {}
 
         sector_benchmark = (
             sector_averages.get(sector)
@@ -1521,14 +1534,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             shares_outstanding=raw_fin["current"].get("shares_outstanding"),
         )
         safety = calculate_safety_score_v3(
-            yoy_eps_growth=val.get("eps_growth_rate"),
+            yoy_eps_growth=None,
             avg_volume=avg_volume,
             avg_trading_value=adv_jpy_20d,
             current_volatility=cur_vol, average_volatility=avg_vol,
             below_ma25=below_ma25, below_ma75=below_ma75
         )
         spec = detect_speculative_manipulation_v2(
-            yoy_eps_growth=val.get("eps_growth_rate"),
+            yoy_eps_growth=None,
             avg_volume=avg_volume,
             current_volatility=cur_vol, average_volatility=avg_vol,
             below_ma25=below_ma25, below_ma75=below_ma75,
@@ -1570,6 +1583,38 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         ps_ratio = val.get("ps_ratio")
         per = val.get("per")
 
+        ps_available = (ps_ratio is not None and np.isfinite(ps_ratio))
+        per_available = (per is not None and np.isfinite(per))
+        valuation_available = bool(ps_available and per_available)
+
+        rc, rp = raw_fin["current"], raw_fin["previous"]
+        valuation_input_complete = (
+            current_price is not None
+            and rc.get("shares_outstanding") not in (None, 0)
+            and rc.get("revenue") is not None
+            and rc.get("net_income") is not None
+            and rp.get("net_income") is not None
+        )
+        piotroski_input_complete = bool(
+            rc.get("net_income") is not None
+            and rc.get("operating_cash_flow") is not None
+            and rc.get("revenue") is not None
+            and rc.get("total_assets") is not None
+            and rc.get("equity") is not None
+            and rc.get("current_assets") is not None
+            and rc.get("current_liabilities") is not None
+            and rc.get("gross_profit_margin") is not None
+            and rp.get("net_income") is not None
+            and rp.get("total_assets") is not None
+            and rp.get("equity") is not None
+            and rp.get("operating_cash_flow") is not None
+            and rp.get("revenue") is not None
+            and rp.get("current_assets") is not None
+            and rp.get("current_liabilities") is not None
+            and rp.get("gross_profit_margin") is not None
+            and rp.get("shares_outstanding") is not None
+        )
+
         defensive_ps_ok = (ps_ratio is not None and np.isfinite(ps_ratio) and ps_ratio <= MAX_PS_DEFENSIVE)
         per_satellite = (per is not None and np.isfinite(per) and per > MAX_PER_CORE)
         per_core_ok = (per is not None and np.isfinite(per) and per <= MAX_PER_CORE)
@@ -1605,6 +1650,11 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "statement_disclosed_date": statement_disclosed_date,
             "statement_type": statement_type,
             "statement_staleness_days": statement_staleness_days,
+            "statement_basis_used": statement_basis_used,
+            "fallback_basis_flag": (statement_basis_used == "fallback_primary_type"),
+            "valuation_input_complete": valuation_input_complete,
+            "piotroski_input_complete": piotroski_input_complete,
+            "growth_proxy_detached_from_scoring": True,
             "imputation": imputation,
             "critical_missing_count": critical_missing,
             "raw_financial_fields": {
@@ -1617,12 +1667,16 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         }
 
         base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
-        core_candidate = bool(base_ok and defensive_ps_ok and per_core_ok)
-        satellite_candidate = bool(base_ok and (not core_candidate))
+        core_candidate = bool(base_ok and valuation_available and defensive_ps_ok and per_core_ok)
+        satellite_candidate = bool(base_ok and valuation_available and (not core_candidate))
+        excluded_candidate = bool((not base_ok) or (not valuation_available))
 
         filter_details = {
             "liquidity_ok": liquidity_ok,
             "market_cap_ok": market_cap_ok,
+            "ps_available": ps_available,
+            "per_available": per_available,
+            "valuation_available": valuation_available,
             "defensive_ps_ok": defensive_ps_ok,
             "per_satellite": per_satellite,
             "per_core_ok": per_core_ok,
@@ -1631,6 +1685,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "base_ok": base_ok,
             "core_candidate": core_candidate,
             "satellite_candidate": satellite_candidate,
+            "excluded_candidate": excluded_candidate,
             "thresholds": {
                 "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
                 "MIN_ADV_JPY_20D": MIN_ADV_JPY_20D,
@@ -1657,7 +1712,11 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "momentum_6m_3m": momentum.get("momentum_6m_3m"),
             "momentum_3m_1m": momentum.get("momentum_3m_1m"),
             "piotroski": piot,
-            "ps_ratio": ps_ratio, "peg_ratio": val.get("peg_ratio"), "per": per,
+            "ps_ratio": ps_ratio,
+            "peg_ratio": val.get("peg_ratio"),
+            "reference_peg": val.get("reference_peg"),
+            "peg_trusted": val.get("peg_trusted"),
+            "per": per,
             "revenue_per_share": val.get("revenue_per_share"),
             "safety": safety, "speculation": spec, "success": True,
             "avg_volume_30d": avg_volume,
@@ -1861,12 +1920,16 @@ def _extract_filters(d: dict) -> dict:
         "liquidity_ok": _safe_bool(f.get("liquidity_ok")),
         "market_cap_ok": _safe_bool(f.get("market_cap_ok")),
         "defensive_ps_ok": _safe_bool(f.get("defensive_ps_ok")),
+        "ps_available": _safe_bool(f.get("ps_available")),
+        "per_available": _safe_bool(f.get("per_available")),
+        "valuation_available": _safe_bool(f.get("valuation_available")),
         "per_satellite": _safe_bool(f.get("per_satellite")),
         "op_income_stable": _safe_bool(f.get("op_income_stable")),
         "op_income_reason": f.get("op_income_reason"),
         "base_ok": _safe_bool(f.get("base_ok")),
         "core_candidate": _safe_bool(f.get("core_candidate")),
         "satellite_candidate": _safe_bool(f.get("satellite_candidate")),
+        "excluded_candidate": _safe_bool(f.get("excluded_candidate")),
     }
 
 def _flatten_result(d: dict) -> dict:
@@ -1886,7 +1949,8 @@ def _flatten_result(d: dict) -> dict:
         "sector": d.get("sector_name"),
         "price": d.get("current_price"),
         "ps": d.get("ps_ratio"),
-        "peg": d.get("peg_ratio"),
+        "reference_peg": d.get("reference_peg") if d.get("reference_peg") is not None else d.get("peg_ratio"),
+        "peg_trusted": d.get("peg_trusted"),
         "per": d.get("per"),
         "rsi": d.get("rsi"),
         "adx": d.get("adx"),
@@ -1921,9 +1985,13 @@ def _flatten_result(d: dict) -> dict:
         "adv_jpy_60d": d.get("adv_jpy_60d"),
         "traded_days_60d": d.get("traded_days_60d"),
         "sector_ps_benchmark": sector_benchmark.get("ps"),
-        "sector_peg_benchmark": sector_benchmark.get("peg"),
         "sector_benchmark_source": sector_benchmark.get("data_source"),
         "statement_type": diagnostics.get("statement_type"),
+        "statement_basis_used": diagnostics.get("statement_basis_used"),
+        "fallback_basis_flag": diagnostics.get("fallback_basis_flag"),
+        "valuation_input_complete": diagnostics.get("valuation_input_complete"),
+        "piotroski_input_complete": diagnostics.get("piotroski_input_complete"),
+        "growth_proxy_detached_from_scoring": diagnostics.get("growth_proxy_detached_from_scoring"),
         "statement_disclosed_date": diagnostics.get("statement_disclosed_date"),
         "statement_staleness_days": diagnostics.get("statement_staleness_days"),
         "price_asof_date": diagnostics.get("latest_price_date"),
@@ -1988,7 +2056,10 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
 
     core = ok[ok["core_candidate"] == True].copy()
     sat = ok[ok["satellite_candidate"] == True].copy()
-    exc = ok[(ok["base_ok"] != True) | (ok["op_income_stable"] != True) | (ok["liquidity_ok"] != True) | (ok["market_cap_ok"] != True)].copy()
+    if "excluded_candidate" in ok.columns:
+        exc = ok[ok["excluded_candidate"] == True].copy()
+    else:
+        exc = ok[(ok["base_ok"] != True) | (ok["op_income_stable"] != True) | (ok["liquidity_ok"] != True) | (ok["market_cap_ok"] != True)].copy()
 
     # 固定名で上書き（ストレージ節約）
     p_core = outdir / "core_candidates.csv"
@@ -2025,7 +2096,7 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
         return []
 
     # 固定名で上書き（ストレージ節約）
-    for c in ["safety","piot","spec_score","per","peg","ps","rsi","adx","safety_criteria_score","market_cap","avg_volume_30d"]:
+    for c in ["safety","piot","spec_score","per","reference_peg","ps","rsi","adx","safety_criteria_score","market_cap","avg_volume_30d"]:
         if c in ok.columns:
             ok[c] = pd.to_numeric(ok[c], errors="coerce")
 
@@ -2079,6 +2150,9 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
     rec = _build_ranked(core).sort_values(by=["total_score"], ascending=[False]).head(topn)
 
     lines = ["# おすすめトップテン（Core候補）", ""]
+    lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
+    lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
+    lines.append("")
     if timestamp:
         lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
         lines.append("")
@@ -2089,9 +2163,14 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         mc_str = f"{mc/1e9:.1f}B" if pd.notna(mc) else "N/A"
         vol = r.get("avg_volume_30d")
         vol_str = f"{int(vol):,}" if pd.notna(vol) else "N/A"
+        rp = r.get("reference_peg")
+        if rp is None or (isinstance(rp, float) and pd.isna(rp)):
+            peg_str = "N/A"
+        else:
+            peg_str = f"{float(rp):.2f}"
         lines.append(
             f"- **{r['code']} {r['name']}** | 総合 {r['total_score']:.1f} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
-            f"PER {r['per']} | PS {r['ps']} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
+            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
     p = outdir / f"report_core_top{topn}.md"
@@ -2209,8 +2288,10 @@ def _data_quality_penalty(imputed_field_count: Optional[float], critical_missing
 
 def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df = flat.copy()
+    if "reference_peg" not in df.columns and "peg" in df.columns:
+        df["reference_peg"] = df["peg"]
     for c in [
-        "ps", "peg", "per", "rsi", "adx", "piot", "safety", "spec_score", "below_ma200",
+        "ps", "reference_peg", "per", "rsi", "adx", "piot", "safety", "spec_score", "below_ma200",
         "return_21d", "return_63d", "return_126d", "return_252d",
         "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "safety_criteria_score",
         "max_drawdown", "sales_cagr", "adv_jpy_20d", "adv_jpy_60d", "sector_ps_benchmark",
@@ -2233,8 +2314,7 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df["ps_vs_sector"] = df.apply(_ps_vs_sector, axis=1)
 
     df["valuation_ps"] = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
-    df["valuation_peg"] = df["peg"].apply(_val_score_from_peg)
-    df["valuation_score"] = df["valuation_ps"] + df["valuation_peg"]                     # 0-20
+    df["valuation_score"] = df["valuation_ps"]                     # PEGは参考指標のためスコアに含めない（0-10）
 
     df["quality_piotroski"] = df["piot"].apply(_quality_score_from_piotroski)
     df["quality_op_income"] = np.where(df.get("op_income_stable", False) == True, 8.0, 0.0)
@@ -2260,12 +2340,19 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
 
     df["spec_penalty"] = df["spec_score"].fillna(0.0).clip(lower=0, upper=100) * (8.0 / 100.0)  # 0-8
     df["per_penalty"] = np.where(df["per"].notna() & (df["per"] > MAX_PER_CORE), 4.0, 0.0)
+    if "fallback_basis_flag" in df.columns:
+        fb_series = df["fallback_basis_flag"].apply(
+            lambda x: (x is True) or (str(x).strip().lower() == "true")
+        )
+    else:
+        fb_series = pd.Series(False, index=df.index)
     df["data_penalty"] = [
-        _data_quality_penalty(imputed, missing, stale)
-        for imputed, missing, stale in zip(
+        _data_quality_penalty(imputed, missing, stale) + (2.0 if fb else 0.0)
+        for imputed, missing, stale, fb in zip(
             df["imputed_field_count"],
             df["critical_missing_count"],
             df["statement_staleness_days"],
+            fb_series,
         )
     ]
 
@@ -2306,15 +2393,24 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     ps_min = ranked["ps_vs_sector"].min(skipna=True)
     ps_max = ranked["ps_vs_sector"].max(skipna=True)
 
-    peg_avg = ranked["peg"].mean(skipna=True)
-    peg_med = ranked["peg"].median(skipna=True)
-    peg_min = ranked["peg"].min(skipna=True)
-    peg_max = ranked["peg"].max(skipna=True)
+    if "reference_peg" in ranked.columns:
+        refpeg = ranked["reference_peg"]
+    elif "peg" in ranked.columns:
+        refpeg = ranked["peg"]
+    else:
+        refpeg = pd.Series(np.nan, index=ranked.index)
+    peg_avg = refpeg.mean(skipna=True)
+    peg_med = refpeg.median(skipna=True)
+    peg_min = refpeg.min(skipna=True)
+    peg_max = refpeg.max(skipna=True)
 
     top = ranked.sort_values("total_score", ascending=False).head(topn)
 
     lines: list[str] = []
     lines.append("# 🏆 PS・PEGレシオ対応 投資銘柄スクリーニング レポート（Core候補）")
+    lines.append("")
+    lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
+    lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
     lines.append("")
     lines.append(f"**📅 生成日時:** {now}")
     lines.append(f"**📊 分析対象(Core):** {n}銘柄")
@@ -2346,7 +2442,7 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append(f"- 最小: {ps_min:.2f}")
     lines.append(f"- 最大: {ps_max:.2f}")
     lines.append("")
-    lines.append("### PEGレシオ")
+    lines.append("### PEGレシオ（参考・スコア未使用）")
     lines.append(f"- 平均: {peg_avg:.2f}")
     lines.append(f"- 中央値: {peg_med:.2f}")
     lines.append(f"- 最小: {peg_min:.2f}")
@@ -2358,9 +2454,15 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("|------|------------|--------|----------|--------|----------|------|-----|---------------|")
     for i, r in enumerate(top.itertuples(index=False), 1):
         ps_vs = 0 if pd.isna(r.ps_vs_sector) else r.ps_vs_sector
-        peg = 0 if pd.isna(r.peg) else r.peg
+        rpeg = getattr(r, "reference_peg", None)
+        if rpeg is None or (isinstance(rpeg, float) and pd.isna(rpeg)):
+            rpeg = getattr(r, "peg", np.nan)
+        if rpeg is None or (isinstance(rpeg, float) and pd.isna(rpeg)):
+            peg_cell = "N/A"
+        else:
+            peg_cell = f"{float(rpeg):.2f}"
         lines.append(f"| {i} | {r.code} | {r.name} | {r.grade} | {r.total_score:.1f} | {r.sector} | "
-                     f"{ps_vs:.2f} | {peg:.2f} | {r.pio_disp} |")
+                     f"{ps_vs:.2f} | {peg_cell} | {r.pio_disp} |")
     lines.append("")
     lines.append(f"## 📊 詳細分析（上位{details_n}銘柄）")
     lines.append("")
@@ -2500,6 +2602,7 @@ def run_interactive():
             cleanup_old_report_files(outdir)
             cleanup_old_report_files(outdir.parent)
             print(f"✅ 出力: {fp}")
+            print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
 
         elif choice == "4":
             print("📊 セクター平均をキャッシュから計算中...")
@@ -2521,11 +2624,11 @@ def run_interactive():
                 print(f"✅ セクター平均を更新しました（{len(updated_avgs)}セクター）")
                 for sector, stats in updated_avgs.items():
                     ps_val = stats.get('ps', None)
-                    peg_val = stats.get('peg', None)
+                    per_val = stats.get('per', None)
                     sample_count = stats.get('sample_count', 0)
                     ps_str = f"{ps_val:.2f}" if ps_val is not None else "N/A"
-                    peg_str = f"{peg_val:.2f}" if peg_val is not None else "N/A"
-                    print(f"  {sector}: PS={ps_str}, PEG={peg_str}, サンプル数={sample_count}")
+                    per_str = f"{per_val:.2f}" if per_val is not None else "N/A"
+                    print(f"  {sector}: PS={ps_str}, PER={per_str}, サンプル数={sample_count}")
             else:
                 print("⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。")
 
@@ -2599,6 +2702,7 @@ def main():
         cleanup_old_report_files(outdir)
         cleanup_old_report_files(outdir.parent)
         print(f"✅ 単銘柄出力: {fp}")
+        print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
         return
 
     if args.phase == "analyze":
