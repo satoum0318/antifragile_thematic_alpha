@@ -1619,6 +1619,16 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         per_satellite = (per is not None and np.isfinite(per) and per > MAX_PER_CORE)
         per_core_ok = (per is not None and np.isfinite(per) and per <= MAX_PER_CORE)
 
+        sector_ps_benchmark = sector_benchmark.get("ps") if isinstance(sector_benchmark, dict) else None
+        try:
+            _sb_ps = float(sector_ps_benchmark) if sector_ps_benchmark is not None else float("nan")
+        except (TypeError, ValueError):
+            _sb_ps = float("nan")
+        if np.isfinite(_sb_ps) and _sb_ps > 0:
+            ps_satellite_limit = float(max(MAX_PS_DEFENSIVE, _sb_ps * 1.25))
+        else:
+            ps_satellite_limit = float(max(MAX_PS_DEFENSIVE, 3.0))
+
         op_income_eval = evaluate_operating_income_stability(
             financial_history,
             years=OP_INCOME_YEARS,
@@ -1668,8 +1678,24 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 
         base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
         core_candidate = bool(base_ok and valuation_available and defensive_ps_ok and per_core_ok)
-        satellite_candidate = bool(base_ok and valuation_available and (not core_candidate))
-        excluded_candidate = bool((not base_ok) or (not valuation_available))
+        valuation_satellite_candidate = bool(base_ok and valuation_available and (not core_candidate))
+        ps_only_satellite_candidate = bool(
+            base_ok
+            and ps_available
+            and (not per_available)
+            and np.isfinite(ps_ratio)
+            and (ps_ratio <= ps_satellite_limit)
+        )
+        satellite_candidate = bool(valuation_satellite_candidate or ps_only_satellite_candidate)
+        excluded_candidate = bool((not core_candidate) and (not satellite_candidate))
+        if core_candidate:
+            candidate_lane = "core"
+        elif valuation_satellite_candidate:
+            candidate_lane = "satellite_valuation"
+        elif ps_only_satellite_candidate:
+            candidate_lane = "satellite_ps_only"
+        else:
+            candidate_lane = "excluded"
 
         filter_details = {
             "liquidity_ok": liquidity_ok,
@@ -1685,6 +1711,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "base_ok": base_ok,
             "core_candidate": core_candidate,
             "satellite_candidate": satellite_candidate,
+            "valuation_satellite_candidate": valuation_satellite_candidate,
+            "ps_only_satellite_candidate": ps_only_satellite_candidate,
+            "ps_satellite_limit": ps_satellite_limit,
+            "candidate_lane": candidate_lane,
             "excluded_candidate": excluded_candidate,
             "thresholds": {
                 "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
@@ -1732,6 +1762,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "sector_benchmark": sector_benchmark,
             "diagnostics": diagnostics,
             "filters": filter_details,
+            "candidate_lane": candidate_lane,
+            "ps_satellite_limit": ps_satellite_limit,
         }
     except Exception as e:
         return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
@@ -1929,6 +1961,10 @@ def _extract_filters(d: dict) -> dict:
         "base_ok": _safe_bool(f.get("base_ok")),
         "core_candidate": _safe_bool(f.get("core_candidate")),
         "satellite_candidate": _safe_bool(f.get("satellite_candidate")),
+        "valuation_satellite_candidate": _safe_bool(f.get("valuation_satellite_candidate")),
+        "ps_only_satellite_candidate": _safe_bool(f.get("ps_only_satellite_candidate")),
+        "ps_satellite_limit": f.get("ps_satellite_limit"),
+        "candidate_lane": f.get("candidate_lane"),
         "excluded_candidate": _safe_bool(f.get("excluded_candidate")),
     }
 
@@ -2056,6 +2092,14 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
 
     core = ok[ok["core_candidate"] == True].copy()
     sat = ok[ok["satellite_candidate"] == True].copy()
+    if "valuation_satellite_candidate" in ok.columns:
+        sat_val = ok[ok["valuation_satellite_candidate"] == True].copy()
+    else:
+        sat_val = pd.DataFrame()
+    if "ps_only_satellite_candidate" in ok.columns:
+        sat_ps = ok[ok["ps_only_satellite_candidate"] == True].copy()
+    else:
+        sat_ps = pd.DataFrame()
     if "excluded_candidate" in ok.columns:
         exc = ok[ok["excluded_candidate"] == True].copy()
     else:
@@ -2064,15 +2108,21 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
     # 固定名で上書き（ストレージ節約）
     p_core = outdir / "core_candidates.csv"
     p_sat  = outdir / "satellite_candidates.csv"
+    p_sat_val = outdir / "satellite_valuation_candidates.csv"
+    p_sat_ps = outdir / "satellite_ps_only_candidates.csv"
     p_exc  = outdir / "excluded.csv"
     core.to_csv(p_core, index=False, encoding="utf-8-sig")
     sat.to_csv(p_sat, index=False, encoding="utf-8-sig")
+    sat_val.to_csv(p_sat_val, index=False, encoding="utf-8-sig")
+    sat_ps.to_csv(p_sat_ps, index=False, encoding="utf-8-sig")
     exc.to_csv(p_exc, index=False, encoding="utf-8-sig")
 
     summary = {
         "total_ok": int(len(ok)),
         "core": int(len(core)),
         "satellite": int(len(sat)),
+        "satellite_valuation": int(len(sat_val)),
+        "satellite_ps_only": int(len(sat_ps)),
         "excluded": int(len(exc)),
         "thresholds": {
             "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
@@ -2087,7 +2137,7 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
     }
     p_sum = outdir / "filter_summary.json"
     p_sum.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return [p_core, p_sat, p_exc, p_sum]
+    return [p_core, p_sat, p_sat_val, p_sat_ps, p_exc, p_sum]
 
 def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> list[Path]:
     outdir.mkdir(exist_ok=True, parents=True)
@@ -2152,6 +2202,7 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
     lines = ["# おすすめトップテン（Core候補）", ""]
     lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
     lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
+    lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
     lines.append("")
     if timestamp:
         lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
@@ -2346,15 +2397,25 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         )
     else:
         fb_series = pd.Series(False, index=df.index)
-    df["data_penalty"] = [
-        _data_quality_penalty(imputed, missing, stale) + (2.0 if fb else 0.0)
-        for imputed, missing, stale, fb in zip(
-            df["imputed_field_count"],
-            df["critical_missing_count"],
-            df["statement_staleness_days"],
-            fb_series,
+    if "ps_only_satellite_candidate" in df.columns:
+        ps_only_series = df["ps_only_satellite_candidate"].apply(
+            lambda x: (x is True) or (str(x).strip().lower() == "true")
         )
-    ]
+    else:
+        ps_only_series = pd.Series(False, index=df.index)
+    _penalties: list[float] = []
+    for imputed, missing, stale, fb, ps_only in zip(
+        df["imputed_field_count"],
+        df["critical_missing_count"],
+        df["statement_staleness_days"],
+        fb_series,
+        ps_only_series,
+    ):
+        pen = _data_quality_penalty(imputed, missing, stale) + (2.0 if fb else 0.0)
+        if ps_only:
+            pen = max(0.0, pen - 1.5)
+        _penalties.append(pen)
+    df["data_penalty"] = _penalties
 
     df["total_score"] = (
         df["valuation_score"] +
@@ -2411,6 +2472,7 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("")
     lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
     lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
+    lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
     lines.append("")
     lines.append(f"**📅 生成日時:** {now}")
     lines.append(f"**📊 分析対象(Core):** {n}銘柄")
