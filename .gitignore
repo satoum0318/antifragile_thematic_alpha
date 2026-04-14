@@ -54,6 +54,11 @@ desktop.ini
 # ログ
 *.log
 
+# コミットメッセージ草案（誤コミット防止・履歴に残さない）
+commit_msg.txt
+commit_msg_initial.txt
+commit_msg*.txt
+
 
 
 
