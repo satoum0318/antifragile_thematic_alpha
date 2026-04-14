@@ -19,6 +19,12 @@ J-Quants 収集→凍結キャッシュ→完全オフライン分析ワーク�
 
 フィルタは core/satellite/excluded の3分類としてレポート出力にも反映します。
 
+スコアリング前提（重要）:
+- EPS 成長率は当期・前期の**それぞれの発行済株式数**が揃っているときのみ計算（欠損時は None）。
+- 決算系列が annual でない場合（フォールバック時）は sales_cagr および営業利益安定の判定は**非計算**（None / reason=non_annual_basis）。
+- 認証トークン取得（_refresh_id_token）は `requests.post` 直打ちのため **APIRateLimiter の対象外**（データ API のみをカウント）。
+- PEG / reference_peg は**参考列**（総合ランキングスコアの直接入力には用いない）。
+
 必要: pandas, numpy, requests
 """
 
@@ -48,6 +54,15 @@ import requests
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.NullHandler())
+
+def _cli_stdout_utf8ish() -> bool:
+    """Windows cp932 等で絵文字 print が UnicodeEncodeError になるのを避けるための判定。"""
+    enc = (getattr(sys.stdout, "encoding", None) or "").upper()
+    return "UTF" in enc
+
+def _cli_print(msg: str, ascii_safe: str) -> None:
+    """UTF-8 系コンソールでは msg、それ以外では ascii_safe（絵文字なし）を表示。"""
+    print(msg if _cli_stdout_utf8ish() else ascii_safe)
 
 # ------------------------------------------------------------
 # 定数・パス
@@ -98,7 +113,10 @@ class GracefulShutdown:
             pass
 
     def exit_gracefully(self, signum, frame):
-        print(f"\n⚠️ 中断シグナル受信: {signum}\n🛑 安全に終了します")
+        _cli_print(
+            f"\n⚠️ 中断シグナル受信: {signum}\n🛑 安全に終了します",
+            f"\n[中断] シグナル受信: {signum}\n安全に終了します",
+        )
         self.shutdown = True
         sys.exit(130)
 
@@ -149,6 +167,8 @@ class AuthSession(requests.Session):
         self.ini_file = ini_file
 
     def request(self, method, url, **kwargs):
+        """送信直前に wait_if_needed。super().request が応答オブジェクトを返したら毎回 mark（HTTP ステータスは不問）。
+        RequestException（通信失敗）のみ mark しない。401 後の _refresh_id_token は limiter 外（別途コメント参照）。"""
         MAX = 5
         timeout = kwargs.pop("timeout", 30)
 
@@ -162,19 +182,18 @@ class AuthSession(requests.Session):
                 time.sleep(1.5 * attempt)
                 continue
 
-            # 401: idToken refresh
+            self.limiter.mark()
+
             if resp.status_code == 401 and attempt == 1:
                 _refresh_id_token(self, ini_file=self.ini_file)
                 continue
 
-            # Retryable
             if resp.status_code in (429,) or resp.status_code >= 500:
                 if attempt == MAX:
                     return resp
                 time.sleep(min(2 ** attempt, 30))
                 continue
 
-            self.limiter.mark()
             return resp
 
         raise RuntimeError(f"{method} {url} failed after {MAX} attempts")
@@ -192,17 +211,19 @@ def get_authenticated_session_jquants(ini_file: str = "api.ini") -> requests.Ses
             exp = datetime.datetime.strptime(cached["expires_at"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
             if datetime.datetime.now(datetime.timezone.utc) < exp:
                 session.headers.update({"Authorization": f"Bearer {cached['token']}"})
-                print("✅ キャッシュidTokenを使用")
+                _cli_print("✅ キャッシュidTokenを使用", "[OK] キャッシュidTokenを使用")
                 return session
         except Exception:
             pass
 
-    print("🔑 認証開始…")
+    _cli_print("🔑 認証開始…", "認証開始…")
     _refresh_id_token(session, ini_file=ini_file)
-    print("✅ 認証成功")
+    _cli_print("✅ 認証成功", "[OK] 認証成功")
     return session
 
 def _refresh_id_token(session: requests.Session, ini_file: str = "api.ini") -> str:
+    # 認証用 HTTP は requests.post 直打ちのため APIRateLimiter の外。分間・日次カウントには含めない（セッション経由の API のみを対象）。
+    # 将来 session.post に寄せる場合は、含める/含めないを再確認すること。
     config = configparser.ConfigParser()
     config.read(ini_file, encoding="utf-8")
 
@@ -279,18 +300,24 @@ class FrozenCache:
 
     def has_all(self, code: str, max_age_days: Optional[int] = None) -> bool:
         p1, p2 = self.prices_path(code), self.stmts_path(code)
-        if not p1.exists() or not p2.exists():
+        try:
+            st1, st2 = p1.stat(), p2.stat()
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.warning("FrozenCache.has_all: stat失敗 %s", e)
             return False
         if max_age_days is None:
             return True
         try:
             now = time.time()
-            age_days_prices = (now - p1.stat().st_mtime) / 86400.0
-            age_days_stmts  = (now - p2.stat().st_mtime) / 86400.0
+            age_days_prices = (now - st1.st_mtime) / 86400.0
+            age_days_stmts = (now - st2.st_mtime) / 86400.0
             oldest = max(age_days_prices, age_days_stmts)
             return oldest <= max_age_days
-        except Exception:
-            return True
+        except OSError as e:
+            logger.warning("FrozenCache.has_all: 鮮度判定失敗 %s", e)
+            return False
 
 # ------------------------------------------------------------
 # セクター平均・銘柄リスト
@@ -390,7 +417,7 @@ class DynamicSectorAverages:
 
     def get_sector_averages(self, force_refresh: bool = False) -> dict:
         if not force_refresh and self.is_cache_valid() and self.sector_cache:
-            print("📊 セクター平均: メモリキャッシュ")
+            _cli_print("📊 セクター平均: メモリキャッシュ", "[セクター平均] メモリキャッシュ")
             return self.sector_cache
 
         cache_file = CACHE_DIR / "sector_averages.json"
@@ -400,12 +427,12 @@ class DynamicSectorAverages:
                 if time.time() - j.get("timestamp", 0) <= 86400:
                     self.sector_cache = j.get("data", {})
                     self.cache_timestamp = time.time()
-                    print("📊 セクター平均: ファイルキャッシュ")
+                    _cli_print("📊 セクター平均: ファイルキャッシュ", "[セクター平均] ファイルキャッシュ")
                     return self.sector_cache
             except Exception:
                 pass
 
-        print("📊 セクター平均: 静的デフォルト")
+        _cli_print("📊 セクター平均: 静的デフォルト", "[セクター平均] 静的デフォルト")
         sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
         data = {s: self.default_sector_average(s) for s in sectors}
         cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
@@ -470,7 +497,7 @@ class DynamicSectorAverages:
             if cache_file.exists() and not force_refresh:
                 return pd.read_csv(cache_file)
 
-            print("📋 銘柄リスト取得…")
+            _cli_print("📋 銘柄リスト取得…", "[銘柄リスト] 取得中…")
             df = self.load_or_download_data_v2("listed/info", "sector_listed_info")
             if not df.empty:
                 if "Code" in df.columns:
@@ -494,10 +521,10 @@ class DynamicSectorAverages:
         try:
             tasks = build_offline_analysis_tasks(self.session)
             if not tasks:
-                print("📊 セクター平均計算: キャッシュデータが不足しています")
+                _cli_print("📊 セクター平均計算: キャッシュデータが不足しています", "[セクター平均計算] キャッシュデータが不足しています")
                 return {}
 
-            print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...")
+            _cli_print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...", f"[セクター平均計算] {len(tasks)}銘柄から計算中...")
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
 
@@ -514,10 +541,13 @@ class DynamicSectorAverages:
                     if res.get("success") and res.get("ps_ratio") is not None:
                         results.append(res)
                     if i % 100 == 0:
-                        print(f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})")
+                        _cli_print(
+                            f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})",
+                            f"  [{i}/{len(futs)}] 完了 (有効データ={len(results)})",
+                        )
 
             if not results:
-                print("📊 セクター平均計算: 有効なデータがありません")
+                _cli_print("📊 セクター平均計算: 有効なデータがありません", "[セクター平均計算] 有効なデータがありません")
                 return {}
 
             df = pd.DataFrame([
@@ -546,11 +576,11 @@ class DynamicSectorAverages:
                     "data_source": "calculated_from_cache"
                 }
 
-            print(f"📊 セクター平均計算完了: {len(sector_stats)}セクター")
+            _cli_print(f"📊 セクター平均計算完了: {len(sector_stats)}セクター", f"[セクター平均計算完了] {len(sector_stats)}セクター")
             return sector_stats
 
         except Exception as e:
-            print(f"⚠️ セクター平均計算エラー: {e}")
+            _cli_print(f"⚠️ セクター平均計算エラー: {e}", f"[警告] セクター平均計算エラー: {e}")
             import traceback
             traceback.print_exc()
             return {}
@@ -638,6 +668,7 @@ class FinancialDataManager:
         return []
 
     def _fill_missing_fields(self, fin: dict) -> dict:
+        """診断・セクター比較用の欠損補完。Piotroski/バリュエーション本計算には流さないこと（analyze では raw_fin を使用）。"""
         cur, prev = fin.get("current", {}), fin.get("previous", {})
         imputed: dict[str, str] = {}
 
@@ -982,7 +1013,11 @@ def build_financial_history_from_statements(
             rec["equity_ratio"] = None
 
         gross_profit = _pick_numeric_field(stmt, ["GrossProfit"])
-        if rec["revenue"] and gross_profit and rec["revenue"] != 0:
+        if (
+            rec["revenue"] is not None
+            and rec["revenue"] != 0
+            and gross_profit is not None
+        ):
             rec["gross_profit_margin"] = gross_profit / rec["revenue"]
 
         history.append(rec)
@@ -1064,7 +1099,7 @@ def compute_sales_cagr(history: List[dict], years: int = 3) -> Optional[float]:
         return None
     latest = history[0].get("revenue")
     past = history[years].get("revenue") if len(history) > years else None
-    if not latest or not past or past <= 0 or latest <= 0:
+    if latest is None or past is None or past <= 0 or latest <= 0:
         return None
     try:
         return (latest / past) ** (1 / years) - 1
@@ -1185,8 +1220,7 @@ def calculate_safety_criteria_v1(
         else:
             scores["no_speculative_drop"] = 0.0
     else:
-        scores["no_speculative_drop"] = 2.5
-        total_score += 2.5
+        scores["no_speculative_drop"] = 0.0
 
     required_conditions_met = (
         criteria["ps_under_1"] and
@@ -1212,38 +1246,116 @@ def calculate_safety_criteria_v1(
 # Piotroski（実データのみ）
 # ------------------------------------------------------------
 def calculate_piotroski_real(fin: dict) -> dict:
-    def nz(x, default=0.0):
+    def parse_num(x) -> Optional[float]:
         if x in (None, "", "NA") or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
-            return default
+            return None
         try:
             if isinstance(x, str):
                 x = x.replace(",", "").strip()
             return float(x)
         except (TypeError, ValueError):
-            return default
-    def safe_ratio(a, b):
-        a, b = nz(a, 0.0), nz(b, 0.0)
-        return a / b if b != 0 else 0.0
+            return None
 
-    cur  = {k: nz(v, None) for k, v in fin.get("current", {}).items()}
-    prev = {k: nz(v, None) for k, v in fin.get("previous", {}).items()}
+    def ratio_num(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        if a is None or b is None or b == 0:
+            return None
+        return a / b
 
-    comp = {}
-    comp["positive_net_income"] = nz(cur.get("net_income")) > 0
-    comp["positive_ocf"] = nz(cur.get("operating_cash_flow")) > 0
-    comp["ocf_gt_ni"] = nz(cur.get("operating_cash_flow")) > nz(cur.get("net_income"))
-    comp["roa_up"] = safe_ratio(cur.get("net_income"), cur.get("total_assets")) > safe_ratio(prev.get("net_income"), prev.get("total_assets"))
-    comp["ocf_margin_up"] = safe_ratio(cur.get("operating_cash_flow"), cur.get("revenue")) > safe_ratio(prev.get("operating_cash_flow"), prev.get("revenue"))
-    comp["current_ratio_up"] = safe_ratio(cur.get("current_assets"), cur.get("current_liabilities")) > safe_ratio(prev.get("current_assets"), prev.get("current_liabilities"))
-    comp["shares_down"] = nz(cur.get("shares_outstanding")) < nz(prev.get("shares_outstanding"))
-    comp["gpm_up"] = nz(cur.get("gross_profit_margin")) > nz(prev.get("gross_profit_margin"))
-    lev_cur  = safe_ratio(nz(cur.get("total_assets")) - nz(cur.get("equity")), nz(cur.get("total_assets")))
-    lev_prev = safe_ratio(nz(prev.get("total_assets")) - nz(prev.get("equity")), nz(prev.get("total_assets")))
-    comp["leverage_down"] = lev_cur < lev_prev
+    cur = fin.get("current") or {}
+    prev = fin.get("previous") or {}
 
-    score = int(sum(bool(v) for v in comp.values()))
-    evaluation = ("優秀" if score >= 7 else "良好" if score >= 5 else "普通" if score >= 3 else "注意")
-    return {"score": score, "details": comp, "evaluation": evaluation, "mode": "real"}
+    ni_c = parse_num(cur.get("net_income"))
+    ni_p = parse_num(prev.get("net_income"))
+    ocf_c = parse_num(cur.get("operating_cash_flow"))
+    ocf_p = parse_num(prev.get("operating_cash_flow"))
+    rev_c = parse_num(cur.get("revenue"))
+    rev_p = parse_num(prev.get("revenue"))
+    ta_c = parse_num(cur.get("total_assets"))
+    ta_p = parse_num(prev.get("total_assets"))
+    eq_c = parse_num(cur.get("equity"))
+    eq_p = parse_num(prev.get("equity"))
+    ca_c = parse_num(cur.get("current_assets"))
+    ca_p = parse_num(prev.get("current_assets"))
+    cl_c = parse_num(cur.get("current_liabilities"))
+    cl_p = parse_num(prev.get("current_liabilities"))
+    sh_c = parse_num(cur.get("shares_outstanding"))
+    sh_p = parse_num(prev.get("shares_outstanding"))
+    gpm_c = parse_num(cur.get("gross_profit_margin"))
+    gpm_p = parse_num(prev.get("gross_profit_margin"))
+
+    comp: dict[str, Optional[bool]] = {}
+    comp["positive_net_income"] = None if ni_c is None else (ni_c > 0)
+    comp["positive_ocf"] = None if ocf_c is None else (ocf_c > 0)
+    if ocf_c is None or ni_c is None:
+        comp["ocf_gt_ni"] = None
+    else:
+        comp["ocf_gt_ni"] = ocf_c > ni_c
+
+    roa_c = ratio_num(ni_c, ta_c)
+    roa_p = ratio_num(ni_p, ta_p)
+    if roa_c is None or roa_p is None:
+        comp["roa_up"] = None
+    else:
+        comp["roa_up"] = roa_c > roa_p
+
+    om_c = ratio_num(ocf_c, rev_c)
+    om_p = ratio_num(ocf_p, rev_p)
+    if om_c is None or om_p is None:
+        comp["ocf_margin_up"] = None
+    else:
+        comp["ocf_margin_up"] = om_c > om_p
+
+    cr_c = ratio_num(ca_c, cl_c)
+    cr_p = ratio_num(ca_p, cl_p)
+    if cr_c is None or cr_p is None:
+        comp["current_ratio_up"] = None
+    else:
+        comp["current_ratio_up"] = cr_c > cr_p
+
+    if sh_c is None or sh_p is None:
+        comp["shares_down"] = None
+    else:
+        comp["shares_down"] = sh_c < sh_p
+
+    if gpm_c is None or gpm_p is None:
+        comp["gpm_up"] = None
+    else:
+        comp["gpm_up"] = gpm_c > gpm_p
+
+    def leverage(ta: Optional[float], eq: Optional[float]) -> Optional[float]:
+        if ta is None or eq is None or ta == 0:
+            return None
+        return (ta - eq) / ta
+
+    lv_c = leverage(ta_c, eq_c)
+    lv_p = leverage(ta_p, eq_p)
+    if lv_c is None or lv_p is None:
+        comp["leverage_down"] = None
+    else:
+        comp["leverage_down"] = lv_c < lv_p
+
+    possible_items = 9
+    observed_items = sum(1 for v in comp.values() if v is not None)
+    observed_score = sum(1 for v in comp.values() if v is True)
+    coverage_ratio = (observed_items / possible_items) if possible_items else None
+
+    base_eval = (
+        "優秀" if observed_score >= 7 else "良好" if observed_score >= 5 else "普通" if observed_score >= 3 else "注意"
+    )
+    if observed_items < possible_items:
+        evaluation = f"{base_eval}・要注意(coverage_low)"
+    else:
+        evaluation = base_eval
+
+    return {
+        "score": observed_score,
+        "details": comp,
+        "evaluation": evaluation,
+        "mode": "real",
+        "observed_items": observed_items,
+        "possible_items": possible_items,
+        "coverage_ratio": coverage_ratio,
+    }
 
 # ------------------------------------------------------------
 # バリュエーション（モックなし）
@@ -1251,11 +1363,21 @@ def calculate_piotroski_real(fin: dict) -> dict:
 def calculate_ps_ratio(current_price: Optional[float], revenue_per_share: Optional[float]=None,
                        market_cap: Optional[float]=None, revenue: Optional[float]=None) -> Optional[float]:
     try:
-        if current_price and revenue_per_share and revenue_per_share > 0:
-            return float(current_price) / float(revenue_per_share)
-        if market_cap and revenue and revenue > 0:
-            return float(market_cap) / float(revenue)
-        return None
+        ps: Optional[float] = None
+        if current_price is not None and current_price > 0:
+            if revenue_per_share is not None and revenue_per_share > 0:
+                ps = float(current_price) / float(revenue_per_share)
+        if ps is None:
+            if (
+                market_cap is not None and market_cap > 0
+                and revenue is not None and revenue > 0
+            ):
+                ps = float(market_cap) / float(revenue)
+        if ps is None or not np.isfinite(ps):
+            return None
+        if ps <= 0 or ps >= 1000:
+            return None
+        return ps
     except Exception:
         return None
 
@@ -1277,14 +1399,18 @@ def calculate_peg_ratio(per: Optional[float], eps_growth_rate_pct: Optional[floa
 
 def estimate_eps_growth_rate(net_income_current: Optional[float],
                              net_income_previous: Optional[float],
-                             shares_outstanding: Optional[float]) -> Optional[float]:
+                             shares_outstanding_current: Optional[float],
+                             shares_outstanding_previous: Optional[float]) -> Optional[float]:
+    """YoY EPS 成長率(%)。当期・前期で**別々の発行済株式数**で EPS を定義。前期株数欠損時は計算しない。"""
     try:
-        if not all(v is not None for v in [net_income_current, net_income_previous, shares_outstanding]):
+        if net_income_current is None or net_income_previous is None:
             return None
-        if shares_outstanding <= 0:
+        if shares_outstanding_current is None or shares_outstanding_previous is None:
             return None
-        eps_cur = float(net_income_current) / float(shares_outstanding)
-        eps_prev = float(net_income_previous) / float(shares_outstanding)
+        if shares_outstanding_current <= 0 or shares_outstanding_previous <= 0:
+            return None
+        eps_cur = float(net_income_current) / float(shares_outstanding_current)
+        eps_prev = float(net_income_previous) / float(shares_outstanding_previous)
         if eps_prev <= 0:
             return None
         return (eps_cur / eps_prev - 1.0) * 100.0
@@ -1295,18 +1421,32 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
                                        net_income_current: Optional[float],
                                        net_income_previous: Optional[float],
                                        revenue_current: Optional[float],
-                                       shares_outstanding: Optional[float]) -> dict:
+                                       shares_outstanding: Optional[float],
+                                       shares_outstanding_previous: Optional[float] = None) -> dict:
     rps = None
-    if revenue_current and shares_outstanding and shares_outstanding > 0:
-        rps = revenue_current / shares_outstanding
+    if (
+        revenue_current is not None
+        and shares_outstanding is not None
+        and shares_outstanding > 0
+    ):
+        rps = float(revenue_current) / float(shares_outstanding)
 
     per = None
-    if net_income_current and shares_outstanding and shares_outstanding > 0:
-        eps = net_income_current / shares_outstanding
-        if eps > 0 and current_price and current_price > 0:
-            per = current_price / eps
+    if (
+        net_income_current is not None
+        and shares_outstanding is not None
+        and shares_outstanding > 0
+    ):
+        eps = float(net_income_current) / float(shares_outstanding)
+        if eps > 0 and current_price is not None and current_price > 0:
+            per = float(current_price) / eps
 
-    eps_growth = estimate_eps_growth_rate(net_income_current, net_income_previous, shares_outstanding)
+    eps_growth = estimate_eps_growth_rate(
+        net_income_current,
+        net_income_previous,
+        shares_outstanding,
+        shares_outstanding_previous,
+    )
     ps_ratio = calculate_ps_ratio(current_price, revenue_per_share=rps)
     peg_ratio = calculate_peg_ratio(per, eps_growth)
     return {
@@ -1341,40 +1481,79 @@ def calculate_safety_score_v3(
     w = {'margin_ratio':4.0,'short_selling':4.0,'earnings_stability':3.5,'dividend_stability':3.0,
          'liquidity':2.5,'momentum_stability':2.5,'volatility_stability':2.5,'technical_strength':3.0}
 
-    margin_score = w['margin_ratio'] * (0.6 if margin_ratio is None else 1.0 if margin_ratio<=3 else 0.8 if margin_ratio<=5 else 0.6 if margin_ratio<=10 else 0.3 if margin_ratio<=20 else 0)
-    short_score  = w['short_selling'] * (0.6 if short_selling_change_rate is None else 1.0 if short_selling_change_rate<=5 else 0.8 if short_selling_change_rate<=15 else 0.5 if short_selling_change_rate<=30 else 0.2 if short_selling_change_rate<=50 else 0)
+    if margin_ratio is None:
+        margin_score = 0.0
+    else:
+        margin_score = w['margin_ratio'] * (1.0 if margin_ratio<=3 else 0.8 if margin_ratio<=5 else 0.6 if margin_ratio<=10 else 0.3 if margin_ratio<=20 else 0)
+    if short_selling_change_rate is None:
+        short_score = 0.0
+    else:
+        short_score  = w['short_selling'] * (1.0 if short_selling_change_rate<=5 else 0.8 if short_selling_change_rate<=15 else 0.5 if short_selling_change_rate<=30 else 0.2 if short_selling_change_rate<=50 else 0)
     safety_score += margin_score + short_score
-    details['信用安全性'] = f"{'不明' if margin_ratio is None else f'{margin_ratio:.1f}倍'} ({margin_score:.1f})"
-    details['空売り安全性'] = f"{'不明' if short_selling_change_rate is None else f'{short_selling_change_rate:.1f}%'} ({short_score:.1f})"
+    details['信用安全性'] = (
+        f"不明 (0.0)" if margin_ratio is None else f"{margin_ratio:.1f}倍 ({margin_score:.1f})"
+    )
+    details['空売り安全性'] = (
+        f"不明 (0.0)" if short_selling_change_rate is None else f"{short_selling_change_rate:.1f}% ({short_score:.1f})"
+    )
 
-    eps_score = w['earnings_stability'] * (0.5 if yoy_eps_growth is None else 1.0 if yoy_eps_growth>=20 else 0.8 if yoy_eps_growth>=10 else 0.7 if yoy_eps_growth>=0 else 0.4 if yoy_eps_growth>=-10 else 0.2 if yoy_eps_growth>=-20 else 0)
-    div_score = w['dividend_stability'] * (0.5 if not dividend_status else 1.0 if dividend_status=='増配' else 0.8 if dividend_status=='維持' else 0.3 if dividend_status=='未定' else 0.1 if dividend_status=='減配' else 0)
+    if yoy_eps_growth is None:
+        eps_score = 0.0
+    else:
+        eps_score = w['earnings_stability'] * (1.0 if yoy_eps_growth>=20 else 0.8 if yoy_eps_growth>=10 else 0.7 if yoy_eps_growth>=0 else 0.4 if yoy_eps_growth>=-10 else 0.2 if yoy_eps_growth>=-20 else 0)
+    if dividend_status in (None, ""):
+        div_score = 0.0
+    else:
+        div_score = w['dividend_stability'] * (1.0 if dividend_status=='増配' else 0.8 if dividend_status=='維持' else 0.3 if dividend_status=='未定' else 0.1 if dividend_status=='減配' else 0)
     safety_score += eps_score + div_score
-    details['業績安定性'] = f"{'不明' if yoy_eps_growth is None else f'EPS成長率{yoy_eps_growth:.1f}%'} ({eps_score:.1f})"
-    details['配当安定性'] = f"{dividend_status or '不明'} ({div_score:.1f})"
+    details['業績安定性'] = (
+        f"不明 (0.0)" if yoy_eps_growth is None else f"EPS成長率{yoy_eps_growth:.1f}% ({eps_score:.1f})"
+    )
+    details['配当安定性'] = f"{dividend_status or '不明'} (0.0)" if dividend_status in (None, "") else f"{dividend_status} ({div_score:.1f})"
 
-    volume_score = w['liquidity'] * (0.5 if avg_volume is None else 1.0 if avg_volume>=500000 else 0.8 if avg_volume>=200000 else 0.6 if avg_volume>=100000 else 0.3 if avg_volume>=50000 else 0)
-    if avg_trading_value is not None and np.isfinite(avg_trading_value):
-        adv_score = 1.0 if avg_trading_value >= 1_000_000_000 else 0.8 if avg_trading_value >= 500_000_000 else 0.6 if avg_trading_value >= 300_000_000 else 0.3 if avg_trading_value >= 100_000_000 else 0.0
-        volume_score = w['liquidity'] * max(volume_score / max(w['liquidity'], 1e-9), adv_score)
+    liq_observed = (avg_volume is not None) or (
+        avg_trading_value is not None and np.isfinite(avg_trading_value)
+    )
+    if not liq_observed:
+        volume_score = 0.0
+        vm = 0.0
+    else:
+        if avg_volume is None:
+            vm = 0.0
+        else:
+            vm = 1.0 if avg_volume>=500000 else 0.8 if avg_volume>=200000 else 0.6 if avg_volume>=100000 else 0.3 if avg_volume>=50000 else 0
+        volume_score = w['liquidity'] * vm
+        if avg_trading_value is not None and np.isfinite(avg_trading_value):
+            adv_score = 1.0 if avg_trading_value >= 1_000_000_000 else 0.8 if avg_trading_value >= 500_000_000 else 0.6 if avg_trading_value >= 300_000_000 else 0.3 if avg_trading_value >= 100_000_000 else 0.0
+            volume_score = w['liquidity'] * max(vm, adv_score)
     safety_score += volume_score
-    liq_note = '不明'
-    if avg_volume is not None:
-        liq_note = f'{avg_volume:,}株'
-    if avg_trading_value is not None and np.isfinite(avg_trading_value):
-        liq_note += f' / ADV{avg_trading_value/1e6:.0f}MJPY'
-    details['流動性'] = f"{liq_note} ({volume_score:.1f})"
+    if not liq_observed:
+        liq_note = '不明'
+    else:
+        liq_note = ''
+        if avg_volume is not None:
+            liq_note = f'{avg_volume:,}株'
+        if avg_trading_value is not None and np.isfinite(avg_trading_value):
+            liq_note += (' / ' if liq_note else '') + f'ADV{avg_trading_value/1e6:.0f}MJPY'
+        if not liq_note:
+            liq_note = 'データあり'
+    details['流動性'] = f"{liq_note} ({volume_score:.1f})" if liq_observed else f"不明 (0.0)"
 
-    stagnant_score = w['momentum_stability'] * (0.6 if stagnant_days_after_spike is None else 1.0 if stagnant_days_after_spike==0 else 0.8 if stagnant_days_after_spike<=2 else 0.5 if stagnant_days_after_spike<=4 else 0.2 if stagnant_days_after_spike<=6 else 0)
+    if stagnant_days_after_spike is None:
+        stagnant_score = 0.0
+    else:
+        stagnant_score = w['momentum_stability'] * (1.0 if stagnant_days_after_spike==0 else 0.8 if stagnant_days_after_spike<=2 else 0.5 if stagnant_days_after_spike<=4 else 0.2 if stagnant_days_after_spike<=6 else 0)
     if current_volatility is not None and average_volatility not in (None, 0):
         vr = current_volatility / average_volatility
         vol_score = w['volatility_stability'] * (1.0 if vr<=1.2 else 0.8 if vr<=1.5 else 0.5 if vr<=2.0 else 0.2 if vr<=2.5 else 0)
         vol_note = f"{vr:.1f}倍"
     else:
-        vol_score = w['volatility_stability'] * 0.6
-        vol_note = "不明"
+        vol_score = 0.0
+        vol_note = "不明 (0.0)"
     safety_score += stagnant_score + vol_score
-    details['モメンタム安定性'] = f"{'不明' if stagnant_days_after_spike is None else f'{stagnant_days_after_spike}日'} ({stagnant_score:.1f})"
+    details['モメンタム安定性'] = (
+        f"不明 (0.0)" if stagnant_days_after_spike is None else f"{stagnant_days_after_spike}日 ({stagnant_score:.1f})"
+    )
     details['ボラティリティ安定性'] = f"{vol_note} ({vol_score:.1f})"
 
     if not below_ma25 and not below_ma75:
@@ -1389,9 +1568,30 @@ def calculate_safety_score_v3(
     safety_score += tech_score
     details['テクニカル強さ'] = f"{tech_note} ({tech_score:.1f})"
 
+    possible_items = 8
+    observed_items = sum([
+        margin_ratio is not None,
+        short_selling_change_rate is not None,
+        yoy_eps_growth is not None,
+        dividend_status not in (None, ""),
+        liq_observed,
+        stagnant_days_after_spike is not None,
+        current_volatility is not None and average_volatility not in (None, 0),
+        True,
+    ])
+    coverage_ratio = observed_items / possible_items if possible_items else None
+
     ratio = safety_score / max_total_score
     level = "🟢 非常に安全" if ratio>=0.8 else "🔵 安全" if ratio>=0.6 else "🟡 普通" if ratio>=0.4 else "🟠 やや危険" if ratio>=0.2 else "🔴 危険"
-    return {"total_score": round(safety_score,1), "max_score": max_total_score, "safety_level": level, "details": details}
+    return {
+        "total_score": round(safety_score,1),
+        "max_score": max_total_score,
+        "safety_level": level,
+        "details": details,
+        "observed_items": observed_items,
+        "possible_items": possible_items,
+        "coverage_ratio": coverage_ratio,
+    }
 
 def detect_speculative_manipulation_v2(
     margin_ratio: float | None = None,
@@ -1408,6 +1608,7 @@ def detect_speculative_manipulation_v2(
     mas: dict | None = None,
     stock_code: str | None = None
 ) -> dict:
+    # 名称は歴史的互換のため維持。入力欠損が多い場合はテクニカル寄りの検出に偏る（返却の model_scope を参照）。
     score = 0
     flags = []; risks = []
     if margin_ratio is not None:
@@ -1433,7 +1634,15 @@ def detect_speculative_manipulation_v2(
     if yoy_eps_growth is not None and yoy_eps_growth < -30: score += 8; flags.append(f"⚠️ EPS急減: {yoy_eps_growth:.1f}%")
 
     level = "🔴 極めて投機的" if score>=70 else "🟠 高い" if score>=50 else "🟡 やや高い" if score>=30 else "🟢 低い"
-    return {"score": score, "level": level, "warning_flags": flags, "risk_factors": risks, "max_score": 100}
+    return {
+        "score": score,
+        "level": level,
+        "warning_flags": flags,
+        "risk_factors": risks,
+        "max_score": 100,
+        "model_scope": "technical_only",
+        "scope_note": "需給・信用残などの外部データ未接続時は、価格・出来高・ボラ・移動平均に基づく簡易プロキシです。",
+    }
 
 # ------------------------------------------------------------
 # 単銘柄フル分析（offline対応、モックなし）
@@ -1512,6 +1721,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             as_of_date=latest_price_date,
             statement_basis="annual",
         )
+        annual_quality_ok = statement_basis_used == "annual"
         cur_fin = financial_history[0].copy() if financial_history else {}
         prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
         raw_fin = {"current": cur_fin.copy(), "previous": prv_fin.copy(), "current_price": current_price, "sector": sector}
@@ -1532,16 +1742,18 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             net_income_previous=raw_fin["previous"].get("net_income"),
             revenue_current=raw_fin["current"].get("revenue"),
             shares_outstanding=raw_fin["current"].get("shares_outstanding"),
+            shares_outstanding_previous=raw_fin["previous"].get("shares_outstanding"),
         )
+        eps_growth_for_scoring = val.get("eps_growth_rate")
         safety = calculate_safety_score_v3(
-            yoy_eps_growth=None,
+            yoy_eps_growth=eps_growth_for_scoring,
             avg_volume=avg_volume,
             avg_trading_value=adv_jpy_20d,
             current_volatility=cur_vol, average_volatility=avg_vol,
             below_ma25=below_ma25, below_ma75=below_ma75
         )
         spec = detect_speculative_manipulation_v2(
-            yoy_eps_growth=None,
+            yoy_eps_growth=eps_growth_for_scoring,
             avg_volume=avg_volume,
             current_volatility=cur_vol, average_volatility=avg_vol,
             below_ma25=below_ma25, below_ma75=below_ma75,
@@ -1550,11 +1762,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 
         shares_outstanding = raw_fin["current"].get("shares_outstanding")
         market_cap = None
-        if current_price is not None and shares_outstanding not in (None, 0):
+        if current_price is not None and shares_outstanding is not None and shares_outstanding > 0:
             market_cap = current_price * shares_outstanding
 
         max_dd = calculate_max_drawdown(close, lookback_days=LOOKBACK_DAYS) if len(close) > 0 else None
-        sales_cagr = compute_sales_cagr(financial_history, years=3) if financial_history else None
+        if annual_quality_ok and financial_history:
+            sales_cagr = compute_sales_cagr(financial_history, years=3)
+        else:
+            sales_cagr = None
         cash_eq = raw_fin["current"].get("cash_and_equivalents")
         equity_ratio = raw_fin["current"].get("equity_ratio")
         if equity_ratio is None:
@@ -1594,6 +1809,15 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             and rc.get("revenue") is not None
             and rc.get("net_income") is not None
             and rp.get("net_income") is not None
+            and rp.get("shares_outstanding") is not None
+        )
+        eps_growth_input_complete = bool(
+            rc.get("net_income") is not None
+            and rp.get("net_income") is not None
+            and rc.get("shares_outstanding") is not None
+            and rc.get("shares_outstanding") > 0
+            and rp.get("shares_outstanding") is not None
+            and rp.get("shares_outstanding") > 0
         )
         piotroski_input_complete = bool(
             rc.get("net_income") is not None
@@ -1629,12 +1853,22 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         else:
             ps_satellite_limit = float(max(MAX_PS_DEFENSIVE, 3.0))
 
-        op_income_eval = evaluate_operating_income_stability(
-            financial_history,
-            years=OP_INCOME_YEARS,
-            drop_floor=OP_INCOME_DROP_FLOOR,
-            exclude_deficit=EXCLUDE_OP_INCOME_DEFICIT
-        )
+        if annual_quality_ok:
+            op_income_eval = evaluate_operating_income_stability(
+                financial_history,
+                years=OP_INCOME_YEARS,
+                drop_floor=OP_INCOME_DROP_FLOOR,
+                exclude_deficit=EXCLUDE_OP_INCOME_DEFICIT
+            )
+        else:
+            latest_op = financial_history[0].get("operating_income") if financial_history else None
+            op_income_eval = {
+                "stable": None,
+                "reason": "non_annual_basis",
+                "years_checked": OP_INCOME_YEARS,
+                "latest": latest_op,
+                "median_prev": None,
+            }
         op_income_stable = (op_income_eval.get("stable") is True)
 
         statement_type = financial_history[0].get("statement_type") if financial_history else None
@@ -1662,9 +1896,15 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "statement_staleness_days": statement_staleness_days,
             "statement_basis_used": statement_basis_used,
             "fallback_basis_flag": (statement_basis_used == "fallback_primary_type"),
+            "annual_financial_compare_ok": annual_quality_ok,
+            "piotroski_basis_note": (
+                None if annual_quality_ok
+                else "non_annual_basis: 年次と四半期が混在しうるため、前年比較系の解釈に注意"
+            ),
             "valuation_input_complete": valuation_input_complete,
+            "eps_growth_input_complete": eps_growth_input_complete,
             "piotroski_input_complete": piotroski_input_complete,
-            "growth_proxy_detached_from_scoring": True,
+            "growth_proxy_detached_from_scoring": False,
             "imputation": imputation,
             "critical_missing_count": critical_missing,
             "raw_financial_fields": {
@@ -1842,7 +2082,7 @@ def collect_all_daemon(session: requests.Session,
 
     pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days)
     if not pending:
-        print("📦 すでに全件取得済み")
+        _cli_print("📦 すでに全件取得済み", "[収集] すでに全件取得済み")
         return
 
     if daily_budget is None:
@@ -1850,7 +2090,10 @@ def collect_all_daemon(session: requests.Session,
         daily_budget = max(1, min(len(pending), rpd // 2 - 5))
 
     mode = "強制再収集" if force_full else (f"{refresh_days}日超のみ再収集" if refresh_days is not None else "未取得のみ")
-    print(f"▶ 全自動収集開始  残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}")
+    _cli_print(
+        f"▶ 全自動収集開始  残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}",
+        f"[収集開始] 残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}",
+    )
 
     while pending:
         taken = 0
@@ -1866,22 +2109,26 @@ def collect_all_daemon(session: requests.Session,
                 taken += 1
                 if taken % 20 == 0 or taken == daily_budget:
                     elapsed = time.time() - start
-                    print(f"  ⏱ 本日 {taken}/{daily_budget} 件  残り{len(pending)}  経過{int(elapsed)}s", flush=True)
+                    _cli_print(
+                        f"  ⏱ 本日 {taken}/{daily_budget} 件  残り{len(pending)}  経過{int(elapsed)}s",
+                        f"  [本日 {taken}/{daily_budget}] 残り{len(pending)}  経過{int(elapsed)}s",
+                    )
+                    sys.stdout.flush()
         except RuntimeError as e:
             if "日次レート制限到達" in str(e):
                 pass
             else:
                 raise
 
-        print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件")
+        _cli_print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件", f"[収集] 今日のバッチ終了: {taken}件  残り{len(pending)}件")
         if not pending:
-            print("✅ 全銘柄の凍結収集が完了")
+            _cli_print("✅ 全銘柄の凍結収集が完了", "[OK] 全銘柄の凍結収集が完了")
             break
 
         wait_sec = seconds_until_next_day()
         h, rem = divmod(wait_sec, 3600)
         m, s = divmod(rem, 60)
-        print(f"⏳ 日次上限回復待ち: {h}h{m}m{s}s 待機")
+        _cli_print(f"⏳ 日次上限回復待ち: {h}h{m}m{s}s 待機", f"[待機] 日次上限回復待ち: {h}h{m}m{s}s")
         time.sleep(wait_sec)
 
 def collect_batch(session: requests.Session, max_codes: int) -> dict:
@@ -1904,7 +2151,11 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
             fail += 1
         if i % 20 == 0 or i == len(picked):
             elapsed = time.time() - start
-            print(f"  ⏱ {i}/{len(picked)} 収集中 (OK={ok} FAIL={fail}) 経過{elapsed:.0f}s", flush=True)
+            _cli_print(
+                f"  ⏱ {i}/{len(picked)} 収集中 (OK={ok} FAIL={fail}) 経過{elapsed:.0f}s",
+                f"  [{i}/{len(picked)}] 収集中 (OK={ok} FAIL={fail}) 経過{elapsed:.0f}s",
+            )
+            sys.stdout.flush()
 
     return {"tried": len(picked), "ok": ok, "fail": fail}
 
@@ -2000,8 +2251,12 @@ def _flatten_result(d: dict) -> dict:
         "momentum_3m_1m": d.get("momentum_3m_1m"),
         "piot": pio.get("score"),
         "piot_eval": pio.get("evaluation"),
+        "piot_observed_items": pio.get("observed_items"),
+        "piot_coverage_ratio": pio.get("coverage_ratio"),
         "safety": saf.get("total_score"),
         "safety_level": saf.get("safety_level"),
+        "safety_coverage_ratio": saf.get("coverage_ratio"),
+        "safety_observed_items": saf.get("observed_items"),
         "spec_score": spc.get("score"),
         "spec_level": spc.get("level"),
         "safety_criteria_score": safety_criteria.get("total_score") if isinstance(safety_criteria, dict) else None,
@@ -2025,7 +2280,10 @@ def _flatten_result(d: dict) -> dict:
         "statement_type": diagnostics.get("statement_type"),
         "statement_basis_used": diagnostics.get("statement_basis_used"),
         "fallback_basis_flag": diagnostics.get("fallback_basis_flag"),
+        "annual_financial_compare_ok": diagnostics.get("annual_financial_compare_ok"),
+        "piotroski_basis_note": diagnostics.get("piotroski_basis_note"),
         "valuation_input_complete": diagnostics.get("valuation_input_complete"),
+        "eps_growth_input_complete": diagnostics.get("eps_growth_input_complete"),
         "piotroski_input_complete": diagnostics.get("piotroski_input_complete"),
         "growth_proxy_detached_from_scoring": diagnostics.get("growth_proxy_detached_from_scoring"),
         "statement_disclosed_date": diagnostics.get("statement_disclosed_date"),
@@ -2082,7 +2340,7 @@ def cleanup_old_report_files(outdir: Path) -> None:
     total += _cleanup_old_files_by_ext(outdir, ".md")
     total += _cleanup_old_files_by_ext(outdir, ".json")
     if total > 0:
-        print(f"🗑️ 古いレポート {total}件を削除しました ({outdir})")
+        _cli_print(f"🗑️ 古いレポート {total}件を削除しました ({outdir})", f"[削除] 古いレポート {total}件を削除しました ({outdir})")
 
 def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[str] = None) -> list[Path]:
     outdir.mkdir(exist_ok=True, parents=True)
@@ -2621,7 +2879,7 @@ def run_interactive():
             budget = input("本日収集する銘柄数（推奨380）: ").strip()
             budget = int(budget) if budget.isdigit() else 380
             s = collect_batch(session, budget)
-            print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}")
+            _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
 
         elif choice == "2":
             tasks = build_offline_analysis_tasks(session)
@@ -2641,15 +2899,18 @@ def run_interactive():
                     results.append(fut.result())
                     if i % 200 == 0 or i == len(futs):
                         ok_cnt = sum(1 for r in results if r.get("success"))
-                        print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
+                        _cli_print(
+                            f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})",
+                            f"  [{i}/{len(futs)}] 完了 (OK={ok_cnt})",
+                        )
 
             flat = pd.DataFrame([_flatten_result(r) for r in results])
             master = outdir / "screening_offline.csv"
             flat.to_csv(master, index=False, encoding="utf-8-sig")
 
             outputs = generate_reports_from_master_csv(master, outdir, topn=30)
-            print(f"✅ 出力: {master}")
-            print(f"✅ 出力先: {outdir}")
+            _cli_print(f"✅ 出力: {master}", f"[OK] 出力: {master}")
+            _cli_print(f"✅ 出力先: {outdir}", f"[OK] 出力先: {outdir}")
             print("=== 生成物 ===")
             for p in outputs:
                 print(f"  - {p}")
@@ -2663,11 +2924,11 @@ def run_interactive():
             df.to_csv(fp, index=False, encoding="utf-8-sig")
             cleanup_old_report_files(outdir)
             cleanup_old_report_files(outdir.parent)
-            print(f"✅ 出力: {fp}")
+            _cli_print(f"✅ 出力: {fp}", f"[OK] 出力: {fp}")
             print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
 
         elif choice == "4":
-            print("📊 セクター平均をキャッシュから計算中...")
+            _cli_print("📊 セクター平均をキャッシュから計算中...", "[セクター平均] キャッシュから計算中...")
             sector_avgs_obj = DynamicSectorAverages(session)
             updated_avgs = sector_avgs_obj.calculate_sector_averages_from_cache()
             if updated_avgs:
@@ -2683,7 +2944,7 @@ def run_interactive():
                 sector_avgs_obj.sector_cache = data
                 sector_avgs_obj.cache_timestamp = time.time()
                 sector_avgs = data
-                print(f"✅ セクター平均を更新しました（{len(updated_avgs)}セクター）")
+                _cli_print(f"✅ セクター平均を更新しました（{len(updated_avgs)}セクター）", f"[OK] セクター平均を更新しました（{len(updated_avgs)}セクター）")
                 for sector, stats in updated_avgs.items():
                     ps_val = stats.get('ps', None)
                     per_val = stats.get('per', None)
@@ -2692,7 +2953,10 @@ def run_interactive():
                     per_str = f"{per_val:.2f}" if per_val is not None else "N/A"
                     print(f"  {sector}: PS={ps_str}, PER={per_str}, サンプル数={sample_count}")
             else:
-                print("⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。")
+                _cli_print(
+                    "⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。",
+                    "[警告] セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。",
+                )
 
         elif choice == "5":
             budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
@@ -2750,7 +3014,7 @@ def main():
 
     if args.phase == "collect":
         s = collect_batch(session, args.budget)
-        print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}")
+        _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
         return
 
     if args.phase == "single":
@@ -2763,7 +3027,7 @@ def main():
         df.to_csv(fp, index=False, encoding="utf-8-sig")
         cleanup_old_report_files(outdir)
         cleanup_old_report_files(outdir.parent)
-        print(f"✅ 単銘柄出力: {fp}")
+        _cli_print(f"✅ 単銘柄出力: {fp}", f"[OK] 単銘柄出力: {fp}")
         print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
         return
 
@@ -2785,15 +3049,18 @@ def main():
                 results.append(fut.result())
                 if i % 200 == 0 or i == len(futs):
                     ok_cnt = sum(1 for r in results if r.get("success"))
-                    print(f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})")
+                    _cli_print(
+                        f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})",
+                        f"  [{i}/{len(futs)}] 完了 (OK={ok_cnt})",
+                    )
 
         flat = pd.DataFrame([_flatten_result(r) for r in results])
         master = outdir / "screening_offline.csv"
         flat.to_csv(master, index=False, encoding="utf-8-sig")
 
         outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
-        print(f"✅ オフライン分析出力: {master}")
-        print(f"✅ 出力先: {outdir}")
+        _cli_print(f"✅ オフライン分析出力: {master}", f"[OK] オフライン分析出力: {master}")
+        _cli_print(f"✅ 出力先: {outdir}", f"[OK] 出力先: {outdir}")
         print("=== 生成物 ===")
         for p in outputs:
             print(f"  - {p}")
