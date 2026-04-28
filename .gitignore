@@ -41,6 +41,8 @@ api.ini
 
 # キャッシュ・データ
 .jquants_cache/
+.jquants_cache_v2/
+snapshots/
 output/
 *.csv
 *.json

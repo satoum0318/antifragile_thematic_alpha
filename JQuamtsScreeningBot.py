@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 J-Quants 収集→凍結キャッシュ→完全オフライン分析ワークフロー
-- 4日運用: 収集(価格+財務)を日次800req内で進め、4日目にオフライン一括分析
+- J-Quants API V2（x-api-key）を使用。キャッシュは .jquants_cache_v2（V1の .jquants_cache は混在させない）
+- collect_all の日次「待機」は JQ_RPD 設定時のみ（未設定なら rpm 主制御で同一日内に待機しない）
+- 収集の --budget 380 は取得件数の安全上限として維持（V2では主にリクエスト/分で制限）
 - モック不使用: オフライン時は“計算不能はNone”で返す（推定やランダムは行わない）
 - 端末対話メニュー付き（引数未指定で起動するとメニュー表示）
 - CLI対応:
@@ -10,7 +12,13 @@ J-Quants 収集→凍結キャッシュ→完全オフライン分析ワーク�
     単銘柄: python script.py --phase single --code 8035
     全件:   python script.py --phase collect_all --budget 380
 環境変数:
-    JQ_RPM=50  JQ_RPD=800  # 必要なら調整
+    JQUANTS_API_KEY または JQ_API_KEY（APIキー。未設定時は api.ini の DEFAULT.API_KEY）
+    JQ_RPM=60        # 分あたりリクエスト上限の目安（公式プランに合わせて調整）
+    JQ_RPD=          # 未設定なら日次セルフ上限なし（旧V1の800相当を自前で付けたい場合のみ数値を指定）
+
+V2では date 指定で equities/bars/daily の全銘柄日次データ取得が可能なため、
+日次更新は将来的に code 単位ではなく date 単位一括取得へ移行する。
+初回移行では既存互換の code 単位取得を維持する。
 
 追加（スクリーニングの「必須」フィルタを実装）
 - 流動性フィルタ: avg_volume_30d >= MIN_AVG_VOLUME_30D かつ market_cap >= MIN_MARKET_CAP_JPY
@@ -22,8 +30,12 @@ J-Quants 収集→凍結キャッシュ→完全オフライン分析ワーク�
 スコアリング前提（重要）:
 - EPS 成長率は当期・前期の**それぞれの発行済株式数**が揃っているときのみ計算（欠損時は None）。
 - 決算系列が annual でない場合（フォールバック時）は sales_cagr および営業利益安定の判定は**非計算**（None / reason=non_annual_basis）。
-- 認証トークン取得（_refresh_id_token）は `requests.post` 直打ちのため **APIRateLimiter の対象外**（データ API のみをカウント）。
+- V2 では API キー認証のためトークン更新は使用しない。
 - PEG / reference_peg は**参考列**（総合ランキングスコアの直接入力には用いない）。
+
+現在のV2実装では、契約プランにより fins/details が403になる場合があります。
+その場合は summary_only mode で動作し、流動資産・流動負債・売上総利益等を用いる一部のPiotroski項目は欠損扱いになります。
+旧V1版と完全同等の財務スクリーニングには Premium 相当の fins/details アクセスが必要です。
 
 必要: pandas, numpy, requests
 """
@@ -52,8 +64,13 @@ import requests
 # ロギング
 # ------------------------------------------------------------
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.NullHandler())
+JQ_LOG_VERBOSE = os.getenv("JQ_LOG", "").lower() == "debug"
+logger.setLevel(logging.DEBUG if JQ_LOG_VERBOSE else logging.INFO)
+_log_stderr = logging.StreamHandler(sys.stderr)
+_log_stderr.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+_log_stderr.setLevel(logging.DEBUG if JQ_LOG_VERBOSE else logging.INFO)
+logger.addHandler(_log_stderr)
+logger.propagate = False
 
 def _cli_stdout_utf8ish() -> bool:
     """Windows cp932 等で絵文字 print が UnicodeEncodeError になるのを避けるための判定。"""
@@ -67,11 +84,14 @@ def _cli_print(msg: str, ascii_safe: str) -> None:
 # ------------------------------------------------------------
 # 定数・パス
 # ------------------------------------------------------------
-JQUANTS_API_BASE = "https://api.jquants.com/v1"
-CACHE_DIR = Path(".jquants_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+JQUANTS_API_BASE = "https://api.jquants.com/v2"
+CACHE_DIR = Path(".jquants_cache_v2")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOOKBACK_DAYS = 700
 REPORTS_DIR = Path("output") / "reports"
+
+# summary_only での影響説明ログ（セッションにつき1回）
+_SUMMARY_ONLY_MODE_INFO_LOGGED = False
 
 # ------------------------------------------------------------
 # スクリーニング必須フィルタ（環境変数で上書き可）
@@ -97,8 +117,477 @@ def seconds_until_next_day(buffer_sec: int = 10) -> int:
     return max(1, int((reset - now).total_seconds()) + buffer_sec)
 
 def build_prices_endpoint(stock_code: str, lookback_days: int = LOOKBACK_DAYS) -> str:
+    """ログ用途・後方互換。実際の取得は fetch_prices_v2 を使用（equities/bars/daily）。候補の先頭を表示。"""
     start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    return f"prices/daily_quotes?code={stock_code}&from={start}"
+    end = datetime.date.today().strftime("%Y-%m-%d")
+    cands = api_code_candidates(stock_code)
+    qc = cands[0] if cands else ""
+    return f"equities/bars/daily?code={qc}&from={start}&to={end}"
+
+def api_code_candidates(code: str) -> List[str]:
+    """V2 API が受け付けるコード候補: 優先して内部4桁、次に4桁+'0'。zfill(5) は使わない。"""
+    c = str(code).strip()
+    m = re.search(r"\d{4}", c)
+    if not m:
+        digits = "".join(ch for ch in c if ch.isdigit())
+        if len(digits) >= 4:
+            c4 = digits[:4]
+            return [c4, c4 + "0"]
+        if digits:
+            c4 = digits.zfill(4)[-4:]
+            return [c4, c4 + "0"]
+        return [c] if c else []
+    c4 = m.group(0)
+    return [c4, c4 + "0"]
+
+def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    V2 fins/summary の略号列を、既存 build_financial_history が期待する V1 風キーへ付与する。
+    （fins/details が使えないプランでも summary 単体で最低限動く）
+    """
+    if not row:
+        return row
+    out = dict(row)
+    if out.get("DisclosedDate") is None and out.get("DiscDate") is not None:
+        out["DisclosedDate"] = out.get("DiscDate")
+    if out.get("TypeOfDocument") is None and out.get("DocType") is not None:
+        out["TypeOfDocument"] = out.get("DocType")
+    if out.get("CurrentPeriodType") is None and out.get("CurPerType") is not None:
+        out["CurrentPeriodType"] = out.get("CurPerType")
+    if out.get("CurrentPeriodEndDate") is None and out.get("CurPerEn") is not None:
+        out["CurrentPeriodEndDate"] = out.get("CurPerEn")
+    if out.get("CurrentFiscalYearEndDate") is None and out.get("CurFYEn") is not None:
+        out["CurrentFiscalYearEndDate"] = out.get("CurFYEn")
+    if out.get("NetSales") is None and out.get("Sales") is not None:
+        out["NetSales"] = out.get("Sales")
+    if out.get("OperatingIncome") is None and out.get("OP") is not None:
+        out["OperatingIncome"] = out.get("OP")
+    if out.get("NetIncomeLoss") is None and out.get("NP") is not None:
+        out["NetIncomeLoss"] = out.get("NP")
+    if out.get("TotalAssets") is None and out.get("TA") is not None:
+        out["TotalAssets"] = out.get("TA")
+    if out.get("EquityAttributableToOwnersOfParent") is None and out.get("Eq") is not None:
+        out["EquityAttributableToOwnersOfParent"] = out.get("Eq")
+    if out.get("NetCashProvidedByUsedInOperatingActivities") is None and out.get("CFO") is not None:
+        out["NetCashProvidedByUsedInOperatingActivities"] = out.get("CFO")
+    if out.get("CashAndCashEquivalents") is None and out.get("CashEq") is not None:
+        out["CashAndCashEquivalents"] = out.get("CashEq")
+    sh = _non_null(out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"), out.get("ShOutFY"))
+    if out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock") is None and sh is not None:
+        out["NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"] = sh
+    return out
+
+def _strip_slash(endpoint: str) -> str:
+    return endpoint.strip().lstrip("/")
+
+def _v2_resp_error_snippet(resp: requests.Response) -> str:
+    try:
+        return (resp.text or "")[:400]
+    except Exception:
+        return ""
+
+def paginate_v2_endpoint(
+    session: requests.Session,
+    endpoint: str,
+    params: Optional[Dict[str, Any]],
+    *,
+    max_pages: int = 1000,
+) -> Tuple[List[Dict[str, Any]], int, str]:
+    """GET の data を連結。pyd 最初の応答ステータスを返す（200以外はページング中止）。"""
+    ep = _strip_slash(endpoint)
+    base_params = dict(params or {})
+    all_rows: List[Dict[str, Any]] = []
+    pagination_key: Optional[str] = None
+    last_http = 200
+    err_snippet = ""
+    for page in range(max_pages):
+        p = base_params.copy()
+        if pagination_key:
+            p["pagination_key"] = pagination_key
+        url = f"{JQUANTS_API_BASE}/{ep}"
+        try:
+            resp = session.get(url, params=p, timeout=30)
+        except requests.RequestException as e:
+            logger.warning("paginate_v2_endpoint 通信失敗 %s: %s", url, e)
+            return [], 599, str(e)
+        last_http = resp.status_code
+        if resp.status_code != 200:
+            err_snippet = _v2_resp_error_snippet(resp)
+            return [], resp.status_code, err_snippet
+        try:
+            body = resp.json()
+        except Exception as e:
+            logger.warning("paginate_v2_endpoint JSON decode失敗 %s: %s", url, e)
+            return [], 598, str(e)
+        data = body.get("data")
+        if not isinstance(data, list):
+            break
+        all_rows.extend(data)
+        pagination_key = body.get("pagination_key")
+        if not pagination_key:
+            break
+    return all_rows, last_http, err_snippet
+
+def get_v2_all_pages(
+    session: requests.Session,
+    endpoint: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    max_pages: int = 1000,
+) -> List[Dict[str, Any]]:
+    """
+    GET {JQUANTS_API_BASE}/{endpoint}
+    response['data'] を連結して返す。pagination_key がある限り続きを取得する。
+    """
+    ep = _strip_slash(endpoint)
+    rows, status, err = paginate_v2_endpoint(session, ep, dict(params or {}), max_pages=max_pages)
+    if status != 200:
+        logger.warning("get_v2_all_pages HTTP %s %s %s", status, endpoint, err[:120] if err else "")
+        return []
+    return rows
+
+def normalize_prices_v2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V2 equities/bars/daily の短縮列名を既存内部標準列へ変換する。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    rename_map = {
+        "O": "Open",
+        "H": "High",
+        "L": "Low",
+        "C": "Close",
+        "Vo": "Volume",
+        "Va": "TurnoverValue",
+        "AdjO": "AdjustmentOpen",
+        "AdjH": "AdjustmentHigh",
+        "AdjL": "AdjustmentLow",
+        "AdjC": "AdjustmentClose",
+        "AdjVo": "AdjustmentVolume",
+    }
+    colmap = {k: v for k, v in rename_map.items() if k in out.columns}
+    if colmap:
+        out = out.rename(columns=colmap)
+    num_cols = [c for c in (
+        "Open", "High", "Low", "Close", "Volume", "TurnoverValue",
+        "AdjustmentOpen", "AdjustmentHigh", "AdjustmentLow", "AdjustmentClose", "AdjustmentVolume",
+    ) if c in out.columns]
+    for c in num_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    if "Date" in out.columns:
+        out = out.sort_values("Date", ascending=True).reset_index(drop=True)
+    return out
+
+def normalize_equities_master_v2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V2 equities/master を既存の Code, CompanyName, Sector33Name, MarketCode へ正規化する。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Code", "CompanyName", "Sector33Name", "MarketCode"])
+
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        d = row.to_dict()
+        code_cell = (
+            _first_present(d, ("Code", "LocalCode", "code", "IssueCode", "CorporateCode"))
+        )
+        if code_cell is None or (isinstance(code_cell, float) and pd.isna(code_cell)):
+            continue
+        digits = "".join(ch for ch in str(code_cell) if ch.isdigit())
+        if len(digits) >= 5:
+            code_4 = digits[:4]
+        elif len(digits) >= 4:
+            code_4 = digits[:4]
+        else:
+            code_4 = digits.zfill(4)[-4:]
+        company = _first_present(
+            d, ("CompanyName", "CompanyNameJapanese", "IssueName", "IssuerNameJa", "IssuerName"),
+        )
+        sector = _first_present(d, ("Sector33Name", "Sector33EnglishName", "Sector17Name"))
+        market = _first_present(
+            d,
+            ("MarketCode", "MarketDivision", "MarketSegment", "Market", "MarketName", "Section"),
+        )
+        rows.append({
+            "Code": code_4,
+            "CompanyName": company if company is not None and not (isinstance(company, float) and pd.isna(company)) else "",
+            "Sector33Name": sector if sector is not None and not (isinstance(sector, float) and pd.isna(sector)) else "",
+            "MarketCode": "" if market is None or (isinstance(market, float) and pd.isna(market)) else str(market),
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.drop_duplicates(subset=["Code"], keep="first")
+    return out
+
+def _first_present(d: dict, keys: Tuple[str, ...]) -> Any:
+    for k in keys:
+        if k in d and d[k] is not None and not (isinstance(d[k], float) and pd.isna(d[k])):
+            return d[k]
+    return None
+
+def _non_null(*vals: Any) -> Any:
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, float) and pd.isna(v):
+            continue
+        if v == "":
+            continue
+        return v
+    return None
+
+def _financial_scalar_absent(val: Any) -> bool:
+    """0 は有効値として欠損扱いしない。"""
+    if val is None:
+        return True
+    if isinstance(val, float) and pd.isna(val):
+        return True
+    if val == "":
+        return True
+    return False
+
+def _audit_v2_legacy_statement_fields(
+    legacy: List[Dict[str, Any]],
+    log_code: str,
+) -> None:
+    """convert 結果の最新行について主要キーを監査。欠損多発時は warning。"""
+    if not legacy:
+        logger.warning("V2財務変換 [%s]: legacy statements が0件です", log_code or "?")
+        return
+    latest = legacy[0]
+    groups: List[Tuple[str, Tuple[str, ...]]] = [
+        ("TotalAssets", ("TotalAssets",)),
+        ("EquityAttributableToOwnersOfParent", ("EquityAttributableToOwnersOfParent", "Equity", "NetAssets", "OwnersEquity")),
+        ("CurrentAssets", ("CurrentAssets",)),
+        ("CurrentLiabilities", ("CurrentLiabilities",)),
+        ("NetCashProvidedByUsedInOperatingActivities", (
+            "NetCashProvidedByUsedInOperatingActivities",
+            "CashFlowsFromOperatingActivities",
+            "OperatingCashFlow",
+            "CFO",
+        )),
+        ("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock", (
+            "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+            "NumberOfIssuedAndOutstandingShares",
+            "IssuedShares",
+            "SharesOutstanding",
+            "ShOutFY",
+        )),
+    ]
+    missing_labels: List[str] = []
+    for label, keys in groups:
+        if all(_financial_scalar_absent(latest.get(k)) for k in keys):
+            missing_labels.append(label)
+    if missing_labels:
+        sample_keys = sorted(str(k) for k in latest.keys())[:48]
+        logger.warning(
+            "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
+            log_code or "?",
+            missing_labels,
+            sample_keys,
+        )
+    else:
+        logger.debug("V2財務変換 [%s]: 主要勘定（TotalAssets/Equity/CA/CL/OCF/株数）は最新行で検出", log_code or "?")
+
+    nd = latest.get("NetSales")
+    ng = latest.get("GrossProfit")
+    nn = latest.get("NetIncomeLoss")
+    oi = latest.get("OperatingIncome")
+    if _financial_scalar_absent(nd) and _financial_scalar_absent(oi):
+        logger.debug(
+            "V2財務変換 [%s]: NetSales/OperatingIncome が最新行で未検出（四半期のみ等の可能性）",
+            log_code or "?",
+        )
+    if _financial_scalar_absent(ng):
+        logger.debug("V2財務変換 [%s]: GrossProfit が最新行で未検出", log_code or "?")
+    if _financial_scalar_absent(nn):
+        logger.debug("V2財務変換 [%s]: NetIncomeLoss が最新行で未検出", log_code or "?")
+
+def _merge_fs_into_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not row:
+        return {}
+    out = dict(row)
+    fs = out.get("FS")
+    if isinstance(fs, dict):
+        for fk, fv in fs.items():
+            if fk not in out or out[fk] is None:
+                out[fk] = fv
+    return out
+
+def _norm_date_iso(val: Any) -> Optional[str]:
+    dt = _parse_optional_date(val)
+    return dt.isoformat() if dt is not None else None
+
+def convert_v2_financials_to_legacy_statements(
+    summary_rows: List[Dict[str, Any]],
+    detail_rows: List[Dict[str, Any]],
+    *,
+    log_code: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    V2 fins/summary + fins/details を既存コードが読む V1 風 statements list[dict] に変換する。
+    """
+    merged_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def merge_pair(srow: Dict[str, Any], drow: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        s_flat = apply_v2_fins_summary_field_aliases(_merge_fs_into_row(srow))
+        d_flat = apply_v2_fins_summary_field_aliases(_merge_fs_into_row(drow)) if drow else {}
+        out: Dict[str, Any] = {**{k: v for k, v in s_flat.items() if k != "FS"}}
+        for k, v in d_flat.items():
+            if k == "FS":
+                continue
+            prev = out.get(k)
+            out[k] = _non_null(prev, v)
+
+        legacy_alias_sets: List[Tuple[str, Tuple[str, ...]]] = [
+            ("NetSales", ("NetSales", "NetSalesIFRS", "Sales", "RevenueFromOperations")),
+            ("OperatingIncome", ("OperatingIncome", "OperatingIncomeIFRS", "OperatingIncomeLoss")),
+            ("NetIncomeLoss", ("NetIncomeLoss", "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome")),
+            ("NetCashProvidedByUsedInOperatingActivities", (
+                "NetCashProvidedByUsedInOperatingActivities",
+                "CashFlowsFromOperatingActivities",
+                "OperatingCashFlow",
+            )),
+            ("TotalAssets", ("TotalAssets", "TA", "TotalAsset")),
+            ("EquityAttributableToOwnersOfParent", (
+                "EquityAttributableToOwnersOfParent",
+                "Equity",
+                "NetAssets",
+                "OwnersEquity",
+                "StockholdersEquity",
+            )),
+            ("CurrentAssets", ("CurrentAssets",)),
+            ("CurrentLiabilities", ("CurrentLiabilities",)),
+            ("GrossProfit", ("GrossProfit",)),
+            ("CashAndCashEquivalents", (
+                "CashAndCashEquivalents",
+                "CashAndCashEquivalentsAtEndOfPeriod",
+                "Cash",
+                "CashEquivalents",
+                "CashAndDeposits",
+            )),
+            ("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock", (
+                "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+                "NumberOfIssuedAndOutstandingShares",
+                "IssuedShares",
+            )),
+            ("DisclosedDate", ("DisclosedDate", "DisclosureDate", "DisclosedAt")),
+            ("CurrentPeriodEndDate", ("CurrentPeriodEndDate", "FiscalYearEnd", "PeriodEnd")),
+            ("CurrentFiscalYearEndDate", ("CurrentFiscalYearEndDate",)),
+            ("TypeOfDocument", ("TypeOfDocument", "DocumentType", "DocType", "ReportType")),
+            ("CurrentPeriodType", ("CurrentPeriodType", "QuarterlyOrAnnual", "PeriodType")),
+        ]
+        for legacy_name, srcs in legacy_alias_sets:
+            picked = _non_null(*(out.get(s) for s in srcs))
+            if picked is not None:
+                out[legacy_name] = picked
+        if not out.get("TypeOfDocument") and isinstance(out.get("CurrentPeriodType"), str):
+            out["TypeOfDocument"] = str(out["CurrentPeriodType"])
+        return out
+
+    detail_pool = list(detail_rows)
+    used_detail_idx: set[int] = set()
+
+    for s in summary_rows:
+        dk = (_norm_date_iso(s.get("DisclosedDate")), _norm_date_iso(s.get("CurrentPeriodEndDate")))
+        best_j: Optional[int] = None
+        for j, dr in enumerate(detail_pool):
+            if j in used_detail_idx:
+                continue
+            ddk = (_norm_date_iso(dr.get("DisclosedDate")), _norm_date_iso(dr.get("CurrentPeriodEndDate")))
+            if ddk == dk and dk != (None, None):
+                best_j = j
+                break
+        if best_j is None:
+            for j, dr in enumerate(detail_pool):
+                if j in used_detail_idx:
+                    continue
+                ddk = (_norm_date_iso(dr.get("DisclosedDate")), _norm_date_iso(dr.get("CurrentPeriodEndDate")))
+                if ddk[0] == dk[0] or ddk[1] == dk[1]:
+                    best_j = j
+                    break
+        dchosen = detail_pool[best_j] if best_j is not None else None
+        if best_j is not None:
+            used_detail_idx.add(best_j)
+        one = merge_pair(s, dchosen)
+        k1 = _norm_date_iso(one.get("DisclosedDate")) or ""
+        k2 = _norm_date_iso(one.get("CurrentPeriodEndDate")) or ""
+        k3 = str(one.get("TypeOfDocument") or one.get("CurrentPeriodType") or "")
+        key = (k1, k2, k3)
+        if key not in merged_by_key:
+            merged_by_key[key] = one
+        else:
+            prev = merged_by_key[key]
+            for kk, vv in one.items():
+                if prev.get(kk) is None and vv is not None:
+                    prev[kk] = vv
+
+    for j, dr in enumerate(detail_pool):
+        if j in used_detail_idx:
+            continue
+        one = merge_pair({}, dr)
+        k1 = _norm_date_iso(one.get("DisclosedDate")) or ""
+        k2 = _norm_date_iso(one.get("CurrentPeriodEndDate")) or ""
+        k3 = str(one.get("TypeOfDocument") or one.get("CurrentPeriodType") or "")
+        key = (k1, k2, k3)
+        if key not in merged_by_key:
+            merged_by_key[key] = one
+
+    legacy = list(merged_by_key.values())
+    legacy.sort(key=lambda r: _statement_sort_key(r), reverse=True)
+    if log_code:
+        _audit_v2_legacy_statement_fields(legacy, log_code)
+    return legacy
+
+def fetch_prices_v2(
+    session: requests.Session,
+    code: str,
+    lookback_days: int = LOOKBACK_DAYS,
+    *,
+    cache_name: Optional[str] = None,
+    bypass_cache: bool = False,
+) -> pd.DataFrame:
+    """
+    銘柄ごとに日足を取得し、既存標準列へ正規化する（code 単位取得互換）。
+    """
+    today = datetime.date.today().strftime("%Y%m%d")
+    cn = cache_name or f"prices_{code}"
+    cache_file = CACHE_DIR / f"{cn}_{today}.csv"
+
+    if cache_file.exists() and not bypass_cache:
+        try:
+            df = pd.read_csv(cache_file)
+            if not df.empty:
+                return normalize_prices_v2(df)
+        except Exception:
+            pass
+
+    start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end = datetime.date.today().strftime("%Y-%m-%d")
+    rows: List[Dict[str, Any]] = []
+    for qc in api_code_candidates(code):
+        rows_try, st, _ = paginate_v2_endpoint(session, "equities/bars/daily", {"code": qc, "from": start, "to": end})
+        if rows_try:
+            rows = rows_try
+            break
+        if st != 200:
+            logger.warning("equities/bars/daily HTTP %s code=%s", st, qc)
+    if not rows:
+        return pd.DataFrame()
+    df = normalize_prices_v2(pd.DataFrame(rows))
+    try:
+        df.to_csv(cache_file, index=False)
+    except Exception:
+        pass
+    return df
+
+def fetch_prices_by_date_v2_placeholder(session: requests.Session, _date: str) -> pd.DataFrame:
+    """
+    将来改善用プレースホルダ: date 指定で全銘柄日足を取得する経路。
+    初回移行では collect/analyze の主経路には使わない。
+    """
+    raise NotImplementedError("date 単位一括取得は次フェーズで実装予定")
 
 # ------------------------------------------------------------
 # Graceful Shutdown
@@ -126,10 +615,10 @@ graceful_shutdown = GracefulShutdown()
 # レートリミッタ + 認証セッション
 # ------------------------------------------------------------
 class APIRateLimiter:
-    """J-Quants 50 req/min, 800 req/day を想定"""
-    def __init__(self, rpm: int = 50, rpd: int = 800):
+    """V2: 公式は主にリクエスト/分。JQ_RPD は任意のセルフ日次上限（未設定なら日次チェックなし）。"""
+    def __init__(self, rpm: int = 60, rpd: Optional[int] = None):
         self.requests_per_minute = rpm
-        self.requests_per_day = rpd
+        self.requests_per_day = rpd  # None なら無制限（分間制御のみ）
         self.base_delay = 1.5
         self.request_timestamps: List[datetime.datetime] = []
         self.daily_count = 0
@@ -141,8 +630,8 @@ class APIRateLimiter:
             self.daily_count = 0
             self.last_reset = now.date()
 
-        if self.daily_count >= self.requests_per_day:
-            raise RuntimeError("日次レート制限到達")
+        if self.requests_per_day is not None and self.daily_count >= self.requests_per_day:
+            raise RuntimeError("日次レート制限到達（JQ_RPD）")
 
         one_minute_ago = now - datetime.timedelta(minutes=1)
         self.request_timestamps = [t for t in self.request_timestamps if t > one_minute_ago]
@@ -157,18 +646,22 @@ class APIRateLimiter:
     def mark(self):
         now = datetime.datetime.now()
         self.request_timestamps.append(now)
-        self.daily_count += 1
+        if self.requests_per_day is not None:
+            self.daily_count += 1
 
 class AuthSession(requests.Session):
-    """J-Quants 認証＋レート制限対応Session"""
+    """J-Quants V2 API キー＋レート制限対応 Session"""
     def __init__(self, limiter: APIRateLimiter, ini_file: str = "api.ini"):
         super().__init__()
         self.limiter = limiter
         self.ini_file = ini_file
+        # fins/details: None=未試行、True=取得成功、False=403等でセッション中以降スキップ
+        self.fins_details_available: Optional[bool] = None
+        self.fins_details_disabled_reason: Optional[str] = None
+        self.fins_details_last_status: Optional[int] = None
 
     def request(self, method, url, **kwargs):
-        """送信直前に wait_if_needed。super().request が応答オブジェクトを返したら毎回 mark（HTTP ステータスは不問）。
-        RequestException（通信失敗）のみ mark しない。401 後の _refresh_id_token は limiter 外（別途コメント参照）。"""
+        """送信直前に wait_if_needed。V2 は 401 でトークン更新しない。"""
         MAX = 5
         timeout = kwargs.pop("timeout", 30)
 
@@ -184,9 +677,8 @@ class AuthSession(requests.Session):
 
             self.limiter.mark()
 
-            if resp.status_code == 401 and attempt == 1:
-                _refresh_id_token(self, ini_file=self.ini_file)
-                continue
+            if resp.status_code == 401:
+                logger.warning("HTTP 401 Unauthorized（APIキーを確認してください）: %s", url)
 
             if resp.status_code in (429,) or resp.status_code >= 500:
                 if attempt == MAX:
@@ -199,63 +691,23 @@ class AuthSession(requests.Session):
         raise RuntimeError(f"{method} {url} failed after {MAX} attempts")
 
 def get_authenticated_session_jquants(ini_file: str = "api.ini") -> requests.Session:
-    token_cache = CACHE_DIR / "access_token.json"
-    rpm = int(os.getenv("JQ_RPM", "50"))
-    rpd = int(os.getenv("JQ_RPD", "800"))
+    api_key = (os.getenv("JQUANTS_API_KEY") or os.getenv("JQ_API_KEY") or "").strip()
+    if not api_key:
+        cfg = configparser.ConfigParser()
+        cfg.read(ini_file, encoding="utf-8")
+        if cfg.has_section("DEFAULT"):
+            api_key = (cfg["DEFAULT"].get("API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("APIキー未設定（JQUANTS_API_KEY / JQ_API_KEY / api.ini の DEFAULT.API_KEY）")
+
+    rpm = int(os.getenv("JQ_RPM", "60"))
+    rpd_env = os.getenv("JQ_RPD")
+    rpd = int(rpd_env) if rpd_env else None
     limiter = APIRateLimiter(rpm=rpm, rpd=rpd)
     session = AuthSession(limiter, ini_file=ini_file)
-
-    if token_cache.exists():
-        try:
-            cached = json.loads(token_cache.read_text(encoding="utf-8"))
-            exp = datetime.datetime.strptime(cached["expires_at"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-            if datetime.datetime.now(datetime.timezone.utc) < exp:
-                session.headers.update({"Authorization": f"Bearer {cached['token']}"})
-                _cli_print("✅ キャッシュidTokenを使用", "[OK] キャッシュidTokenを使用")
-                return session
-        except Exception:
-            pass
-
-    _cli_print("🔑 認証開始…", "認証開始…")
-    _refresh_id_token(session, ini_file=ini_file)
-    _cli_print("✅ 認証成功", "[OK] 認証成功")
+    session.headers.update({"x-api-key": api_key})
+    _cli_print("✅ J-Quants API V2（x-api-key）", "[OK] J-Quants API V2 (x-api-key)")
     return session
-
-def _refresh_id_token(session: requests.Session, ini_file: str = "api.ini") -> str:
-    # 認証用 HTTP は requests.post 直打ちのため APIRateLimiter の外。分間・日次カウントには含めない（セッション経由の API のみを対象）。
-    # 将来 session.post に寄せる場合は、含める/含めないを再確認すること。
-    config = configparser.ConfigParser()
-    config.read(ini_file, encoding="utf-8")
-
-    email = (config["DEFAULT"].get("MAIL_ADDRESS") or
-             config["DEFAULT"].get("mail_address") or
-             config["DEFAULT"].get("email"))
-    password = (config["DEFAULT"].get("PASSWORD") or
-                config["DEFAULT"].get("password"))
-
-    if not (email and password):
-        raise RuntimeError("メールアドレス／パスワード未設定(api.ini)")
-
-    auth_payload = {"mailaddress": email, "password": password}
-    res = requests.post(f"{JQUANTS_API_BASE}/token/auth_user", json=auth_payload, timeout=20)
-    res.raise_for_status()
-    refresh_token = res.json().get("refreshToken")
-    if not refresh_token:
-        raise RuntimeError("refreshToken取得失敗")
-
-    tok_res = requests.post(f"{JQUANTS_API_BASE}/token/auth_refresh?refreshtoken={refresh_token}", timeout=20)
-    tok_res.raise_for_status()
-    id_token = tok_res.json().get("idToken")
-    if not id_token:
-        raise RuntimeError("idToken取得失敗")
-
-    session.headers.update({"Authorization": f"Bearer {id_token}"})
-    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=23)
-    (CACHE_DIR / "access_token.json").write_text(
-        json.dumps({"token": id_token, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%S")}, ensure_ascii=False),
-        encoding="utf-8"
-    )
-    return id_token
 
 # ------------------------------------------------------------
 # 永続キャッシュ（凍結）
@@ -286,17 +738,35 @@ class FrozenCache:
         except Exception:
             return None
 
-    def save_statements(self, code: str, stmts: List[dict]) -> None:
-        self.stmts_path(code).write_text(json.dumps({"statements": stmts}, ensure_ascii=False), encoding="utf-8")
+    def save_statements(self, code: str, stmts: List[dict], financial_meta: Optional[Dict[str, Any]] = None) -> None:
+        obj: Dict[str, Any] = {"statements": stmts}
+        if financial_meta:
+            for k, v in financial_meta.items():
+                if k != "statements":
+                    obj[k] = v
+        self.stmts_path(code).write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
 
-    def load_statements(self, code: str) -> List[dict]:
+    def load_statement_bundle(self, code: str) -> Tuple[List[dict], Dict[str, Any]]:
         p = self.stmts_path(code)
         if not p.exists():
-            return []
+            return [], {}
         try:
-            return json.loads(p.read_text(encoding="utf-8")).get("statements", [])
+            j = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
-            return []
+            return [], {}
+        stmts_raw = j.pop("statements", [])
+        stmts = stmts_raw if isinstance(stmts_raw, list) else []
+        meta = dict(j)
+        if stmts and "financial_data_mode" not in meta:
+            meta.setdefault("financial_data_mode", "legacy_frozen_statement_cache")
+            meta.setdefault("fins_details_available", None)
+            meta.setdefault("fins_details_status", None)
+            meta.setdefault("fins_details_error", None)
+        return stmts, meta
+
+    def load_statements(self, code: str) -> List[dict]:
+        stmts, _ = self.load_statement_bundle(code)
+        return stmts
 
     def has_all(self, code: str, max_age_days: Optional[int] = None) -> bool:
         p1, p2 = self.prices_path(code), self.stmts_path(code)
@@ -440,47 +910,6 @@ class DynamicSectorAverages:
         self.cache_timestamp = time.time()
         return data
 
-    def load_or_download_data_v2(self, endpoint: str, cache_name: str, bypass_cache: bool = False) -> pd.DataFrame:
-        """当日CSVキャッシュ→API→CSV保存。bypass_cache=True なら当日キャッシュを無視して取り直す。"""
-        try:
-            today = datetime.date.today().strftime("%Y%m%d")
-            cache_file = CACHE_DIR / f"{cache_name}_{today}.csv"
-
-            if cache_file.exists() and not bypass_cache:
-                try:
-                    df = pd.read_csv(cache_file)
-                    if not df.empty:
-                        return df
-                except Exception:
-                    pass
-
-            url = f"{JQUANTS_API_BASE}/{endpoint}"
-            res = self.session.get(url, timeout=30)
-            if res.status_code != 200:
-                return pd.DataFrame()
-
-            response_data = res.json()
-            keys = ["info", "daily_quotes", "statements", "data", "results", "items", "companies", "stocks"]
-            data = None
-            for k in keys:
-                if k in response_data and response_data[k]:
-                    data = response_data[k]
-                    break
-            if data is None:
-                data = response_data
-
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                try:
-                    df.to_csv(cache_file, index=False)
-                except Exception:
-                    pass
-                return df
-
-            return pd.DataFrame()
-        except Exception:
-            return pd.DataFrame()
-
     def get_fallback_stock_list_v2(self) -> list[dict]:
         return [
             {"Code":"7203","CompanyName":"トヨタ自動車","Sector33Name":"輸送用機器","MarketCode":"111"},
@@ -498,12 +927,13 @@ class DynamicSectorAverages:
                 return pd.read_csv(cache_file)
 
             _cli_print("📋 銘柄リスト取得…", "[銘柄リスト] 取得中…")
-            df = self.load_or_download_data_v2("listed/info", "sector_listed_info")
+            rows = get_v2_all_pages(self.session, "equities/master", {})
+            df = normalize_equities_master_v2(pd.DataFrame(rows))
             if not df.empty:
                 if "Code" in df.columns:
-                    df["Code"] = df["Code"].astype(str).str.extract(r"(\d{4})", expand=False)
+                    df["Code"] = df["Code"].astype(str).str.strip()
                     df = df.dropna(subset=["Code"])
-                    df = df[df["Code"].str.isdigit()].drop_duplicates("Code")
+                    df = df[df["Code"].str.match(r"^\d{4}$", na=False)].drop_duplicates("Code")
                 df = enhance_stock_list_with_sectors(df)
                 df.to_csv(cache_file, index=False)
                 return df
@@ -593,79 +1023,105 @@ class FinancialDataManager:
         self.session = session
         self.base_url = JQUANTS_API_BASE
         self.cache_dir = CACHE_DIR
+        self._last_financial_fetch_meta: Dict[str, Any] = {}
 
     def get_stock_list_v2(self, force_refresh: bool = False) -> pd.DataFrame:
         helper = DynamicSectorAverages(self.session)
         return helper.get_stock_list_v2(force_refresh=force_refresh)
 
-    def load_or_download_data_v2(self, endpoint: str, cache_name: str) -> pd.DataFrame:
-        helper = DynamicSectorAverages(self.session)
-        return helper.load_or_download_data_v2(endpoint, cache_name)
+    def get_last_financial_fetch_meta(self) -> Dict[str, Any]:
+        return dict(self._last_financial_fetch_meta)
 
-    def _load_json_cached(self, endpoint: str, cache_name: str, ttl_hours: int = 24) -> dict:
-        f = self.cache_dir / f"{cache_name}.json"
-        if f.exists():
-            mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime)
-            if (datetime.datetime.now() - mtime).total_seconds() < ttl_hours * 3600:
-                try:
-                    return json.loads(f.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
+    def fetch_financials_v2_as_statements(self, code: str, force_refresh: bool = False) -> List[dict]:
+        """
+        fins/summary と（利用可能なら）fins/details を取得し、既存の build_financial_history が読める
+        V1 互換 statements list[dict] に変換する。
+        診断キーは self._last_financial_fetch_meta に格納する。
+        """
+        global _SUMMARY_ONLY_MODE_INFO_LOGGED
+        self._last_financial_fetch_meta = {}
+        cache_key = f"v2_fins_legacy_statements_{code}"
+        fpath = self.cache_dir / f"{cache_key}.json"
+        ttl_sec = 12 * 3600
+        if not force_refresh and fpath.exists():
+            try:
+                mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
+                if (datetime.datetime.now() - mtime).total_seconds() < ttl_sec:
+                    j = json.loads(fpath.read_text(encoding="utf-8"))
+                    stmts = j.get("statements", [])
+                    meta = {k: v for k, v in j.items() if k != "statements"}
+                    self._last_financial_fetch_meta = meta
+                    if stmts:
+                        return stmts
+            except Exception:
+                pass
 
-        url = f"{self.base_url}/{endpoint}"
+        session = self.session
+        summary_rows: List[Dict[str, Any]] = []
+        for qc in api_code_candidates(code):
+            sr, st, _ = paginate_v2_endpoint(session, "fins/summary", {"code": qc})
+            if sr:
+                summary_rows = sr
+                break
+            if st != 200:
+                logger.warning("fins/summary HTTP %s code=%s", st, qc)
+
+        detail_rows: List[Dict[str, Any]] = []
+        ds: Optional[int] = None
+        der = ""
+        fds = getattr(session, "fins_details_available", None)
+
+        if fds is False:
+            ds = getattr(session, "fins_details_last_status", None)
+            der = getattr(session, "fins_details_disabled_reason", "") or ""
+        else:
+            for qc in api_code_candidates(code):
+                dr, dst, der = paginate_v2_endpoint(session, "fins/details", {"code": qc})
+                ds = dst
+                session.fins_details_last_status = dst
+                if dst == 403:
+                    session.fins_details_available = False
+                    session.fins_details_disabled_reason = der or "HTTP 403"
+                    detail_rows = []
+                    break
+                if dr:
+                    detail_rows = dr
+                    session.fins_details_available = True
+                    break
+
+        detail_ok = bool(detail_rows)
+        summary_ok = bool(summary_rows)
+        financial_data_mode = "summary_plus_details" if (detail_ok and summary_ok) else "summary_only"
+        fins_details_available = detail_ok
+        meta_out: Dict[str, Any] = {
+            "financial_data_mode": financial_data_mode,
+            "fins_details_available": fins_details_available,
+            "fins_details_status": ds,
+            "fins_details_error": der[:500] if der else "",
+        }
+        self._last_financial_fetch_meta = meta_out
+
+        if financial_data_mode == "summary_only" and summary_ok and not _SUMMARY_ONLY_MODE_INFO_LOGGED:
+            logger.info(
+                "[INFO] fins/details unavailable; running in summary_only mode. Piotroski coverage may be lower. "
+                "Affected: CurrentAssets, CurrentLiabilities, GrossProfit, gross_profit_margin, current_ratio_up, gpm_up."
+            )
+            _SUMMARY_ONLY_MODE_INFO_LOGGED = True
+
+        stmts = convert_v2_financials_to_legacy_statements(
+            summary_rows, detail_rows, log_code=str(code).strip(),
+        )
         try:
-            res = self.session.get(url, timeout=30)
-            if res.status_code == 200:
-                data = res.json()
-                try:
-                    f.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
-                return data
-            return {}
+            blob = {"statements": stmts}
+            blob.update(meta_out)
+            fpath.write_text(json.dumps(blob, ensure_ascii=False), encoding="utf-8")
         except Exception:
-            return {}
+            pass
+        return stmts
 
     def fetch_statements(self, code: str, force_refresh: bool = False) -> List[dict]:
-        cache_key = f"fins_statements_{code}"
-        if not force_refresh:
-            cached = self._load_json_cached(f"fins/statements?code={code}", cache_key, ttl_hours=12)
-            if cached and cached.get("statements"):
-                return cached["statements"]
-
-        url = f"{self.base_url}/fins/statements?code={code}"
-        for attempt in range(1, 6):
-            resp = self.session.get(url, timeout=30)
-            status = resp.status_code
-            try:
-                data = resp.json()
-                stmts = data.get("statements", [])
-            except Exception:
-                stmts = []
-                data = {}
-
-            if status == 200:
-                try:
-                    (self.cache_dir / f"{cache_key}.json").write_text(
-                        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-                        encoding="utf-8"
-                    )
-                except Exception:
-                    pass
-                return stmts
-
-            if status in (402, 403):
-                return []
-
-            if status == 429:
-                time.sleep(2 ** attempt)
-                continue
-
-            if status >= 500:
-                time.sleep(1.5 * attempt)
-                continue
-
-        return []
+        """既存インタフェース維持。内部は V2 summary+details → legacy statements。"""
+        return self.fetch_financials_v2_as_statements(code, force_refresh=force_refresh)
 
     def _fill_missing_fields(self, fin: dict) -> dict:
         """診断・セクター比較用の欠損補完。Piotroski/バリュエーション本計算には流さないこと（analyze では raw_fin を使用）。"""
@@ -727,15 +1183,21 @@ def check_company_name_validity(company_name: str) -> Tuple[bool, str]:
     if not company_name:
         return True, "OK"
     etf_keywords = [
-        'ＥＴＦ','ETF','上場投信','インデックスファンド','連動型上場投信',
-        '上場インデックス','TOPIX','日経225','投資法人','リート','REIT'
+        'ＥＴＦ','ETF','ETFs','etf','上場投信','上場投資信託','インデックスファンド','連動型上場投信',
+        '上場インデックス','TOPIX','日経225','投資法人','リート','REIT','ＲＥＩＴ',
     ]
     if any(k in company_name for k in etf_keywords):
-        return False, "ETF/投信"
+        return False, "ETF/投信/REIT"
     fund_company_keywords = ['アセットマネジメント','投信']
     if any(k in company_name for k in fund_company_keywords):
         return False, "投信会社商品"
     return True, "OK"
+
+def filter_collectable_equities_df(df: pd.DataFrame) -> pd.DataFrame:
+    """銘柄マスタ取得後、収集・解析タスク用に ETF/投信/REIT 等を除外する。"""
+    if df is None or df.empty or "CompanyName" not in df.columns:
+        return df
+    return df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName", "") or ""))[0], axis=1)].reset_index(drop=True)
 
 # ------------------------------------------------------------
 # テクニカル
@@ -1660,12 +2122,13 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         sector_raw = sector_hint or DynamicSectorAverages.get_sector_static(code)
         sector = DynamicSectorAverages.normalize_sector(sector_raw)
         fc = FrozenCache()
+        fin_meta_src: Dict[str, Any] = {}
 
         # 価格
         if offline:
             price_df = fc.load_prices(code)
         else:
-            price_df = fdm.load_or_download_data_v2(build_prices_endpoint(code), f"prices_{code}")
+            price_df = fetch_prices_v2(session, code, cache_name=f"prices_{code}")
         if price_df is None or price_df.empty:
             return {"stock_code": code, "company_name": name, "sector_name": sector, "success": False, "error": "price_missing"}
 
@@ -1711,9 +2174,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 
         # 財務
         if offline:
-            stmts = fc.load_statements(code)
+            stmts, fin_meta_src = fc.load_statement_bundle(code)
         else:
             stmts = fdm.fetch_statements(code)
+            fin_meta_src = fdm.get_last_financial_fetch_meta()
 
         financial_history, statement_basis_used = build_financial_history_from_statements(
             stmts if isinstance(stmts, list) else [],
@@ -1889,7 +2353,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                 statement_disclosed_date,
             )
         )
+        fin_diag = {
+            "financial_data_mode": fin_meta_src.get("financial_data_mode"),
+            "fins_details_available": fin_meta_src.get("fins_details_available"),
+            "fins_details_status": fin_meta_src.get("fins_details_status"),
+            "fins_details_error": fin_meta_src.get("fins_details_error"),
+        }
         diagnostics = {
+            **fin_diag,
             "latest_price_date": latest_price_date.isoformat() if latest_price_date else None,
             "statement_disclosed_date": statement_disclosed_date,
             "statement_type": statement_type,
@@ -2004,6 +2475,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "filters": filter_details,
             "candidate_lane": candidate_lane,
             "ps_satellite_limit": ps_satellite_limit,
+            "financial_data_mode": fin_diag.get("financial_data_mode"),
+            "fins_details_available": fin_diag.get("fins_details_available"),
+            "fins_details_status": fin_diag.get("fins_details_status"),
+            "fins_details_error": fin_diag.get("fins_details_error"),
         }
     except Exception as e:
         return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
@@ -2013,13 +2488,13 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 # ------------------------------------------------------------
 def collect_one_code(session: requests.Session, code: str, name: str = "", *, force_refresh: bool = False) -> bool:
     fc = FrozenCache()
-    helper = DynamicSectorAverages(session)
     try:
         # 価格
-        price_df = helper.load_or_download_data_v2(
-            build_prices_endpoint(code),
-            f"prices_{code}",
-            bypass_cache=force_refresh
+        price_df = fetch_prices_v2(
+            session,
+            code,
+            cache_name=f"prices_{code}",
+            bypass_cache=force_refresh,
         )
         if price_df is not None and not price_df.empty:
             fc.save_prices(code, price_df)
@@ -2028,7 +2503,7 @@ def collect_one_code(session: requests.Session, code: str, name: str = "", *, fo
         fdm = FinancialDataManager(session)
         stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
         if stmts:
-            fc.save_statements(code, stmts)
+            fc.save_statements(code, stmts, financial_meta=fdm.get_last_financial_fetch_meta())
 
         return fc.has_all(code)
     except RuntimeError as e:
@@ -2072,7 +2547,7 @@ def collect_all_daemon(session: requests.Session,
                        reset_pending: bool = False) -> None:
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
-    df = df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName","")))[0], axis=1)].reset_index(drop=True)
+    df = filter_collectable_equities_df(df)
 
     if reset_pending and PENDING_FILE.exists():
         try:
@@ -2086,13 +2561,17 @@ def collect_all_daemon(session: requests.Session,
         return
 
     if daily_budget is None:
-        rpd = int(os.getenv("JQ_RPD", "800"))
-        daily_budget = max(1, min(len(pending), rpd // 2 - 5))
+        rpd_env = os.getenv("JQ_RPD")
+        if rpd_env:
+            rpd = int(rpd_env)
+            daily_budget = max(1, min(len(pending), max(1, rpd // 2 - 5)))
+        else:
+            daily_budget = min(len(pending), 380)
 
     mode = "強制再収集" if force_full else (f"{refresh_days}日超のみ再収集" if refresh_days is not None else "未取得のみ")
     _cli_print(
-        f"▶ 全自動収集開始  残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}",
-        f"[収集開始] 残り{len(pending)}銘柄  日次上限目安={daily_budget}銘柄/日  モード={mode}",
+        f"▶ 全自動収集開始  残り{len(pending)}銘柄  本バッチ上限={daily_budget}銘柄（V2はrpm制御・budgetは取得件数上限）  モード={mode}",
+        f"[収集開始] 残り{len(pending)}銘柄  batch_limit={daily_budget}  mode={mode}",
     )
 
     while pending:
@@ -2125,16 +2604,22 @@ def collect_all_daemon(session: requests.Session,
             _cli_print("✅ 全銘柄の凍結収集が完了", "[OK] 全銘柄の凍結収集が完了")
             break
 
-        wait_sec = seconds_until_next_day()
-        h, rem = divmod(wait_sec, 3600)
-        m, s = divmod(rem, 60)
-        _cli_print(f"⏳ 日次上限回復待ち: {h}h{m}m{s}s 待機", f"[待機] 日次上限回復待ち: {h}h{m}m{s}s")
-        time.sleep(wait_sec)
+        if os.getenv("JQ_RPD"):
+            wait_sec = seconds_until_next_day()
+            h, rem = divmod(wait_sec, 3600)
+            m, s = divmod(rem, 60)
+            _cli_print(f"⏳ JQ_RPD 設定のため日が変わるまで待機: {h}h{m}m{s}s", f"[待機] JQ_RPD: {h}h{m}m{s}s")
+            time.sleep(wait_sec)
+        else:
+            _cli_print(
+                "📌 JQ_RPD 未設定のため日をまたがないで次バッチへ（同一日内の継続）。",
+                "[情報] JQ_RPD 未設定: 継続収集",
+            )
 
 def collect_batch(session: requests.Session, max_codes: int) -> dict:
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
-    df = df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName","")))[0], axis=1)].reset_index(drop=True)
+    df = filter_collectable_equities_df(df)
     fc = FrozenCache()
 
     pending = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
@@ -2165,6 +2650,7 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
 def build_offline_analysis_tasks(session: requests.Session) -> list[tuple[str, str, str, str | None]]:
     fdm = FinancialDataManager(session)
     df_list = fdm.get_stock_list_v2(force_refresh=False)
+    df_list = filter_collectable_equities_df(df_list)
     fc = FrozenCache()
 
     df_list = df_list.copy()
@@ -2293,6 +2779,10 @@ def _flatten_result(d: dict) -> dict:
         "imputed_field_count": imputation.get("field_count"),
         "imputed_fields": ",".join(sorted((imputation.get("fields") or {}).keys())),
         "critical_missing_count": diagnostics.get("critical_missing_count"),
+        "financial_data_mode": diagnostics.get("financial_data_mode"),
+        "fins_details_available": diagnostics.get("fins_details_available"),
+        "fins_details_status": diagnostics.get("fins_details_status"),
+        "fins_details_error": diagnostics.get("fins_details_error"),
         **flt,
         "ok": d.get("success"),
         "error": d.get("error"),

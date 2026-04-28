@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.0] - 2026-04-28
+
+### JQuamtsScreeningBot（J-Quants API V2 / summary-only 互換）
+
+- Migrated J-Quants integration to API V2 using x-api-key authentication.
+- Added V2 cache separation under `.jquants_cache_v2`.
+- Added pagination support for V2 endpoints.
+- Added V2 price normalization for equities/bars/daily.
+- Added V2 summary-only compatible financial conversion.
+- Added `financial_data_mode` / `fins_details_*` diagnostics.
+- Added handling for fins/details 403 by disabling repeated detail requests in the same session.
+- Kept `--budget` default at 380; larger V2 collection should be tested gradually.
+
 ## [1.4.0] - 2026-04-14
 
 ### JQuamtsScreeningBot（スクリーニング安定化）
