@@ -11,7 +11,20 @@
 - Default collect batch size via `JQ_DEFAULT_BUDGET` (unset → 800) for CLI and menus.
 - Resolve `api.ini` beside the script directory; read `[DEFAULT] API_KEY` without relying on `has_section("DEFAULT")`.
 
-タグ: `v1.5.1-jquants-v2-collect-filter`
+タグ（収集フィルタ初版）: `v1.5.1-jquants-v2-collect-filter`
+
+### J-Quants V2 instrument split snapshot
+
+- Added `instrument_type` classification for stock / etf / etn / reit / fund / fund_like / unknown.
+- Separated ETF/ETN/REIT/fund_like instruments from individual-stock financial screening.
+- Preserved ETF-like instruments in an unscored ETF candidate lane (`output/reports/etf_candidates_unscored.csv`, gitignored) for future ETF-specific screening.
+- Ensured Mkt/MktNm-based stock classification (`0105`, `0111`–`0113`, and MktNm hints) takes precedence over fallback code-band filtering, preventing false exclusion of ordinary stocks (e.g. 2002 band).
+- Added/propagated `instrument_type` to analysis and flattened CSV output.
+- Reduced noisy per-symbol legacy-statement warnings by aggregating missing financial statements for stocks.
+- Improved CFO alias handling for V2 summary-only financial conversion.
+- ETF scoring remains out of scope; future ETF scoring should use AUM, expense ratio, NAV deviation, liquidity, and trend/pullback metrics (and external data where J-Quants does not provide fields).
+
+タグ（instrument split）: `v1.5.1-jquants-v2-instrument-split`
 
 ## [1.5.0] - 2026-04-28
 

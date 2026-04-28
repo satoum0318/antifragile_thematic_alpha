@@ -106,6 +106,34 @@ DEFAULT_COLLECT_BUDGET = _default_collect_budget_from_env()
 # summary_only での影響説明ログ（セッションにつき1回）
 _SUMMARY_ONLY_MODE_INFO_LOGGED = False
 
+# V2 legacy: 普通株で statements が空の銘柄をバッチ集計（銘柄ごと WARNING 抑制）
+_V2_LEGACY_EMPTY_STOCK_CODES: List[str] = []
+
+
+def reset_v2_legacy_batch_audit() -> None:
+    global _V2_LEGACY_EMPTY_STOCK_CODES
+    _V2_LEGACY_EMPTY_STOCK_CODES = []
+
+
+def record_v2_legacy_empty_stock(log_code: str) -> None:
+    c = (log_code or "").strip()
+    if c and c not in _V2_LEGACY_EMPTY_STOCK_CODES:
+        _V2_LEGACY_EMPTY_STOCK_CODES.append(c)
+
+
+def flush_v2_legacy_batch_audit_loggers() -> None:
+    global _V2_LEGACY_EMPTY_STOCK_CODES
+    if not _V2_LEGACY_EMPTY_STOCK_CODES:
+        return
+    n = len(_V2_LEGACY_EMPTY_STOCK_CODES)
+    sample = ",".join(_V2_LEGACY_EMPTY_STOCK_CODES[:24])
+    logger.warning(
+        "[WARN] stock financial statements missing: %s symbols (sample: %s)",
+        n,
+        sample,
+    )
+    _V2_LEGACY_EMPTY_STOCK_CODES = []
+
 # ------------------------------------------------------------
 # スクリーニング必須フィルタ（環境変数で上書き可）
 # ------------------------------------------------------------
@@ -181,13 +209,14 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
         out["TotalAssets"] = out.get("TA")
     if out.get("EquityAttributableToOwnersOfParent") is None and out.get("Eq") is not None:
         out["EquityAttributableToOwnersOfParent"] = out.get("Eq")
-    cfo_cf = _non_null(out.get("NetCashProvidedByUsedInOperatingActivities"), out.get("CFO"))
+    cfo_cf = _non_null(
+        out.get("NetCashProvidedByUsedInOperatingActivities"),
+        out.get("CashFlowsFromOperatingActivities"),
+        out.get("CFO"),
+    )
     if cfo_cf is not None:
         out["NetCashProvidedByUsedInOperatingActivities"] = cfo_cf
-        if out.get("CashFlowsFromOperatingActivities") is None:
-            out["CashFlowsFromOperatingActivities"] = cfo_cf
-    elif out.get("CashFlowsFromOperatingActivities") is None and out.get("CFO") is not None:
-        out["CashFlowsFromOperatingActivities"] = out.get("CFO")
+        out["CashFlowsFromOperatingActivities"] = cfo_cf
     if out.get("CashAndCashEquivalents") is None and out.get("CashEq") is not None:
         out["CashAndCashEquivalents"] = out.get("CashEq")
     sh = _non_null(out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"), out.get("ShOutFY"))
@@ -386,12 +415,15 @@ def _financial_scalar_absent(val: Any) -> bool:
 def _audit_v2_legacy_statement_fields(
     legacy: List[Dict[str, Any]],
     log_code: str,
+    *,
+    financial_data_mode: Optional[str] = None,
 ) -> None:
-    """convert 結果の最新行について主要キーを監査。欠損多発時は warning。"""
+    """convert 結果の最新行について主要キーを監査（変換後 legacy を参照）。空件は銘柄別 WARNING ではなくバッチ集計。"""
     if not legacy:
-        logger.warning("V2財務変換 [%s]: legacy statements が0件です", log_code or "?")
+        record_v2_legacy_empty_stock(log_code)
         return
     latest = legacy[0]
+    summary_only = financial_data_mode == "summary_only"
     groups: List[Tuple[str, Tuple[str, ...]]] = [
         ("TotalAssets", ("TotalAssets",)),
         ("EquityAttributableToOwnersOfParent", ("EquityAttributableToOwnersOfParent", "Equity", "NetAssets", "OwnersEquity")),
@@ -417,12 +449,27 @@ def _audit_v2_legacy_statement_fields(
             missing_labels.append(label)
     if missing_labels:
         sample_keys = sorted(str(k) for k in latest.keys())[:48]
-        logger.warning(
-            "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
-            log_code or "?",
-            missing_labels,
-            sample_keys,
-        )
+        if summary_only:
+            severe = [x for x in missing_labels if x not in ("CurrentAssets", "CurrentLiabilities")]
+            if severe:
+                logger.warning(
+                    "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
+                    log_code or "?",
+                    severe,
+                    sample_keys,
+                )
+            else:
+                logger.debug(
+                    "V2財務変換 [%s]: summary_only — CurrentAssets/CurrentLiabilities 欠損のみ（想定内）",
+                    log_code or "?",
+                )
+        else:
+            logger.warning(
+                "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
+                log_code or "?",
+                missing_labels,
+                sample_keys,
+            )
     else:
         logger.debug("V2財務変換 [%s]: 主要勘定（TotalAssets/Equity/CA/CL/OCF/株数）は最新行で検出", log_code or "?")
 
@@ -460,6 +507,7 @@ def convert_v2_financials_to_legacy_statements(
     detail_rows: List[Dict[str, Any]],
     *,
     log_code: Optional[str] = None,
+    financial_data_mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     V2 fins/summary + fins/details を既存コードが読む V1 風 statements list[dict] に変換する。
@@ -582,7 +630,9 @@ def convert_v2_financials_to_legacy_statements(
     legacy = list(merged_by_key.values())
     legacy.sort(key=lambda r: _statement_sort_key(r), reverse=True)
     if log_code:
-        _audit_v2_legacy_statement_fields(legacy, log_code)
+        _audit_v2_legacy_statement_fields(
+            legacy, log_code, financial_data_mode=financial_data_mode,
+        )
     return legacy
 
 def fetch_prices_v2(
@@ -860,6 +910,9 @@ class FrozenCache:
         stmts, _ = self.load_statement_bundle(code)
         return stmts
 
+    def has_prices(self, code: str) -> bool:
+        return self.prices_path(code).exists()
+
     def has_all(self, code: str, max_age_days: Optional[int] = None) -> bool:
         p1, p2 = self.prices_path(code), self.stmts_path(code)
         try:
@@ -1017,7 +1070,8 @@ class DynamicSectorAverages:
             # CoName/Mkt 正規化後のマスタ（旧キャッシュは列不足のため別名）
             cache_file = CACHE_DIR / f"sector_stock_list_v2norm_{today}.csv"
             if cache_file.exists() and not force_refresh:
-                return pd.read_csv(cache_file)
+                df_cached = pd.read_csv(cache_file)
+                return enhance_stock_list_with_sectors(ensure_instrument_type_column(df_cached))
 
             _cli_print("📋 銘柄リスト取得…", "[銘柄リスト] 取得中…")
             rows = get_v2_all_pages(self.session, "equities/master", {})
@@ -1027,16 +1081,19 @@ class DynamicSectorAverages:
                     df["Code"] = df["Code"].astype(str).str.strip()
                     df = df.dropna(subset=["Code"])
                     df = df[df["Code"].str.match(r"^\d{4}$", na=False)].drop_duplicates("Code")
+                df = ensure_instrument_type_column(df)
                 df = enhance_stock_list_with_sectors(df)
                 df.to_csv(cache_file, index=False)
                 return df
 
             fb = pd.DataFrame(self.get_fallback_stock_list_v2())
+            fb = ensure_instrument_type_column(fb)
             fb = enhance_stock_list_with_sectors(fb)
             fb.to_csv(cache_file, index=False)
             return fb
         except Exception:
             fb = pd.DataFrame(self.get_fallback_stock_list_v2())
+            fb = ensure_instrument_type_column(fb)
             fb = enhance_stock_list_with_sectors(fb)
             return fb
 
@@ -1202,7 +1259,10 @@ class FinancialDataManager:
             _SUMMARY_ONLY_MODE_INFO_LOGGED = True
 
         stmts = convert_v2_financials_to_legacy_statements(
-            summary_rows, detail_rows, log_code=str(code).strip(),
+            summary_rows,
+            detail_rows,
+            log_code=str(code).strip(),
+            financial_data_mode=financial_data_mode,
         )
         try:
             blob = {"statements": stmts}
@@ -1274,25 +1334,64 @@ def enhance_stock_list_with_sectors(df: pd.DataFrame) -> pd.DataFrame:
     if "MktNm" not in df.columns:
         df["MktNm"] = ""
     base_cols = ["Code", "CompanyName", "Sector33Name", "MarketCode"]
-    extra_cols = [c for c in ("CoNameEn", "Mkt", "MktNm") if c in df.columns]
+    extra_ordered = ("instrument_type", "CoNameEn", "Mkt", "MktNm")
+    extra_cols = [c for c in extra_ordered if c in df.columns]
     return df[base_cols + extra_cols]
 
 # ------------------------------------------------------------
 # 銘柄名フィルタ（全銘柄収集・一覧用。--phase single は通さない）
 # ------------------------------------------------------------
-# J-Quants V2 equities/master の Mkt: 0109=ETF 等（確認サンプル）、0111/0112/0113=株式市場区分の例
+# J-Quants V2 equities/master の Mkt（実データ確認）:
+# 0109=ETF・PRO 等、0111/0112/0113=プライム・スタンダード・グロース、0105=東京 PRO 市場（株式）
 _JQ_MKT_ETF_OR_FUND_SEGMENT = frozenset({"0109"})
-_JQ_MKT_PRIME_STOCK_LIKE = frozenset({"0111", "0112", "0113"})
+_JQ_MKT_LISTED_EQUITY_SEGMENT = frozenset({"0105", "0111", "0112", "0113"})
+
+
+def _canonical_jq_segment(val: Any) -> str:
+    """CSV が 109→109.0 等になり得るため 4 桁セグメントに正規化する。"""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    try:
+        iv = int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        s = str(val).strip()
+        digs = "".join(ch for ch in s if ch.isdigit())
+        if len(digs) >= 4:
+            return digs[-4:].zfill(4)
+        if digs:
+            return digs.zfill(4)[-4:]
+        return s
+    if 0 <= iv <= 9999:
+        return f"{iv:04d}"
+    return str(iv)
 
 _FUND_NAME_KEYWORDS = (
     "ＥＴＦ", "ETF", "ETFs", "etf",
     "上場投信", "上場投資信託", "インデックスファンド", "連動型上場投信",
-    "投資信託", "上場インデックス",
+    "投資信託", "上場インデックス", "投信",
     "ETN", "ＥＴＮ", "etn",
     "REIT", "ＲＥＩＴ", "reit", "リート", "投資法人",
     "インデックス", "指数", "TOPIX", "日経225", "連動",
     "ベア", "ブル", "レバレッジ", "ダブルインバース", "インバース",
     "アセットマネジメント",
+    "先物", "債券", "国債", "米国債", "金", "原油", "商品",
+)
+
+# ETF 専用レーン向け（本スクリプトでは未スコア。将来: AUM推移・出来高・信託報酬・NAV乖離・トラッキングエラー・原資産・
+# レバ/インバース・200日線押し目・52週調整・RSI など。J-Quants 未取得は推定せず None。）
+_ETF_LANE_FUTURE_NOTE = "etf_lane_future_metrics"
+
+_REIT_NAME_KEYWORDS = ("REIT", "ＲＥＩＴ", "reit", "リート", "投資法人")
+_ETN_NAME_KEYWORDS = ("ETN", "ＥＴＮ", "etn")
+_ETF_NAME_KEYWORDS = (
+    "ＥＴＦ", "ETF", "ETFs", "etf",
+    "上場投信", "上場投資信託", "インデックスファンド", "連動型上場投信",
+    "上場インデックス",
+    "インデックス", "指数", "TOPIX", "日経225", "連動",
+)
+_FUND_NON_ETF_KEYWORDS = (
+    "投資信託", "投信", "投資信託", "ベア", "ブル", "レバレッジ",
+    "ダブルインバース", "インバース", "先物", "債券", "国債", "米国債", "金", "原油", "商品",
 )
 
 
@@ -1325,7 +1424,26 @@ def _fund_name_blob_excludes_jp(blob: str) -> bool:
     return False
 
 
+def _mktnm_suggests_equity_listing(mkt_nm: str) -> bool:
+    """Mkt 列の欠損・将来揺れ時の保険（ETF 市場0109は除外済みであること）。"""
+    n = (mkt_nm or "").strip()
+    if not n:
+        return False
+    return any(
+        k in n
+        for k in (
+            "プライム",
+            "スタンダード",
+            "グロース",
+            "TOKYO PRO MARKET",
+            "Pro Market",
+            "プロマーケット",
+        )
+    )
+
+
 def _fund_code_band_fallback(code4: str) -> bool:
+    """個別株財務スクリーニングには不適切なコード帯（ETF/投信・指数連動等が多い）。"""
     try:
         n = int(str(code4).strip()[:4])
     except ValueError:
@@ -1336,69 +1454,150 @@ def _fund_code_band_fallback(code4: str) -> bool:
         return True
     if 1550 <= n <= 1699:
         return True
+    if 2000 <= n <= 2099:
+        return True
+    if 2230 <= n <= 2869:
+        return True
     return False
 
 
-def _row_collectable_equity(row: pd.Series) -> Tuple[bool, Optional[str]]:
+def classify_instrument_from_master(row: Dict[str, Any]) -> str:
     """
-    False + 理由 で除外。単銘柄 UI では呼ばず、マスタ一覧→collect/analyze のみ。
+    V2 equities/master 相当の1行（正規化列）から instrument_type を返す。
+    stock / etf / etn / reit / fund / fund_like / unknown
+
+    判定順（コード帯は最後）:
+    1) Mkt で ETF 市場(0109) → etf
+    2) Mkt / MktNm で上場株式と判定 → stock
+    3) 名称キーワード
+    4) コード帯フォールバック → fund_like
+    5) その他 stock
     """
-    code4 = str(row.get("Code", "") or "").strip()[:4]
-    if not re.match(r"^\d{4}$", code4):
-        return False, "code"
-    cn = str(row.get("CompanyName", "") or "").strip()
-    co_en = str(row.get("CoNameEn", "") or "").strip()
-    mkt = str(row.get("Mkt", "") or row.get("MarketCode", "") or "").strip()
-    mkt_nm = str(row.get("MktNm", "") or "").strip()
+    code_cell = row.get("Code")
+    digits = "".join(ch for ch in str(code_cell or "") if ch.isdigit())
+    if len(digits) >= 4:
+        code4 = digits[:4]
+    else:
+        code4 = ""
+
+    cn = str(row.get("CompanyName") or "").strip()
+    co_en = str(row.get("CoNameEn") or "").strip()
+    mkt_raw = row.get("Mkt") if row.get("Mkt") not in (None, "") else row.get("MarketCode")
+    mkt = _canonical_jq_segment(mkt_raw)
+    mkt_nm = str(row.get("MktNm") or "").strip()
+    if not cn:
+        return "unknown"
+
+    if not code4.isdigit() or len(code4) != 4:
+        return "unknown"
+
     blob = f"{cn} {co_en} {mkt_nm}"
 
-    if not cn:
-        return False, "empty_name"
-
-    ok_name, _ = check_company_name_validity(cn)
-    if not ok_name:
-        return False, "name_keyword"
-
-    if _fund_name_blob_excludes_jp(blob):
-        return False, "fund_keyword"
-
+    # 1) ETF・上場投信市場（0109）
     if mkt in _JQ_MKT_ETF_OR_FUND_SEGMENT:
-        return False, "mkt_etf"
+        return "etf"
 
-    if mkt in _JQ_MKT_PRIME_STOCK_LIKE:
-        return True, None
+    # 2) 上場株式セグメント（0105 PRO / プライム・スタンダード・グロース）— コード帯より先
+    if mkt in _JQ_MKT_LISTED_EQUITY_SEGMENT:
+        return "stock"
+    if mkt not in _JQ_MKT_ETF_OR_FUND_SEGMENT and _mktnm_suggests_equity_listing(mkt_nm):
+        return "stock"
 
+    # 3) 名称（REIT→ETN→投信系→ETF）
+    if any(k in blob for k in _REIT_NAME_KEYWORDS):
+        return "reit"
+    if any(k in blob for k in _ETN_NAME_KEYWORDS):
+        return "etn"
+    if _fund_name_blob_excludes_jp(blob) or any(k in blob for k in _FUND_NON_ETF_KEYWORDS):
+        if any(k in blob for k in _ETF_NAME_KEYWORDS) or any(k in blob.lower() for k in ("etf", "etfn")):
+            return "etf"
+        return "fund"
+    if any(k in blob for k in _ETF_NAME_KEYWORDS):
+        return "etf"
+
+    # 4) コード帯（ETF/投信が多い帯のみ。上記で stock を確定できない場合）
     if _fund_code_band_fallback(code4):
-        return False, "code_band"
+        return "fund_like"
 
-    return True, None
+    return "stock"
+
+
+def ensure_instrument_type_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["instrument_type"] = out.apply(
+        lambda r: classify_instrument_from_master(r.to_dict()),
+        axis=1,
+    )
+    return out
+
+
+def _save_etf_candidates_unscored_csv(df_non_stock: pd.DataFrame) -> None:
+    """ETF/fund レーン検討用（未スコア）。個別株ランキングには混ぜない。"""
+    if df_non_stock is None or df_non_stock.empty:
+        return
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    cols = [c for c in ("Code", "CompanyName", "instrument_type", "Sector33Name", "MarketCode") if c in df_non_stock.columns]
+    if len(cols) < 3:
+        return
+    path = REPORTS_DIR / "etf_candidates_unscored.csv"
+    try:
+        df_non_stock[cols].sort_values("Code").to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        logger.warning("etf_candidates_unscored 保存スキップ: %s", e)
 
 
 def filter_collectable_equities_df(df: pd.DataFrame) -> pd.DataFrame:
-    """銘柄マスタ取得後、収集・解析タスク用に ETF/投信/REIT・空名・コード帯を除外する。"""
-    if df is None or df.empty or "CompanyName" not in df.columns:
+    """instrument_type が stock のみ収集対象。非株は etf_candidates_unscored に別途保存する。"""
+    _ = _ETF_LANE_FUTURE_NOTE  # メタ情報用（削除されないように参照のみ）
+    if df is None or df.empty:
         return df
+    if "CompanyName" not in df.columns:
+        return df
+    df = ensure_instrument_type_column(df)
+
+    try:
+        m_non_stock = df["instrument_type"].astype(str).str.strip() != "stock"
+        _save_etf_candidates_unscored_csv(df.loc[m_non_stock].copy())
+    except Exception:
+        pass
+
     n_in = len(df)
-    keep_mask: List[bool] = []
+    keep_rows: List[int] = []
     removed_empty_name = 0
+    removed_unknown = 0
     removed_fund_like = 0
-    for _, r in df.iterrows():
-        ok, reason = _row_collectable_equity(r)
-        keep_mask.append(ok)
-        if ok:
-            continue
-        if reason == "empty_name":
+
+    for idx, r in df.iterrows():
+        cn_raw = str(r.get("CompanyName", "") or "").strip()
+        if not cn_raw:
             removed_empty_name += 1
-        else:
+            continue
+        it = str(r.get("instrument_type") or "").strip() or classify_instrument_from_master(r.to_dict())
+        if it == "unknown":
+            removed_unknown += 1
+            continue
+        if it != "stock":
             removed_fund_like += 1
-    out = df.loc[keep_mask].copy() if any(keep_mask) else pd.DataFrame(columns=df.columns)
+            continue
+        ok_name, _ = check_company_name_validity(cn_raw)
+        if not ok_name:
+            removed_fund_like += 1
+            continue
+        keep_rows.append(idx)
+
+    out = df.loc[keep_rows].copy() if keep_rows else pd.DataFrame(columns=df.columns)
+
     logger.info(
-        "[INFO] collectable filter: input=%s output=%s removed_empty_name=%s removed_fund_like=%s",
+        "[INFO] collectable filter: input=%s output=%s removed_fund_like=%s removed_empty_name=%s removed_unknown=%s",
         n_in,
         len(out),
-        removed_empty_name,
         removed_fund_like,
+        removed_empty_name,
+        removed_unknown,
     )
+
     return out.reset_index(drop=True)
 
 # ------------------------------------------------------------
@@ -2318,13 +2517,17 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                                      market: str = "",
                                      sector_hint: str | None = None,
                                      *,
-                                     offline: bool = False) -> dict:
+                                     offline: bool = False,
+                                     instrument_type: str | None = None,
+                                     ) -> dict:
     try:
         fdm = FinancialDataManager(session)
         sector_raw = sector_hint or DynamicSectorAverages.get_sector_static(code)
         sector = DynamicSectorAverages.normalize_sector(sector_raw)
         fc = FrozenCache()
         fin_meta_src: Dict[str, Any] = {}
+        inst_t = (instrument_type or "stock").strip() or "stock"
+        skip_financial_lane = inst_t != "stock"
 
         # 価格
         if offline:
@@ -2332,7 +2535,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         else:
             price_df = fetch_prices_v2(session, code, cache_name=f"prices_{code}")
         if price_df is None or price_df.empty:
-            return {"stock_code": code, "company_name": name, "sector_name": sector, "success": False, "error": "price_missing"}
+            return {
+                "stock_code": code,
+                "company_name": name,
+                "sector_name": sector,
+                "success": False,
+                "error": "price_missing",
+                "instrument_type": inst_t,
+            }
 
         def _col(df, *cands):
             lc = {c.lower(): c for c in df.columns}
@@ -2374,8 +2584,17 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         adv_jpy_60d = liquidity.get("adv_jpy_60d")
         traded_days_60d = liquidity.get("traded_days_60d")
 
-        # 財務
-        if offline:
+        # 財務（ETF/ETN/投信等は個別株用の fins を取得しない。※未取得は None、推定しない）
+        _skip_fin_meta = {
+            "financial_data_mode": "skipped_non_stock_instrument",
+            "fins_details_available": False,
+            "fins_details_status": None,
+            "fins_details_error": "",
+        }
+        if skip_financial_lane:
+            stmts = []
+            fin_meta_src = dict(_skip_fin_meta)
+        elif offline:
             stmts, fin_meta_src = fc.load_statement_bundle(code)
         else:
             stmts = fdm.fetch_statements(code)
@@ -2560,6 +2779,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "fins_details_available": fin_meta_src.get("fins_details_available"),
             "fins_details_status": fin_meta_src.get("fins_details_status"),
             "fins_details_error": fin_meta_src.get("fins_details_error"),
+            "instrument_type": inst_t,
         }
         diagnostics = {
             **fin_diag,
@@ -2681,14 +2901,29 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "fins_details_available": fin_diag.get("fins_details_available"),
             "fins_details_status": fin_diag.get("fins_details_status"),
             "fins_details_error": fin_diag.get("fins_details_error"),
+            "instrument_type": inst_t,
         }
     except Exception as e:
-        return {"stock_code": code, "company_name": name, "sector_name": sector_hint or "その他", "error": f"{e}", "success": False}
+        return {
+            "stock_code": code,
+            "company_name": name,
+            "sector_name": sector_hint or "その他",
+            "error": f"{e}",
+            "success": False,
+            "instrument_type": instrument_type or "stock",
+        }
 
 # ------------------------------------------------------------
 # 収集（単体/全体）
 # ------------------------------------------------------------
-def collect_one_code(session: requests.Session, code: str, name: str = "", *, force_refresh: bool = False) -> bool:
+def collect_one_code(
+    session: requests.Session,
+    code: str,
+    name: str = "",
+    *,
+    force_refresh: bool = False,
+    instrument_type: str = "stock",
+) -> bool:
     fc = FrozenCache()
     try:
         # 価格
@@ -2701,7 +2936,10 @@ def collect_one_code(session: requests.Session, code: str, name: str = "", *, fo
         if price_df is not None and not price_df.empty:
             fc.save_prices(code, price_df)
 
-        # 財務
+        if instrument_type != "stock":
+            return fc.has_prices(code)
+
+        # 財務（個別株レーン）
         fdm = FinancialDataManager(session)
         stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
         if stmts:
@@ -2722,23 +2960,44 @@ def _save_pending(codes: list[str]) -> None:
 
 def _load_pending(df: pd.DataFrame, *, force_full: bool = False, refresh_days: Optional[int] = None) -> list[str]:
     fc = FrozenCache()
+    allowed = set(str(c).strip() for c in df["Code"].astype(str))
+
+    def _intersect_allow(codes_in: List[str]) -> List[str]:
+        out = [str(c).strip() for c in codes_in if str(c).strip() in allowed]
+        if len(out) != len(codes_in):
+            logger.info(
+                "[INFO] pending_codes dropped %s stale entries not in collectable universe",
+                len(codes_in) - len(out),
+            )
+        return out
+
     if force_full:
-        codes = [str(c) for c in df["Code"].astype(str)]
+        codes = _intersect_allow([str(c).strip() for c in df["Code"].astype(str)])
         _save_pending(codes)
         return codes
 
     if refresh_days is not None:
-        codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c), max_age_days=refresh_days)]
+        codes_raw = [
+            str(c).strip() for c in df["Code"].astype(str)
+            if str(c).strip() in allowed and not fc.has_all(str(c).strip(), max_age_days=refresh_days)
+        ]
+        codes = _intersect_allow(codes_raw)
         _save_pending(codes)
         return codes
 
     if PENDING_FILE.exists():
         try:
-            return json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
+            raw_pending = json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
+            filt = _intersect_allow([str(c) for c in raw_pending])
+            if len(filt) != len(raw_pending):
+                _save_pending(filt)
+            return filt
         except Exception:
             pass
 
-    codes = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
+    codes = _intersect_allow(
+        [str(c).strip() for c in df["Code"].astype(str) if not fc.has_all(str(c).strip())]
+    )
     _save_pending(codes)
     return codes
 
@@ -2779,11 +3038,17 @@ def collect_all_daemon(session: requests.Session,
     while pending:
         taken = 0
         start = time.time()
+        reset_v2_legacy_batch_audit()
         try:
             for code in list(pending):
                 if taken >= daily_budget:
                     break
-                ok = collect_one_code(session, code, force_refresh=(force_full or refresh_days is not None))
+                ok = collect_one_code(
+                    session,
+                    code,
+                    force_refresh=(force_full or refresh_days is not None),
+                    instrument_type="stock",
+                )
                 if ok:
                     pending.remove(code)
                     _save_pending(pending)
@@ -2801,6 +3066,7 @@ def collect_all_daemon(session: requests.Session,
             else:
                 raise
 
+        flush_v2_legacy_batch_audit_loggers()
         _cli_print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件", f"[収集] 今日のバッチ終了: {taken}件  残り{len(pending)}件")
         if not pending:
             _cli_print("✅ 全銘柄の凍結収集が完了", "[OK] 全銘柄の凍結収集が完了")
@@ -2819,6 +3085,7 @@ def collect_all_daemon(session: requests.Session,
             )
 
 def collect_batch(session: requests.Session, max_codes: int) -> dict:
+    reset_v2_legacy_batch_audit()
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
@@ -2831,7 +3098,7 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
     start = time.time()
 
     for i, code in enumerate(picked, 1):
-        ok_flag = collect_one_code(session, code)
+        ok_flag = collect_one_code(session, code, instrument_type="stock")
         if ok_flag:
             ok += 1
         else:
@@ -2844,6 +3111,7 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
             )
             sys.stdout.flush()
 
+    flush_v2_legacy_batch_audit_loggers()
     return {"tried": len(picked), "ok": ok, "fail": fail}
 
 # ------------------------------------------------------------
@@ -2878,6 +3146,25 @@ def lookup_company_name(session: requests.Session, code: str) -> str:
     if not hit.empty:
         return str(hit.iloc[0].get("CompanyName") or "")
     return ""
+
+
+def lookup_equity_name_and_instrument(session: requests.Session, code: str) -> Tuple[str, str]:
+    """マスタから銘柄名と instrument_type を返す（single 用。名称空でも拒否しない）。"""
+    fdm = FinancialDataManager(session)
+    df_list = fdm.get_stock_list_v2(force_refresh=False)
+    df_list = df_list.copy()
+    df_list["Code"] = df_list["Code"].astype(str).str.strip()
+    hit = df_list[df_list["Code"] == str(code).strip()]
+    if hit.empty:
+        return "", classify_instrument_from_master(
+            {"Code": code, "CompanyName": "", "CoNameEn": "", "Mkt": "", "MktNm": ""}
+        )
+    row = hit.iloc[0]
+    name = str(row.get("CompanyName") or "")
+    it = row.get("instrument_type")
+    if it is None or (isinstance(it, float) and pd.isna(it)) or str(it).strip() == "":
+        it = classify_instrument_from_master(row.to_dict())
+    return name, str(it)
 
 # ------------------------------------------------------------
 # レポート出力（flatten / csv / md）
@@ -2921,6 +3208,8 @@ def _flatten_result(d: dict) -> dict:
     return {
         "code": d.get("stock_code"),
         "name": d.get("company_name"),
+        "instrument_type": d.get("instrument_type")
+        or (diagnostics.get("instrument_type") if isinstance(diagnostics, dict) else None),
         "sector": d.get("sector_name"),
         "price": d.get("current_price"),
         "ps": d.get("ps_ratio"),
@@ -3609,8 +3898,10 @@ def run_interactive():
 
         elif choice == "3":
             code = input("銘柄コード4桁: ").strip()
-            name = lookup_company_name(session, code)
-            res = analyze_single_stock_complete_v3(session, sector_avgs, code, name=name, offline=True)
+            name, inst = lookup_equity_name_and_instrument(session, code)
+            res = analyze_single_stock_complete_v3(
+                session, sector_avgs, code, name=name, offline=True, instrument_type=inst,
+            )
             df = pd.DataFrame([_flatten_result(res)])
             fp = outdir / f"single_{code}.csv"
             df.to_csv(fp, index=False, encoding="utf-8-sig")
@@ -3712,8 +4003,10 @@ def main():
     if args.phase == "single":
         if not args.code:
             raise SystemExit("--code 必須")
-        name = lookup_company_name(session, args.code)
-        res = analyze_single_stock_complete_v3(session, sector_avgs, args.code, name=name, offline=True)
+        name, inst = lookup_equity_name_and_instrument(session, args.code)
+        res = analyze_single_stock_complete_v3(
+            session, sector_avgs, args.code, name=name, offline=True, instrument_type=inst,
+        )
         df = pd.DataFrame([_flatten_result(res)])
         fp = outdir / f"single_{args.code}.csv"
         df.to_csv(fp, index=False, encoding="utf-8-sig")
