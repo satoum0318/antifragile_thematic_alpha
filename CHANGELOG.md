@@ -12,6 +12,7 @@
 - Added `financial_data_mode` / `fins_details_*` diagnostics.
 - Added handling for fins/details 403 by disabling repeated detail requests in the same session.
 - Kept `--budget` default at 380; larger V2 collection should be tested gradually.
+- Added `api.ini.example` (committed template). Copy to local-only `api.ini` for `[DEFAULT] API_KEY`; `api.ini` stays gitignored.
 
 ## [1.4.0] - 2026-04-14
 
