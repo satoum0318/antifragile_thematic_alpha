@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.1] - 2026-04-28
+
+### JQuamtsScreeningBot（収集フィルタ・マスタ正規化・CF 別名）
+
+- Normalized V2 `equities/master` using `CoName`, `CoNameEn`, `S33Nm`, `Mkt`, `MktNm` (fixes empty `CompanyName` in cached lists).
+- Strengthened `filter_collectable_equities_df`: ETF segment (`Mkt=0109`), keyword exclusions, empty-name exclusion for batch flows, JP code-band fallbacks (`1300–1399`, `1450–1499`, `1550–1699`) when not prime-listed; single `--phase single` bypasses this filter.
+- One-line INFO log with removal counts; new daily cache file `sector_stock_list_v2norm_{date}.csv`.
+- Map V2 summary `CFO` into `NetCashProvidedByUsedInOperatingActivities` and `CashFlowsFromOperatingActivities` in aliases and legacy conversion.
+- Default collect batch size via `JQ_DEFAULT_BUDGET` (unset → 800) for CLI and menus.
+- Resolve `api.ini` beside the script directory; read `[DEFAULT] API_KEY` without relying on `has_section("DEFAULT")`.
+
+タグ: `v1.5.1-jquants-v2-collect-filter`
+
 ## [1.5.0] - 2026-04-28
 
 ### JQuamtsScreeningBot（J-Quants API V2 / summary-only 互換）
@@ -11,7 +24,6 @@
 - Added V2 summary-only compatible financial conversion.
 - Added `financial_data_mode` / `fins_details_*` diagnostics.
 - Added handling for fins/details 403 by disabling repeated detail requests in the same session.
-- Kept `--budget` default at 380; larger V2 collection should be tested gradually.
 - Added `api.ini.example` (committed template). Copy to local-only `api.ini` for `[DEFAULT] API_KEY`; `api.ini` stays gitignored.
 
 ## [1.4.0] - 2026-04-14

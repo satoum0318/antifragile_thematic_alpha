@@ -3,18 +3,19 @@
 J-Quants 収集→凍結キャッシュ→完全オフライン分析ワークフロー
 - J-Quants API V2（x-api-key）を使用。キャッシュは .jquants_cache_v2（V1の .jquants_cache は混在させない）
 - collect_all の日次「待機」は JQ_RPD 設定時のみ（未設定なら rpm 主制御で同一日内に待機しない）
-- 収集の --budget 380 は取得件数の安全上限として維持（V2では主にリクエスト/分で制限）
+- 収集の既定銘柄数は環境変数 JQ_DEFAULT_BUDGET（未設定時 800）、--budget で上書き（V2 では RPM も調整）
 - モック不使用: オフライン時は“計算不能はNone”で返す（推定やランダムは行わない）
 - 端末対話メニュー付き（引数未指定で起動するとメニュー表示）
 - CLI対応:
-    収集:   python script.py --phase collect --budget 380
+    収集:   python script.py --phase collect --budget 800
     解析:   python script.py --phase analyze --top 10
     単銘柄: python script.py --phase single --code 8035
-    全件:   python script.py --phase collect_all --budget 380
+    全件:   python script.py --phase collect_all --budget 800
 環境変数:
     JQUANTS_API_KEY または JQ_API_KEY（APIキー。未設定時は api.ini の DEFAULT.API_KEY）
     JQ_RPM=60        # 分あたりリクエスト上限の目安（公式プランに合わせて調整）
     JQ_RPD=          # 未設定なら日次セルフ上限なし（旧V1の800相当を自前で付けたい場合のみ数値を指定）
+    JQ_DEFAULT_BUDGET=800  # 収集フェーズ・メニューの既定「1回あたり最大銘柄数」（未設定時は 800）
 
 V2では date 指定で equities/bars/daily の全銘柄日次データ取得が可能なため、
 日次更新は将来的に code 単位ではなく date 単位一括取得へ移行する。
@@ -89,6 +90,18 @@ CACHE_DIR = Path(".jquants_cache_v2")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOOKBACK_DAYS = 700
 REPORTS_DIR = Path("output") / "reports"
+
+
+def _default_collect_budget_from_env() -> int:
+    """インタラクティブ・CLI --budget 未指定・collect_all の日次デフォルトなどに使用。"""
+    raw = os.getenv("JQ_DEFAULT_BUDGET", "800").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 800
+
+
+DEFAULT_COLLECT_BUDGET = _default_collect_budget_from_env()
 
 # summary_only での影響説明ログ（セッションにつき1回）
 _SUMMARY_ONLY_MODE_INFO_LOGGED = False
@@ -168,8 +181,13 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
         out["TotalAssets"] = out.get("TA")
     if out.get("EquityAttributableToOwnersOfParent") is None and out.get("Eq") is not None:
         out["EquityAttributableToOwnersOfParent"] = out.get("Eq")
-    if out.get("NetCashProvidedByUsedInOperatingActivities") is None and out.get("CFO") is not None:
-        out["NetCashProvidedByUsedInOperatingActivities"] = out.get("CFO")
+    cfo_cf = _non_null(out.get("NetCashProvidedByUsedInOperatingActivities"), out.get("CFO"))
+    if cfo_cf is not None:
+        out["NetCashProvidedByUsedInOperatingActivities"] = cfo_cf
+        if out.get("CashFlowsFromOperatingActivities") is None:
+            out["CashFlowsFromOperatingActivities"] = cfo_cf
+    elif out.get("CashFlowsFromOperatingActivities") is None and out.get("CFO") is not None:
+        out["CashFlowsFromOperatingActivities"] = out.get("CFO")
     if out.get("CashAndCashEquivalents") is None and out.get("CashEq") is not None:
         out["CashAndCashEquivalents"] = out.get("CashEq")
     sh = _non_null(out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"), out.get("ShOutFY"))
@@ -282,9 +300,11 @@ def normalize_prices_v2(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_equities_master_v2(df: pd.DataFrame) -> pd.DataFrame:
     """
     V2 equities/master を既存の Code, CompanyName, Sector33Name, MarketCode へ正規化する。
+    J-Quants V2 では CoName / Mkt が返るためそれを優先する。
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Code", "CompanyName", "Sector33Name", "MarketCode"])
+        base_cols = ["Code", "CompanyName", "Sector33Name", "MarketCode", "CoNameEn", "Mkt", "MktNm"]
+        return pd.DataFrame(columns=base_cols)
 
     rows: List[Dict[str, Any]] = []
     for _, row in df.iterrows():
@@ -302,18 +322,34 @@ def normalize_equities_master_v2(df: pd.DataFrame) -> pd.DataFrame:
         else:
             code_4 = digits.zfill(4)[-4:]
         company = _first_present(
-            d, ("CompanyName", "CompanyNameJapanese", "IssueName", "IssuerNameJa", "IssuerName"),
+            d,
+            (
+                "CoName",
+                "CompanyName",
+                "CompanyNameJapanese",
+                "IssueName",
+                "IssuerNameJa",
+                "IssuerName",
+            ),
         )
-        sector = _first_present(d, ("Sector33Name", "Sector33EnglishName", "Sector17Name"))
+        co_en = _first_present(d, ("CoNameEn", "CompanyNameEnglish"))
+        sector = _first_present(
+            d,
+            ("S33Nm", "Sector33Name", "Sector33EnglishName", "S17Nm", "Sector17Name"),
+        )
         market = _first_present(
             d,
-            ("MarketCode", "MarketDivision", "MarketSegment", "Market", "MarketName", "Section"),
+            ("Mkt", "MarketCode", "MarketDivision", "MarketSegment", "Market", "MarketName", "Section"),
         )
+        mkt_nm = _first_present(d, ("MktNm", "MarketName", "Section"))
         rows.append({
             "Code": code_4,
             "CompanyName": company if company is not None and not (isinstance(company, float) and pd.isna(company)) else "",
             "Sector33Name": sector if sector is not None and not (isinstance(sector, float) and pd.isna(sector)) else "",
             "MarketCode": "" if market is None or (isinstance(market, float) and pd.isna(market)) else str(market),
+            "CoNameEn": "" if co_en is None or (isinstance(co_en, float) and pd.isna(co_en)) else str(co_en),
+            "Mkt": "" if market is None or (isinstance(market, float) and pd.isna(market)) else str(market),
+            "MktNm": "" if mkt_nm is None or (isinstance(mkt_nm, float) and pd.isna(mkt_nm)) else str(mkt_nm),
         })
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -448,6 +484,7 @@ def convert_v2_financials_to_legacy_statements(
                 "NetCashProvidedByUsedInOperatingActivities",
                 "CashFlowsFromOperatingActivities",
                 "OperatingCashFlow",
+                "CFO",
             )),
             ("TotalAssets", ("TotalAssets", "TA", "TotalAsset")),
             ("EquityAttributableToOwnersOfParent", (
@@ -482,6 +519,14 @@ def convert_v2_financials_to_legacy_statements(
             picked = _non_null(*(out.get(s) for s in srcs))
             if picked is not None:
                 out[legacy_name] = picked
+        ocf_val = _non_null(
+            out.get("NetCashProvidedByUsedInOperatingActivities"),
+            out.get("CashFlowsFromOperatingActivities"),
+            out.get("CFO"),
+        )
+        if ocf_val is not None:
+            out["NetCashProvidedByUsedInOperatingActivities"] = ocf_val
+            out["CashFlowsFromOperatingActivities"] = ocf_val
         if not out.get("TypeOfDocument") and isinstance(out.get("CurrentPeriodType"), str):
             out["TypeOfDocument"] = str(out["CurrentPeriodType"])
         return out
@@ -690,21 +735,68 @@ class AuthSession(requests.Session):
 
         raise RuntimeError(f"{method} {url} failed after {MAX} attempts")
 
+
+def _resolve_api_ini_path(ini_rel: str) -> Optional[Path]:
+    """api.ini を「スクリプト配置ディレクトリ」優先で解決する（cwd だけに依存しない）。"""
+    name = (ini_rel or "api.ini").strip() or "api.ini"
+    p = Path(name)
+    if p.is_absolute():
+        return p if p.is_file() else None
+    script_dir = Path(__file__).resolve().parent
+    for root in (script_dir, Path.cwd()):
+        cand = (root / name).resolve()
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _load_api_key_from_ini(ini_path: Path) -> str:
+    """[DEFAULT] API_KEY を読む。interpolation 無効で % 等を安全に扱う。"""
+    cfg = configparser.ConfigParser(interpolation=None)
+    if not cfg.read(ini_path, encoding="utf-8"):
+        return ""
+    # has_section("DEFAULT") は stdlib の仕様で常に False のため使えない（[DEFAULT] は cfg["DEFAULT"] で読む）
+    return (cfg["DEFAULT"].get("API_KEY") or "").strip()
+
+
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "",
+        "PASTE_YOUR_JQUANTS_V2_API_KEY_HERE",
+    }
+)
+
+
 def get_authenticated_session_jquants(ini_file: str = "api.ini") -> requests.Session:
     api_key = (os.getenv("JQUANTS_API_KEY") or os.getenv("JQ_API_KEY") or "").strip()
+    ini_resolved = _resolve_api_ini_path(ini_file)
+    raw_ini_key = ""
+    if not api_key and ini_resolved:
+        raw_ini_key = _load_api_key_from_ini(ini_resolved)
+        api_key = raw_ini_key
+        if api_key in _PLACEHOLDER_API_KEYS:
+            api_key = ""
     if not api_key:
-        cfg = configparser.ConfigParser()
-        cfg.read(ini_file, encoding="utf-8")
-        if cfg.has_section("DEFAULT"):
-            api_key = (cfg["DEFAULT"].get("API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("APIキー未設定（JQUANTS_API_KEY / JQ_API_KEY / api.ini の DEFAULT.API_KEY）")
+        base = Path(__file__).resolve().parent
+        hints: List[str] = [
+            "APIキー未設定: 環境変数 JQUANTS_API_KEY / JQ_API_KEY、または api.ini の [DEFAULT] API_KEY を設定してください。",
+        ]
+        if ini_resolved is None:
+            hints.append(
+                f"api.ini が見つかりません（{base}、または現在のフォルダ {Path.cwd()} に {ini_file} を配置）"
+            )
+        elif raw_ini_key == "PASTE_YOUR_JQUANTS_V2_API_KEY_HERE":
+            hints.append("api.ini の API_KEY がプレースホルダのままです。実キーに置き換えてください。")
+        elif raw_ini_key == "":
+            hints.append("api.ini はありますが [DEFAULT] API_KEY が空です。")
+        raise RuntimeError(" ".join(hints))
 
     rpm = int(os.getenv("JQ_RPM", "60"))
     rpd_env = os.getenv("JQ_RPD")
     rpd = int(rpd_env) if rpd_env else None
     limiter = APIRateLimiter(rpm=rpm, rpd=rpd)
-    session = AuthSession(limiter, ini_file=ini_file)
+    ini_for_session = str(ini_resolved) if ini_resolved else ini_file
+    session = AuthSession(limiter, ini_file=ini_for_session)
     session.headers.update({"x-api-key": api_key})
     _cli_print("✅ J-Quants API V2（x-api-key）", "[OK] J-Quants API V2 (x-api-key)")
     return session
@@ -922,7 +1014,8 @@ class DynamicSectorAverages:
     def get_stock_list_v2(self, force_refresh: bool = False) -> pd.DataFrame:
         try:
             today = datetime.date.today().strftime("%Y%m%d")
-            cache_file = CACHE_DIR / f"sector_stock_list_{today}.csv"
+            # CoName/Mkt 正規化後のマスタ（旧キャッシュは列不足のため別名）
+            cache_file = CACHE_DIR / f"sector_stock_list_v2norm_{today}.csv"
             if cache_file.exists() and not force_refresh:
                 return pd.read_csv(cache_file)
 
@@ -1174,30 +1267,139 @@ def enhance_stock_list_with_sectors(df: pd.DataFrame) -> pd.DataFrame:
         df["MarketCode"] = ""
     if "CompanyName" not in df.columns:
         df["CompanyName"] = ""
-    return df[["Code", "CompanyName", "Sector33Name", "MarketCode"]]
+    if "CoNameEn" not in df.columns:
+        df["CoNameEn"] = ""
+    if "Mkt" not in df.columns:
+        df["Mkt"] = df["MarketCode"].astype(str) if "MarketCode" in df.columns else ""
+    if "MktNm" not in df.columns:
+        df["MktNm"] = ""
+    base_cols = ["Code", "CompanyName", "Sector33Name", "MarketCode"]
+    extra_cols = [c for c in ("CoNameEn", "Mkt", "MktNm") if c in df.columns]
+    return df[base_cols + extra_cols]
 
 # ------------------------------------------------------------
-# 銘柄名フィルタ
+# 銘柄名フィルタ（全銘柄収集・一覧用。--phase single は通さない）
 # ------------------------------------------------------------
+# J-Quants V2 equities/master の Mkt: 0109=ETF 等（確認サンプル）、0111/0112/0113=株式市場区分の例
+_JQ_MKT_ETF_OR_FUND_SEGMENT = frozenset({"0109"})
+_JQ_MKT_PRIME_STOCK_LIKE = frozenset({"0111", "0112", "0113"})
+
+_FUND_NAME_KEYWORDS = (
+    "ＥＴＦ", "ETF", "ETFs", "etf",
+    "上場投信", "上場投資信託", "インデックスファンド", "連動型上場投信",
+    "投資信託", "上場インデックス",
+    "ETN", "ＥＴＮ", "etn",
+    "REIT", "ＲＥＩＴ", "reit", "リート", "投資法人",
+    "インデックス", "指数", "TOPIX", "日経225", "連動",
+    "ベア", "ブル", "レバレッジ", "ダブルインバース", "インバース",
+    "アセットマネジメント",
+)
+
+
 def check_company_name_validity(company_name: str) -> Tuple[bool, str]:
-    if not company_name:
-        return True, "OK"
+    if company_name is None or not str(company_name).strip():
+        return False, "会社名空欄"
+    cn = str(company_name)
     etf_keywords = [
-        'ＥＴＦ','ETF','ETFs','etf','上場投信','上場投資信託','インデックスファンド','連動型上場投信',
-        '上場インデックス','TOPIX','日経225','投資法人','リート','REIT','ＲＥＩＴ',
+        "ＥＴＦ", "ETF", "ETFs", "etf", "上場投信", "上場投資信託", "インデックスファンド", "連動型上場投信",
+        "上場インデックス", "TOPIX", "日経225", "投資法人", "リート", "REIT", "ＲＥＩＴ",
     ]
-    if any(k in company_name for k in etf_keywords):
+    if any(k in cn for k in etf_keywords):
         return False, "ETF/投信/REIT"
-    fund_company_keywords = ['アセットマネジメント','投信']
-    if any(k in company_name for k in fund_company_keywords):
+    fund_company_keywords = ["アセットマネジメント", "投信"]
+    if any(k in cn for k in fund_company_keywords):
         return False, "投信会社商品"
     return True, "OK"
 
+
+def _fund_name_blob_excludes_jp(blob: str) -> bool:
+    if not blob:
+        return False
+    b_lo = blob
+    if any(k in b_lo for k in _FUND_NAME_KEYWORDS):
+        return True
+    blo = b_lo.lower()
+    for k in ("etf", "etn", "reit", "topix"):
+        if k in blo:
+            return True
+    return False
+
+
+def _fund_code_band_fallback(code4: str) -> bool:
+    try:
+        n = int(str(code4).strip()[:4])
+    except ValueError:
+        return False
+    if 1300 <= n <= 1399:
+        return True
+    if 1450 <= n <= 1499:
+        return True
+    if 1550 <= n <= 1699:
+        return True
+    return False
+
+
+def _row_collectable_equity(row: pd.Series) -> Tuple[bool, Optional[str]]:
+    """
+    False + 理由 で除外。単銘柄 UI では呼ばず、マスタ一覧→collect/analyze のみ。
+    """
+    code4 = str(row.get("Code", "") or "").strip()[:4]
+    if not re.match(r"^\d{4}$", code4):
+        return False, "code"
+    cn = str(row.get("CompanyName", "") or "").strip()
+    co_en = str(row.get("CoNameEn", "") or "").strip()
+    mkt = str(row.get("Mkt", "") or row.get("MarketCode", "") or "").strip()
+    mkt_nm = str(row.get("MktNm", "") or "").strip()
+    blob = f"{cn} {co_en} {mkt_nm}"
+
+    if not cn:
+        return False, "empty_name"
+
+    ok_name, _ = check_company_name_validity(cn)
+    if not ok_name:
+        return False, "name_keyword"
+
+    if _fund_name_blob_excludes_jp(blob):
+        return False, "fund_keyword"
+
+    if mkt in _JQ_MKT_ETF_OR_FUND_SEGMENT:
+        return False, "mkt_etf"
+
+    if mkt in _JQ_MKT_PRIME_STOCK_LIKE:
+        return True, None
+
+    if _fund_code_band_fallback(code4):
+        return False, "code_band"
+
+    return True, None
+
+
 def filter_collectable_equities_df(df: pd.DataFrame) -> pd.DataFrame:
-    """銘柄マスタ取得後、収集・解析タスク用に ETF/投信/REIT 等を除外する。"""
+    """銘柄マスタ取得後、収集・解析タスク用に ETF/投信/REIT・空名・コード帯を除外する。"""
     if df is None or df.empty or "CompanyName" not in df.columns:
         return df
-    return df[df.apply(lambda r: check_company_name_validity(str(r.get("CompanyName", "") or ""))[0], axis=1)].reset_index(drop=True)
+    n_in = len(df)
+    keep_mask: List[bool] = []
+    removed_empty_name = 0
+    removed_fund_like = 0
+    for _, r in df.iterrows():
+        ok, reason = _row_collectable_equity(r)
+        keep_mask.append(ok)
+        if ok:
+            continue
+        if reason == "empty_name":
+            removed_empty_name += 1
+        else:
+            removed_fund_like += 1
+    out = df.loc[keep_mask].copy() if any(keep_mask) else pd.DataFrame(columns=df.columns)
+    logger.info(
+        "[INFO] collectable filter: input=%s output=%s removed_empty_name=%s removed_fund_like=%s",
+        n_in,
+        len(out),
+        removed_empty_name,
+        removed_fund_like,
+    )
+    return out.reset_index(drop=True)
 
 # ------------------------------------------------------------
 # テクニカル
@@ -2566,7 +2768,7 @@ def collect_all_daemon(session: requests.Session,
             rpd = int(rpd_env)
             daily_budget = max(1, min(len(pending), max(1, rpd // 2 - 5)))
         else:
-            daily_budget = min(len(pending), 380)
+            daily_budget = min(len(pending), DEFAULT_COLLECT_BUDGET)
 
     mode = "強制再収集" if force_full else (f"{refresh_days}日超のみ再収集" if refresh_days is not None else "未取得のみ")
     _cli_print(
@@ -3366,8 +3568,8 @@ def run_interactive():
         choice = input("選択: ").strip().lower()
 
         if choice == "1":
-            budget = input("本日収集する銘柄数（推奨380）: ").strip()
-            budget = int(budget) if budget.isdigit() else 380
+            budget = input(f"本日収集する銘柄数（推奨既定{DEFAULT_COLLECT_BUDGET}、Enter で既定）: ").strip()
+            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
             s = collect_batch(session, budget)
             _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
 
@@ -3449,20 +3651,20 @@ def run_interactive():
                 )
 
         elif choice == "5":
-            budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
-            budget = int(budget) if budget.isdigit() else 380
+            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
+            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget)
 
         elif choice == "6":
             days = input("何日より古ければ取り直すか（日数。例: 7）: ").strip()
             days = int(days) if days.isdigit() else 7
-            budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
-            budget = int(budget) if budget.isdigit() else 380
+            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
+            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget, refresh_days=days, reset_pending=True)
 
         elif choice == "7":
-            budget = input("1日あたりの最大収集銘柄数（既定380）: ").strip()
-            budget = int(budget) if budget.isdigit() else 380
+            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
+            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget, force_full=True, reset_pending=True)
 
         elif choice == "q":
@@ -3478,7 +3680,7 @@ def main():
                         choices=["collect","collect_all","analyze","single","interactive"],
                         default="interactive")
     parser.add_argument("--code")
-    parser.add_argument("--budget", type=int, default=380)
+    parser.add_argument("--budget", type=int, default=DEFAULT_COLLECT_BUDGET)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--reset-pending", action="store_true")
     parser.add_argument("--refresh-days", type=int)
