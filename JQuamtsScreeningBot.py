@@ -90,6 +90,11 @@ CACHE_DIR = Path(".jquants_cache_v2")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOOKBACK_DAYS = 700
 REPORTS_DIR = Path("output") / "reports"
+COLLECTION_SKIPLIST_PATH = REPORTS_DIR / "collection_skiplist.json"
+MISSING_FINANCIALS_CSV = REPORTS_DIR / "missing_financials_symbols.csv"
+NON_STOCK_EXCLUDED_CSV = REPORTS_DIR / "non_stock_excluded_symbols.csv"
+COLLECT_FILTER_EXCLUDED_CSV = REPORTS_DIR / "collectable_filter_excluded.csv"
+SECTOR_NORM_AUDIT_CSV = REPORTS_DIR / "sector_normalization_audit.csv"
 
 _CANDIDATE_LANE_SORT: Dict[str, int] = {
     "ma200_reclaim_core": 1,
@@ -278,6 +283,13 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
         out["TotalAssets"] = out.get("TA")
     if out.get("EquityAttributableToOwnersOfParent") is None and out.get("Eq") is not None:
         out["EquityAttributableToOwnersOfParent"] = out.get("Eq")
+    for _cfo_alt in ("CFO", "Cfo", "cfo"):
+        if _cfo_alt in out and out.get(_cfo_alt) not in (None, "", "NA"):
+            if out.get("NetCashProvidedByUsedInOperatingActivities") is None:
+                out["NetCashProvidedByUsedInOperatingActivities"] = out.get(_cfo_alt)
+            if out.get("CashFlowsFromOperatingActivities") is None:
+                out["CashFlowsFromOperatingActivities"] = out.get(_cfo_alt)
+            break
     cfo_cf = _non_null(
         out.get("NetCashProvidedByUsedInOperatingActivities"),
         out.get("CashFlowsFromOperatingActivities"),
@@ -503,6 +515,8 @@ def _audit_v2_legacy_statement_fields(
             "CashFlowsFromOperatingActivities",
             "OperatingCashFlow",
             "CFO",
+            "Cfo",
+            "cfo",
         )),
         ("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock", (
             "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
@@ -518,8 +532,9 @@ def _audit_v2_legacy_statement_fields(
             missing_labels.append(label)
     if missing_labels:
         sample_keys = sorted(str(k) for k in latest.keys())[:48]
+        summary_only_exempt = ("CurrentAssets", "CurrentLiabilities", "GrossProfit")
         if summary_only:
-            severe = [x for x in missing_labels if x not in ("CurrentAssets", "CurrentLiabilities")]
+            severe = [x for x in missing_labels if x not in summary_only_exempt]
             if severe:
                 logger.warning(
                     "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
@@ -527,10 +542,11 @@ def _audit_v2_legacy_statement_fields(
                     severe,
                     sample_keys,
                 )
-            else:
-                logger.debug(
-                    "V2財務変換 [%s]: summary_only — CurrentAssets/CurrentLiabilities 欠損のみ（想定内）",
+            elif missing_labels:
+                logger.info(
+                    "V2財務変換 [%s]: summary_only 想定内欠損のみ %s",
                     log_code or "?",
+                    missing_labels,
                 )
         else:
             logger.warning(
@@ -546,14 +562,25 @@ def _audit_v2_legacy_statement_fields(
     ng = latest.get("GrossProfit")
     nn = latest.get("NetIncomeLoss")
     oi = latest.get("OperatingIncome")
-    if _financial_scalar_absent(nd) and _financial_scalar_absent(oi):
+    if summary_only:
+        if _financial_scalar_absent(nd) and _financial_scalar_absent(oi):
+            logger.warning(
+                "V2財務変換 [%s]: summary_only だが NetSales/OperatingIncome が最新行で欠損",
+                log_code or "?",
+            )
+        if _financial_scalar_absent(nn):
+            logger.warning(
+                "V2財務変換 [%s]: summary_only だが NetIncomeLoss が最新行で欠損",
+                log_code or "?",
+            )
+    elif _financial_scalar_absent(nd) and _financial_scalar_absent(oi):
         logger.debug(
             "V2財務変換 [%s]: NetSales/OperatingIncome が最新行で未検出（四半期のみ等の可能性）",
             log_code or "?",
         )
     if _financial_scalar_absent(ng):
         logger.debug("V2財務変換 [%s]: GrossProfit が最新行で未検出", log_code or "?")
-    if _financial_scalar_absent(nn):
+    if not summary_only and _financial_scalar_absent(nn):
         logger.debug("V2財務変換 [%s]: NetIncomeLoss が最新行で未検出", log_code or "?")
 
 def _merge_fs_into_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -704,6 +731,59 @@ def convert_v2_financials_to_legacy_statements(
         )
     return legacy
 
+def fetch_prices_v2_with_meta(
+    session: requests.Session,
+    code: str,
+    lookback_days: int = LOOKBACK_DAYS,
+    *,
+    cache_name: Optional[str] = None,
+    bypass_cache: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    today = datetime.date.today().strftime("%Y%m%d")
+    cn = cache_name or f"prices_{code}"
+    cache_file = CACHE_DIR / f"{cn}_{today}.csv"
+
+    if cache_file.exists() and not bypass_cache:
+        try:
+            df = pd.read_csv(cache_file)
+            if not df.empty:
+                dfn = normalize_prices_v2(df)
+                return dfn, {"http": 200, "rows": len(dfn), "from_cache": True, "transient": False}
+        except Exception:
+            pass
+
+    start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end = datetime.date.today().strftime("%Y-%m-%d")
+    rows: List[Dict[str, Any]] = []
+    last_st = 200
+    last_err = ""
+    for qc in api_code_candidates(code):
+        rows_try, st, err = paginate_v2_endpoint(session, "equities/bars/daily", {"code": qc, "from": start, "to": end})
+        last_st = int(st)
+        last_err = (err or "")[:400]
+        if rows_try:
+            rows = rows_try
+            last_st = 200
+            break
+        if st != 200:
+            logger.warning("equities/bars/daily HTTP %s code=%s", st, qc)
+    if not rows:
+        transient = last_st in (408, 409, 429, 500, 502, 503, 504) or last_st >= 520 or last_st == 599
+        return pd.DataFrame(), {
+            "http": last_st,
+            "rows": 0,
+            "err": last_err,
+            "from_cache": False,
+            "transient": transient,
+        }
+    df = normalize_prices_v2(pd.DataFrame(rows))
+    try:
+        df.to_csv(cache_file, index=False)
+    except Exception:
+        pass
+    return df, {"http": 200, "rows": len(df), "from_cache": False, "transient": False}
+
+
 def fetch_prices_v2(
     session: requests.Session,
     code: str,
@@ -715,35 +795,9 @@ def fetch_prices_v2(
     """
     銘柄ごとに日足を取得し、既存標準列へ正規化する（code 単位取得互換）。
     """
-    today = datetime.date.today().strftime("%Y%m%d")
-    cn = cache_name or f"prices_{code}"
-    cache_file = CACHE_DIR / f"{cn}_{today}.csv"
-
-    if cache_file.exists() and not bypass_cache:
-        try:
-            df = pd.read_csv(cache_file)
-            if not df.empty:
-                return normalize_prices_v2(df)
-        except Exception:
-            pass
-
-    start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end = datetime.date.today().strftime("%Y-%m-%d")
-    rows: List[Dict[str, Any]] = []
-    for qc in api_code_candidates(code):
-        rows_try, st, _ = paginate_v2_endpoint(session, "equities/bars/daily", {"code": qc, "from": start, "to": end})
-        if rows_try:
-            rows = rows_try
-            break
-        if st != 200:
-            logger.warning("equities/bars/daily HTTP %s code=%s", st, qc)
-    if not rows:
-        return pd.DataFrame()
-    df = normalize_prices_v2(pd.DataFrame(rows))
-    try:
-        df.to_csv(cache_file, index=False)
-    except Exception:
-        pass
+    df, _ = fetch_prices_v2_with_meta(
+        session, code, lookback_days, cache_name=cache_name, bypass_cache=bypass_cache,
+    )
     return df
 
 def fetch_prices_by_date_v2_placeholder(session: requests.Session, _date: str) -> pd.DataFrame:
@@ -759,21 +813,61 @@ def fetch_prices_by_date_v2_placeholder(session: requests.Session, _date: str) -
 class GracefulShutdown:
     def __init__(self):
         self.shutdown = False
+        self._signal_received = False
+        self._final_user_message_printed = False
         try:
             signal.signal(signal.SIGINT, self.exit_gracefully)
-            signal.signal(signal.SIGTERM, self.exit_gracefully)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, self.exit_gracefully)
         except Exception:
             pass
 
     def exit_gracefully(self, signum, frame):
-        _cli_print(
-            f"\n⚠️ 中断シグナル受信: {signum}\n🛑 安全に終了します",
-            f"\n[中断] シグナル受信: {signum}\n安全に終了します",
-        )
+        if self._signal_received:
+            self.shutdown = True
+            return
+        self._signal_received = True
         self.shutdown = True
-        sys.exit(130)
+        _cli_print(
+            f"\n⚠️ 中断シグナル受信: {signum}\n🛑 現在の処理を区切りで停止します",
+            f"\n[中断] シグナル受信: {signum}\n現在の処理を区切りで停止します",
+        )
+
+    def print_safe_exit_once(self) -> None:
+        if not self.shutdown:
+            return
+        if self._final_user_message_printed:
+            return
+        self._final_user_message_printed = True
+        _cli_print("✅ 安全に終了しました", "[終了] 安全に終了しました")
+
 
 graceful_shutdown = GracefulShutdown()
+
+
+def _sleep_interruptible(total_seconds: float, chunk_seconds: float = 1.0) -> None:
+    """長い time.sleep を分割し、graceful_shutdown 時に抜けられるようにする。"""
+    if total_seconds <= 0:
+        return
+    end = time.time() + float(total_seconds)
+    while time.time() < end:
+        if graceful_shutdown.shutdown:
+            return
+        rem = end - time.time()
+        time.sleep(min(chunk_seconds, rem) if rem > 0 else 0.0)
+
+
+def _executor_shutdown_interrupt(ex: ThreadPoolExecutor, futs: List[Any]) -> None:
+    """未着手の future を cancel し、プールを待たずに停止（ベストエフォート）。"""
+    for f in futs:
+        try:
+            f.cancel()
+        except Exception:
+            pass
+    try:
+        ex.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        ex.shutdown(wait=False)
 
 # ------------------------------------------------------------
 # レートリミッタ + 認証セッション
@@ -1026,6 +1120,9 @@ class DynamicSectorAverages:
         "自動車": {"ca_ratio": 0.55, "cl_ratio": 0.40, "gpm": 0.20},
         "医薬品": {"ca_ratio": 0.58, "cl_ratio": 0.32, "gpm": 0.65},
         "商社": {"ca_ratio": 0.52, "cl_ratio": 0.38, "gpm": 0.15},
+        "保険": {"ca_ratio": 0.22, "cl_ratio": 0.85, "gpm": 0.22},
+        "証券": {"ca_ratio": 0.35, "cl_ratio": 0.62, "gpm": 0.35},
+        "不動産": {"ca_ratio": 0.55, "cl_ratio": 0.40, "gpm": 0.40},
         "ゲーム": {"ca_ratio": 0.60, "cl_ratio": 0.35, "gpm": 0.55},
         "その他":   {"ca_ratio": 0.60, "cl_ratio": 0.40, "gpm": 0.25},
     }
@@ -1044,6 +1141,12 @@ class DynamicSectorAverages:
         # J-Quants Sector33Name（および近い表記）→ 社内セクターキー
         if "銀行" in s:
             return "銀行"
+        if "保険" in s:
+            return "保険"
+        if "証券" in s or "商品先物" in s:
+            return "証券"
+        if "不動産" in s:
+            return "不動産"
         if "小売業" in s or s == "小売":
             return "小売"
         if "卸売業" in s or s == "卸売":
@@ -1235,16 +1338,21 @@ class DynamicSectorAverages:
             _cli_print(f"📊 セクター平均計算: {len(tasks)}銘柄から計算中...", f"[セクター平均計算] {len(tasks)}銘柄から計算中...")
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
-
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [
-                    ex.submit(
-                        analyze_single_stock_complete_v3,
-                        self.session, {}, code, name, market, sector,
-                        offline=True
-                    ) for (code, name, market, sector) in tasks[:max_samples_per_sector * 20]
-                ]
+            task_slice = tasks[: max_samples_per_sector * 20]
+            ex = ThreadPoolExecutor(max_workers=max_workers)
+            futs = [
+                ex.submit(
+                    analyze_single_stock_complete_v3,
+                    self.session, {}, code, name, market, sector,
+                    offline=True
+                )
+                for (code, name, market, sector) in task_slice
+            ]
+            try:
                 for i, fut in enumerate(as_completed(futs), 1):
+                    if graceful_shutdown.shutdown:
+                        logger.info("shutdown requested; stopping sector average loop")
+                        break
                     res = fut.result()
                     if res.get("success") and res.get("ps_ratio") is not None:
                         results.append(res)
@@ -1253,6 +1361,14 @@ class DynamicSectorAverages:
                             f"  ⏱ {i}/{len(futs)} 完了 (有効データ={len(results)})",
                             f"  [{i}/{len(futs)}] 完了 (有効データ={len(results)})",
                         )
+            finally:
+                _executor_shutdown_interrupt(ex, futs)
+
+            if graceful_shutdown.shutdown and len(results) < len(futs):
+                _cli_print(
+                    "🛑 セクター平均計算を中断しました（結果は未反映の可能性があります）",
+                    "[中断] セクター平均計算を打ち切り",
+                )
 
             if not results:
                 _cli_print("📊 セクター平均計算: 有効なデータがありません", "[セクター平均計算] 有効なデータがありません")
@@ -1336,10 +1452,15 @@ class FinancialDataManager:
 
         session = self.session
         summary_rows: List[Dict[str, Any]] = []
+        summary_http = 200
+        summary_err = ""
         for qc in api_code_candidates(code):
-            sr, st, _ = paginate_v2_endpoint(session, "fins/summary", {"code": qc})
+            sr, st, err_snip = paginate_v2_endpoint(session, "fins/summary", {"code": qc})
+            summary_http = int(st)
+            summary_err = (err_snip or "")[:400]
             if sr:
                 summary_rows = sr
+                summary_http = 200
                 break
             if st != 200:
                 logger.warning("fins/summary HTTP %s code=%s", st, qc)
@@ -1355,7 +1476,7 @@ class FinancialDataManager:
         else:
             for qc in api_code_candidates(code):
                 dr, dst, der = paginate_v2_endpoint(session, "fins/details", {"code": qc})
-                ds = dst
+                ds = int(dst) if dst is not None else None
                 session.fins_details_last_status = dst
                 if dst == 403:
                     session.fins_details_available = False
@@ -1376,6 +1497,10 @@ class FinancialDataManager:
             "fins_details_available": fins_details_available,
             "fins_details_status": ds,
             "fins_details_error": der[:500] if der else "",
+            "api_status_summary": summary_http,
+            "api_error_summary": summary_err,
+            "summary_rows": len(summary_rows),
+            "detail_rows": len(detail_rows),
         }
         self._last_financial_fetch_meta = meta_out
 
@@ -1676,6 +1801,170 @@ def _save_etf_candidates_unscored_csv(df_non_stock: pd.DataFrame) -> None:
         logger.warning("etf_candidates_unscored 保存スキップ: %s", e)
 
 
+def _master_row_for_reports(r: Any) -> Dict[str, str]:
+    if r is None:
+        return {
+            "company_name": "", "sector": "", "market": "", "mkt": "", "mkt_nm": "",
+            "instrument_type": "",
+        }
+    d = r if isinstance(r, dict) else r.to_dict()
+    return {
+        "company_name": str(d.get("CompanyName") or ""),
+        "sector": str(d.get("Sector33Name") or ""),
+        "market": str(d.get("MarketCode") or ""),
+        "mkt": str(d.get("Mkt") or d.get("MarketCode") or ""),
+        "mkt_nm": str(d.get("MktNm") or ""),
+        "instrument_type": str(d.get("instrument_type") or ""),
+    }
+
+
+def _reports_upsert_csv(path: Path, row: dict, key_col: str = "code") -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = Path(path)
+    kval = str(row.get(key_col, "")).strip()
+    if path.exists():
+        try:
+            df_old = pd.read_csv(path, encoding="utf-8-sig")
+            if key_col in df_old.columns:
+                df_old = df_old[df_old[key_col].astype(str).str.strip() != kval]
+            df_new = pd.concat([df_old, pd.DataFrame([row])], ignore_index=True)
+        except Exception:
+            df_new = pd.DataFrame([row])
+    else:
+        df_new = pd.DataFrame([row])
+    df_new.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _load_skiplist_raw() -> dict:
+    if not COLLECTION_SKIPLIST_PATH.exists():
+        return {"skipped": {}}
+    try:
+        return json.loads(COLLECTION_SKIPLIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"skipped": {}}
+
+
+def _save_skiplist_raw(blob: dict) -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    COLLECTION_SKIPLIST_PATH.write_text(json.dumps(blob, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _skiplist_add_entry(code: str, reason: str, **extra: Any) -> None:
+    blob = _load_skiplist_raw()
+    blob.setdefault("skipped", {})
+    blob["skipped"][str(code).strip()] = {
+        "reason": reason,
+        "last_attempt_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        **extra,
+    }
+    _save_skiplist_raw(blob)
+
+
+_NON_STOCK_NAME_SUBSTRINGS_EXTRA = (
+    "インフラファンド", "優先出資", "受益証券", "ＥＴＦ", "ETF", "ETN", "ＥＴＮ",
+    "REIT", "ＲＥＩＴ", "リート", "投資法人", "上場投信", "上場投資信託", "投資信託", "投信",
+)
+
+
+def _non_stock_keyword_hit(company_name: str) -> Optional[str]:
+    cn = company_name or ""
+    for sub in _NON_STOCK_NAME_SUBSTRINGS_EXTRA:
+        if sub in cn:
+            return f"name_keyword:{sub}"
+    return None
+
+
+def _non_stock_market_hit(row: dict) -> Optional[str]:
+    seg = _canonical_jq_segment(row.get("Mkt") if row.get("Mkt") not in (None, "") else row.get("MarketCode"))
+    if seg in _JQ_MKT_ETF_OR_FUND_SEGMENT:
+        return "mkt_segment_etf_fund"
+    mnm = str(row.get("MktNm") or "")
+    for k in ("ＥＴＦ", "ETF", "上場投信", "投信", "リート", "REIT"):
+        if k in mnm:
+            return f"mktnm:{k}"
+    return None
+
+
+def _collect_hard_exclusion_reason(row: dict) -> Optional[str]:
+    r = _non_stock_keyword_hit(str(row.get("CompanyName") or ""))
+    if r:
+        return r
+    r2 = _non_stock_market_hit(row)
+    if r2:
+        return r2
+    it = str(row.get("instrument_type") or "").strip()
+    if it and it != "stock":
+        return f"instrument_type:{it}"
+    return None
+
+
+def _record_permanent_missing_financials(res: dict, master_row: Optional[Any]) -> None:
+    code = str(res.get("code", "")).strip()
+    m = _master_row_for_reports(master_row)
+    _skiplist_add_entry(code, "permanent_missing_financials", detail=res.get("reason", ""))
+    row = {
+        "code": code,
+        "company_name": m["company_name"],
+        "sector": m["sector"],
+        "market": m["market"],
+        "instrument_type": m["instrument_type"],
+        "reason": res.get("reason", ""),
+        "last_attempt_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "price_rows": res.get("price_rows", 0),
+        "summary_rows": res.get("summary_rows", 0),
+        "detail_rows": res.get("detail_rows", 0),
+        "financial_data_mode": res.get("financial_data_mode", ""),
+        "api_status_summary": res.get("api_status_summary", ""),
+        "api_status_details": res.get("api_status_details", ""),
+    }
+    _reports_upsert_csv(MISSING_FINANCIALS_CSV, row, "code")
+
+
+def _record_non_stock_excluded(res: dict, master_row: Optional[Any]) -> None:
+    code = str(res.get("code", "")).strip()
+    m = _master_row_for_reports(master_row)
+    _skiplist_add_entry(code, "non_stock_or_fund_like", detail=res.get("reason", ""))
+    row = {
+        "code": code,
+        "company_name": m["company_name"],
+        "sector": m["sector"],
+        "market": m["market"],
+        "mkt": m["mkt"],
+        "mkt_nm": m["mkt_nm"],
+        "instrument_type": m["instrument_type"],
+        "reason": res.get("reason", ""),
+    }
+    _reports_upsert_csv(NON_STOCK_EXCLUDED_CSV, row, "code")
+
+
+def write_sector_normalization_audit_csv(session: requests.Session) -> Optional[Path]:
+    """マスタの収集対象銘柄について Sector33 → 正規化セクターの監査CSVを出す。"""
+    try:
+        fdm = FinancialDataManager(session)
+        df = filter_collectable_equities_df(fdm.get_stock_list_v2(force_refresh=False))
+        if df is None or df.empty:
+            return None
+        rows: List[dict] = []
+        for _, r in df.iterrows():
+            o = str(r.get("Sector33Name") or "")
+            n = DynamicSectorAverages.normalize_sector(o)
+            rows.append({
+                "code": str(r.get("Code") or "").strip(),
+                "company_name": str(r.get("CompanyName") or ""),
+                "original_sector33": o,
+                "normalized_sector": n,
+                "market": str(r.get("MarketCode") or ""),
+                "reason_if_other": (o or "empty_sector33") if n == "その他" else "",
+            })
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        p = SECTOR_NORM_AUDIT_CSV
+        pd.DataFrame(rows).sort_values("code").to_csv(p, index=False, encoding="utf-8-sig")
+        return p
+    except Exception as e:
+        logger.warning("sector_normalization_audit 出力スキップ: %s", e)
+        return None
+
+
 def filter_collectable_equities_df(df: pd.DataFrame) -> pd.DataFrame:
     """instrument_type が stock のみ収集対象。非株は etf_candidates_unscored に別途保存する。"""
     _ = _ETF_LANE_FUTURE_NOTE  # メタ情報用（削除されないように参照のみ）
@@ -1696,26 +1985,56 @@ def filter_collectable_equities_df(df: pd.DataFrame) -> pd.DataFrame:
     removed_empty_name = 0
     removed_unknown = 0
     removed_fund_like = 0
+    excluded_audit: List[Dict[str, str]] = []
 
     for idx, r in df.iterrows():
         cn_raw = str(r.get("CompanyName", "") or "").strip()
+        rd = r.to_dict()
+        code_s = str(r.get("Code", "")).strip()
         if not cn_raw:
             removed_empty_name += 1
             continue
-        it = str(r.get("instrument_type") or "").strip() or classify_instrument_from_master(r.to_dict())
+        it = str(r.get("instrument_type") or "").strip() or classify_instrument_from_master(rd)
         if it == "unknown":
             removed_unknown += 1
             continue
         if it != "stock":
             removed_fund_like += 1
             continue
-        ok_name, _ = check_company_name_validity(cn_raw)
+        hard = _collect_hard_exclusion_reason(rd)
+        if hard:
+            removed_fund_like += 1
+            excluded_audit.append({
+                "code": code_s,
+                "company_name": cn_raw,
+                "sector": str(r.get("Sector33Name") or ""),
+                "market": str(r.get("MarketCode") or ""),
+                "reason": hard,
+            })
+            continue
+        ok_name, reason_nm = check_company_name_validity(cn_raw)
         if not ok_name:
             removed_fund_like += 1
+            excluded_audit.append({
+                "code": code_s,
+                "company_name": cn_raw,
+                "sector": str(r.get("Sector33Name") or ""),
+                "market": str(r.get("MarketCode") or ""),
+                "reason": reason_nm or "name_filter",
+            })
             continue
         keep_rows.append(idx)
 
     out = df.loc[keep_rows].copy() if keep_rows else pd.DataFrame(columns=df.columns)
+
+    if excluded_audit:
+        try:
+            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(excluded_audit).sort_values("code").to_csv(
+                COLLECT_FILTER_EXCLUDED_CSV, index=False, encoding="utf-8-sig",
+            )
+        except Exception as e:
+            logger.warning("collectable_filter_excluded CSV 失敗: %s", e)
 
     logger.info(
         "[INFO] collectable filter: input=%s output=%s removed_fund_like=%s removed_empty_name=%s removed_unknown=%s",
@@ -3894,6 +4213,111 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 # ------------------------------------------------------------
 # 収集（単体/全体）
 # ------------------------------------------------------------
+def collect_one_code_result(
+    session: requests.Session,
+    code: str,
+    master_row: Optional[dict] = None,
+    *,
+    force_refresh: bool = False,
+    instrument_type: str = "stock",
+) -> Dict[str, Any]:
+    fc = FrozenCache()
+    code = str(code).strip()
+    out: Dict[str, Any] = {
+        "ok": False,
+        "status": "transient_error",
+        "code": code,
+        "reason": "",
+        "price_rows": 0,
+        "summary_rows": 0,
+        "detail_rows": 0,
+        "saved_prices": False,
+        "saved_statements": False,
+        "financial_data_mode": "",
+        "api_status_summary": "",
+        "api_status_details": "",
+    }
+    try:
+        if master_row:
+            hr = _collect_hard_exclusion_reason(master_row)
+            if hr:
+                return {
+                    **out,
+                    "status": "non_stock_or_fund_like",
+                    "reason": hr,
+                }
+
+        if instrument_type != "stock":
+            df_p, pmeta = fetch_prices_v2_with_meta(
+                session, code, cache_name=f"prices_{code}", bypass_cache=force_refresh,
+            )
+            out["price_rows"] = int(pmeta.get("rows") or 0)
+            if df_p is not None and not df_p.empty:
+                fc.save_prices(code, df_p)
+                out["saved_prices"] = True
+            if fc.has_prices(code):
+                return {**out, "ok": True, "status": "success", "reason": ""}
+            ph = int(pmeta.get("http", 200) or 200)
+            if ph in (401, 403):
+                return {**out, "status": "auth_or_permission_error", "reason": f"price_http_{ph}"}
+            return {**out, "status": "transient_error", "reason": f"price_http_{ph}"}
+
+        df_p, pmeta = fetch_prices_v2_with_meta(
+            session, code, cache_name=f"prices_{code}", bypass_cache=force_refresh,
+        )
+        out["price_rows"] = int(pmeta.get("rows") or 0)
+        if df_p is not None and not df_p.empty:
+            fc.save_prices(code, df_p)
+            out["saved_prices"] = True
+        else:
+            ph = int(pmeta.get("http", 200) or 200)
+            if ph in (401, 403):
+                return {**out, "status": "auth_or_permission_error", "reason": f"price_http_{ph}"}
+            if bool(pmeta.get("transient")):
+                return {**out, "status": "transient_error", "reason": f"price_transient_http_{ph}"}
+
+        fdm = FinancialDataManager(session)
+        stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
+        meta = fdm.get_last_financial_fetch_meta()
+        sum_st = int(meta.get("api_status_summary", 200) or 200)
+        n_sum = int(meta.get("summary_rows", 0) or 0)
+        n_det = int(meta.get("detail_rows", 0) or 0)
+        out["summary_rows"] = n_sum
+        out["detail_rows"] = n_det
+        out["financial_data_mode"] = str(meta.get("financial_data_mode") or "")
+        out["api_status_summary"] = sum_st
+        ds = meta.get("fins_details_status")
+        out["api_status_details"] = str(ds) if ds is not None else ""
+
+        if sum_st in (401, 403):
+            return {**out, "status": "auth_or_permission_error", "reason": "fins_summary_auth"}
+        if sum_st != 200:
+            return {**out, "status": "transient_error", "reason": f"fins_summary_http_{sum_st}"}
+        if n_sum == 0:
+            return {**out, "status": "permanent_missing_financials", "reason": "fins_summary_empty_http200"}
+        if not stmts:
+            return {**out, "status": "permanent_missing_financials", "reason": "statements_empty_after_convert"}
+
+        fc.save_statements(code, stmts, financial_meta=meta)
+        out["saved_statements"] = True
+
+        if fc.has_all(code):
+            return {**out, "ok": True, "status": "success", "reason": ""}
+        if not fc.has_prices(code):
+            return {**out, "status": "transient_error", "reason": "price_missing_after_fin_save"}
+        return {**out, "status": "transient_error", "reason": "cache_incomplete_after_save"}
+
+    except RuntimeError as e:
+        if "日次レート制限到達" in str(e):
+            raise
+        return {**out, "status": "transient_error", "reason": str(e)}
+    except requests.RequestException as e:
+        return {**out, "status": "transient_error", "reason": f"request:{e!s}"}
+    except Exception as e:
+        logger.warning("collect_one_code_result 例外 code=%s: %s", code, e)
+        return {**out, "status": "transient_error", "reason": str(e)}
+
+
 def collect_one_code(
     session: requests.Session,
     code: str,
@@ -3902,43 +4326,29 @@ def collect_one_code(
     force_refresh: bool = False,
     instrument_type: str = "stock",
 ) -> bool:
-    fc = FrozenCache()
-    try:
-        # 価格
-        price_df = fetch_prices_v2(
-            session,
-            code,
-            cache_name=f"prices_{code}",
-            bypass_cache=force_refresh,
+    return bool(
+        collect_one_code_result(session, code, None, force_refresh=force_refresh, instrument_type=instrument_type).get(
+            "ok"
         )
-        if price_df is not None and not price_df.empty:
-            fc.save_prices(code, price_df)
-
-        if instrument_type != "stock":
-            return fc.has_prices(code)
-
-        # 財務（個別株レーン）
-        fdm = FinancialDataManager(session)
-        stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
-        if stmts:
-            fc.save_statements(code, stmts, financial_meta=fdm.get_last_financial_fetch_meta())
-
-        return fc.has_all(code)
-    except RuntimeError as e:
-        if "日次レート制限到達" in str(e):
-            raise
-        return False
-    except Exception:
-        return False
+    )
 
 PENDING_FILE = CACHE_DIR / "pending_codes.json"
 
 def _save_pending(codes: list[str]) -> None:
     PENDING_FILE.write_text(json.dumps({"codes": codes}, ensure_ascii=False), encoding="utf-8")
 
-def _load_pending(df: pd.DataFrame, *, force_full: bool = False, refresh_days: Optional[int] = None) -> list[str]:
+def _load_pending(
+    df: pd.DataFrame,
+    *,
+    force_full: bool = False,
+    refresh_days: Optional[int] = None,
+    ignore_skiplist: bool = False,
+) -> list[str]:
     fc = FrozenCache()
     allowed = set(str(c).strip() for c in df["Code"].astype(str))
+    skip_set: set[str] = set()
+    if not ignore_skiplist:
+        skip_set = {str(k).strip() for k in _load_skiplist_raw().get("skipped", {}).keys()}
 
     def _intersect_allow(codes_in: List[str]) -> List[str]:
         out = [str(c).strip() for c in codes_in if str(c).strip() in allowed]
@@ -3949,32 +4359,36 @@ def _load_pending(df: pd.DataFrame, *, force_full: bool = False, refresh_days: O
             )
         return out
 
+    def _skip_skipped(codes_in: List[str]) -> List[str]:
+        return [c for c in codes_in if str(c).strip() not in skip_set]
+
     if force_full:
-        codes = _intersect_allow([str(c).strip() for c in df["Code"].astype(str)])
+        codes = _skip_skipped(_intersect_allow([str(c).strip() for c in df["Code"].astype(str)]))
         _save_pending(codes)
         return codes
 
     if refresh_days is not None:
         codes_raw = [
-            str(c).strip() for c in df["Code"].astype(str)
+            str(c).strip()
+            for c in df["Code"].astype(str)
             if str(c).strip() in allowed and not fc.has_all(str(c).strip(), max_age_days=refresh_days)
         ]
-        codes = _intersect_allow(codes_raw)
+        codes = _skip_skipped(_intersect_allow(codes_raw))
         _save_pending(codes)
         return codes
 
     if PENDING_FILE.exists():
         try:
             raw_pending = json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
-            filt = _intersect_allow([str(c) for c in raw_pending])
+            filt = _skip_skipped(_intersect_allow([str(c) for c in raw_pending]))
             if len(filt) != len(raw_pending):
                 _save_pending(filt)
             return filt
         except Exception:
             pass
 
-    codes = _intersect_allow(
-        [str(c).strip() for c in df["Code"].astype(str) if not fc.has_all(str(c).strip())]
+    codes = _skip_skipped(
+        _intersect_allow([str(c).strip() for c in df["Code"].astype(str) if not fc.has_all(str(c).strip())])
     )
     _save_pending(codes)
     return codes
@@ -3988,16 +4402,26 @@ def collect_all_daemon(session: requests.Session,
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
 
+    if reset_pending and force_full and COLLECTION_SKIPLIST_PATH.exists():
+        try:
+            COLLECTION_SKIPLIST_PATH.unlink()
+        except OSError:
+            pass
+
     if reset_pending and PENDING_FILE.exists():
         try:
             PENDING_FILE.unlink()
         except Exception:
             pass
 
-    pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days)
+    ignore_skiplist = bool(force_full)
+    pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days, ignore_skiplist=ignore_skiplist)
     if not pending:
         _cli_print("📦 すでに全件取得済み", "[収集] すでに全件取得済み")
+        write_sector_normalization_audit_csv(session)
         return
+
+    code_to_row = {str(r.get("Code", "")).strip(): r.to_dict() for _, r in df.iterrows()}
 
     if daily_budget is None:
         rpd_env = os.getenv("JQ_RPD")
@@ -4014,28 +4438,76 @@ def collect_all_daemon(session: requests.Session,
     )
 
     while pending:
+        if graceful_shutdown.shutdown:
+            logger.info("shutdown requested; stopping collect_all_daemon")
+            break
+        pending_before = len(pending)
         taken = 0
         start = time.time()
+        stats = {
+            "success": 0,
+            "permanent_missing_financials": 0,
+            "non_stock_or_fund_like": 0,
+            "transient_error": 0,
+            "auth_or_permission_error": 0,
+        }
         reset_v2_legacy_batch_audit()
         try:
             for code in list(pending):
+                if graceful_shutdown.shutdown:
+                    logger.info("shutdown requested; stopping current collect batch")
+                    break
                 if taken >= daily_budget:
                     break
-                ok = collect_one_code(
+                mr = code_to_row.get(str(code).strip())
+                res = collect_one_code_result(
                     session,
                     code,
+                    mr,
                     force_refresh=(force_full or refresh_days is not None),
                     instrument_type="stock",
                 )
-                if ok:
-                    pending.remove(code)
-                    _save_pending(pending)
+                stt = str(res.get("status") or "")
+                c_norm = str(code).strip()
+                if stt == "success":
+                    if c_norm in pending:
+                        pending.remove(c_norm)
+                    stats["success"] += 1
+                elif stt == "permanent_missing_financials":
+                    if c_norm in pending:
+                        pending.remove(c_norm)
+                    _record_permanent_missing_financials(res, mr)
+                    stats["permanent_missing_financials"] += 1
+                elif stt == "non_stock_or_fund_like":
+                    if c_norm in pending:
+                        pending.remove(c_norm)
+                    _record_non_stock_excluded(res, mr)
+                    stats["non_stock_or_fund_like"] += 1
+                elif stt == "auth_or_permission_error":
+                    stats["auth_or_permission_error"] += 1
+                else:
+                    stats["transient_error"] += 1
+                _save_pending(pending)
                 taken += 1
                 if taken % 20 == 0 or taken == daily_budget:
                     elapsed = time.time() - start
                     _cli_print(
-                        f"  ⏱ 本日 {taken}/{daily_budget} 件  残り{len(pending)}  経過{int(elapsed)}s",
-                        f"  [本日 {taken}/{daily_budget}] 残り{len(pending)}  経過{int(elapsed)}s",
+                        "  ⏱ 本日 {}/{} 件 | pending_before={} | success={} | permanent_skip={} | "
+                        "non_stock={} | transient={} | auth={} | pending_after={} | 経過{}s".format(
+                            taken,
+                            daily_budget,
+                            pending_before,
+                            stats["success"],
+                            stats["permanent_missing_financials"],
+                            stats["non_stock_or_fund_like"],
+                            stats["transient_error"],
+                            stats["auth_or_permission_error"],
+                            len(pending),
+                            int(elapsed),
+                        ),
+                        "  [進捗] {}/{} pending {} ok {} skip {}".format(
+                            taken, daily_budget, len(pending), stats["success"], stats["permanent_missing_financials"],
+                        ),
                     )
                     sys.stdout.flush()
         except RuntimeError as e:
@@ -4045,7 +4517,15 @@ def collect_all_daemon(session: requests.Session,
                 raise
 
         flush_v2_legacy_batch_audit_loggers()
-        _cli_print(f"📦 今日の収集バッチ終了: {taken}件  残り{len(pending)}件", f"[収集] 今日のバッチ終了: {taken}件  残り{len(pending)}件")
+        pending_after = len(pending)
+        summary_lines = (
+            f"収集バッチ終了: tried={taken}, success={stats['success']}, "
+            f"permanent_missing_financials={stats['permanent_missing_financials']}, "
+            f"non_stock_or_fund_like={stats['non_stock_or_fund_like']}, transient_error={stats['transient_error']}, "
+            f"auth_or_permission_error={stats['auth_or_permission_error']}, "
+            f"pending_before={pending_before}, pending_after={pending_after}"
+        )
+        _cli_print("📦 " + summary_lines, "[収集] " + summary_lines)
         if not pending:
             _cli_print("✅ 全銘柄の凍結収集が完了", "[OK] 全銘柄の凍結収集が完了")
             break
@@ -4055,12 +4535,22 @@ def collect_all_daemon(session: requests.Session,
             h, rem = divmod(wait_sec, 3600)
             m, s = divmod(rem, 60)
             _cli_print(f"⏳ JQ_RPD 設定のため日が変わるまで待機: {h}h{m}m{s}s", f"[待機] JQ_RPD: {h}h{m}m{s}s")
-            time.sleep(wait_sec)
+            _sleep_interruptible(wait_sec)
+            if graceful_shutdown.shutdown:
+                break
         else:
+            if pending_after >= pending_before and taken > 0:
+                _cli_print(
+                    "⛔ 進捗なしのため停止。missing_financials_symbols.csv と collection_skiplist.json を確認してください。",
+                    "[停止] 進捗なし: skiplist / missing_financials を確認",
+                )
+                break
             _cli_print(
                 "📌 JQ_RPD 未設定のため日をまたがないで次バッチへ（同一日内の継続）。",
                 "[情報] JQ_RPD 未設定: 継続収集",
             )
+
+    write_sector_normalization_audit_csv(session)
 
 def collect_batch(session: requests.Session, max_codes: int) -> dict:
     reset_v2_legacy_batch_audit()
@@ -4068,17 +4558,34 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
     fc = FrozenCache()
+    code_to_row = {str(r.get("Code", "")).strip(): r.to_dict() for _, r in df.iterrows()}
 
-    pending = [str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c))]
-    picked  = pending[:max_codes]
+    skip_set = {str(k).strip() for k in _load_skiplist_raw().get("skipped", {}).keys()}
+    pending = [
+        str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c)) and str(c).strip() not in skip_set
+    ]
+    picked = pending[:max_codes]
     ok = 0
     fail = 0
     start = time.time()
 
     for i, code in enumerate(picked, 1):
-        ok_flag = collect_one_code(session, code, instrument_type="stock")
-        if ok_flag:
+        if graceful_shutdown.shutdown:
+            logger.info("shutdown requested; stopping collect_batch")
+            break
+        mr = code_to_row.get(str(code).strip())
+        res = collect_one_code_result(
+            session, code, mr, force_refresh=False, instrument_type="stock",
+        )
+        stt = res.get("status")
+        if stt == "success":
             ok += 1
+        elif stt == "permanent_missing_financials":
+            _record_permanent_missing_financials(res, mr)
+            fail += 1
+        elif stt == "non_stock_or_fund_like":
+            _record_non_stock_excluded(res, mr)
+            fail += 1
         else:
             fail += 1
         if i % 20 == 0 or i == len(picked):
@@ -4986,6 +5493,9 @@ def run_interactive():
     outdir.mkdir(exist_ok=True, parents=True)
 
     while True:
+        if graceful_shutdown.shutdown:
+            logger.info("shutdown requested; stopping menu loop")
+            break
         print("=== メニュー ===")
         print("1) 収集（価格+財務を凍結保存）")
         print("2) オフライン一括分析（core/satellite/excluded 出力）")
@@ -4995,7 +5505,12 @@ def run_interactive():
         print("6) 鮮度で取り直し収集（例: 7日より古いものだけ）")
         print("7) 全銘柄“強制”再収集（pending初期化＋当日再取得）")
         print("q) 終了")
-        choice = input("選択: ").strip().lower()
+        try:
+            choice = input("選択: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            graceful_shutdown.shutdown = True
+            _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+            break
 
         if choice == "1":
             budget = input(f"本日収集する銘柄数（推奨既定{DEFAULT_COLLECT_BUDGET}、Enter で既定）: ").strip()
@@ -5011,13 +5526,20 @@ def run_interactive():
 
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(
+            ex = ThreadPoolExecutor(max_workers=max_workers)
+            futs = [
+                ex.submit(
                     analyze_single_stock_complete_v3,
                     session, sector_avgs, code, name, market, sector,
                     offline=True
-                ) for (code, name, market, sector) in tasks]
+                )
+                for (code, name, market, sector) in tasks
+            ]
+            try:
                 for i, fut in enumerate(as_completed(futs), 1):
+                    if graceful_shutdown.shutdown:
+                        logger.info("shutdown requested; stopping analyze loop")
+                        break
                     results.append(fut.result())
                     if i % 200 == 0 or i == len(futs):
                         ok_cnt = sum(1 for r in results if r.get("success"))
@@ -5025,6 +5547,15 @@ def run_interactive():
                             f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})",
                             f"  [{i}/{len(futs)}] 完了 (OK={ok_cnt})",
                         )
+            finally:
+                _executor_shutdown_interrupt(ex, futs)
+
+            if graceful_shutdown.shutdown and len(results) < len(futs):
+                _cli_print(
+                    "🛑 中断のため一括分析を打ち切りました（CSVは保存していません）",
+                    "[中断] 一括分析を打ち切り",
+                )
+                continue
 
             flat = pd.DataFrame([_flatten_result(r) for r in results])
             master = outdir / "screening_offline.csv"
@@ -5080,6 +5611,9 @@ def run_interactive():
                     ps_str = f"{ps_val:.2f}" if ps_val is not None else "N/A"
                     per_str = f"{per_val:.2f}" if per_val is not None else "N/A"
                     print(f"  {sector}: PS={ps_str}, PER={per_str}, サンプル数={sample_count}")
+                p_audit = write_sector_normalization_audit_csv(session)
+                if p_audit:
+                    _cli_print(f"📄 セクター正規化監査: {p_audit}", f"[監査] sector_normalization {p_audit}")
             else:
                 _cli_print(
                     "⚠️ セクター平均の計算に失敗しました。キャッシュデータが不足している可能性があります。",
@@ -5109,7 +5643,7 @@ def run_interactive():
         else:
             print("無効な選択")
 
-def main():
+def main() -> int:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase",
@@ -5121,79 +5655,121 @@ def main():
     parser.add_argument("--reset-pending", action="store_true")
     parser.add_argument("--refresh-days", type=int)
     parser.add_argument("--force-full", action="store_true")
+    parser.add_argument("--force", action="store_true", help="--force-full と同等（skiplist 無視・メニュー7相当）")
     args = parser.parse_args()
 
     if args.phase == "interactive":
-        run_interactive()
-        return
+        try:
+            run_interactive()
+        except KeyboardInterrupt:
+            graceful_shutdown.shutdown = True
+            _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+        return 130 if graceful_shutdown.shutdown else 0
 
-    session = get_authenticated_session_jquants()
-    sector_avgs = DynamicSectorAverages(session).get_sector_averages()
-    outdir = REPORTS_DIR
-    outdir.mkdir(exist_ok=True, parents=True)
+    args.force_full = bool(args.force_full or getattr(args, "force", False))
 
-    if args.phase == "collect_all":
-        collect_all_daemon(session,
-                           daily_budget=args.budget,
-                           refresh_days=args.refresh_days,
-                           force_full=args.force_full,
-                           reset_pending=args.reset_pending)
-        return
+    try:
+        session = get_authenticated_session_jquants()
+        sector_avgs = DynamicSectorAverages(session).get_sector_averages()
+        outdir = REPORTS_DIR
+        outdir.mkdir(exist_ok=True, parents=True)
 
-    if args.phase == "collect":
-        s = collect_batch(session, args.budget)
-        _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
-        return
+        if args.phase == "collect_all":
+            collect_all_daemon(session,
+                               daily_budget=args.budget,
+                               refresh_days=args.refresh_days,
+                               force_full=args.force_full,
+                               reset_pending=args.reset_pending)
+            return 130 if graceful_shutdown.shutdown else 0
 
-    if args.phase == "single":
-        if not args.code:
-            raise SystemExit("--code 必須")
-        name, inst = lookup_equity_name_and_instrument(session, args.code)
-        res = analyze_single_stock_complete_v3(
-            session, sector_avgs, args.code, name=name, offline=True, instrument_type=inst,
-        )
-        df = pd.DataFrame([_flatten_result(res)])
-        fp = outdir / f"single_{args.code}.csv"
-        df.to_csv(fp, index=False, encoding="utf-8-sig")
-        cleanup_old_report_files(outdir)
-        cleanup_old_report_files(outdir.parent)
-        _cli_print(f"✅ 単銘柄出力: {fp}", f"[OK] 単銘柄出力: {fp}")
-        print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
-        return
+        if args.phase == "collect":
+            s = collect_batch(session, args.budget)
+            _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
+            return 130 if graceful_shutdown.shutdown else 0
 
-    if args.phase == "analyze":
-        tasks = build_offline_analysis_tasks(session)
-        if not tasks:
-            print("キャッシュ不足。先に --phase collect か collect_all を実行してください。")
-            return
+        if args.phase == "single":
+            if not args.code:
+                raise SystemExit("--code 必須")
+            name, inst = lookup_equity_name_and_instrument(session, args.code)
+            res = analyze_single_stock_complete_v3(
+                session, sector_avgs, args.code, name=name, offline=True, instrument_type=inst,
+            )
+            df = pd.DataFrame([_flatten_result(res)])
+            fp = outdir / f"single_{args.code}.csv"
+            df.to_csv(fp, index=False, encoding="utf-8-sig")
+            cleanup_old_report_files(outdir)
+            cleanup_old_report_files(outdir.parent)
+            _cli_print(f"✅ 単銘柄出力: {fp}", f"[OK] 単銘柄出力: {fp}")
+            print("注: PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
+            return 130 if graceful_shutdown.shutdown else 0
 
-        results = []
-        max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(
-                analyze_single_stock_complete_v3,
-                session, sector_avgs, code, name, market, sector,
-                offline=True
-            ) for (code, name, market, sector) in tasks]
-            for i, fut in enumerate(as_completed(futs), 1):
-                results.append(fut.result())
-                if i % 200 == 0 or i == len(futs):
-                    ok_cnt = sum(1 for r in results if r.get("success"))
-                    _cli_print(
-                        f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})",
-                        f"  [{i}/{len(futs)}] 完了 (OK={ok_cnt})",
-                    )
+        if args.phase == "analyze":
+            tasks = build_offline_analysis_tasks(session)
+            if not tasks:
+                print("キャッシュ不足。先に --phase collect か collect_all を実行してください。")
+                return 0
 
-        flat = pd.DataFrame([_flatten_result(r) for r in results])
-        master = outdir / "screening_offline.csv"
-        flat.to_csv(master, index=False, encoding="utf-8-sig")
+            results = []
+            max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
+            ex = ThreadPoolExecutor(max_workers=max_workers)
+            futs = [
+                ex.submit(
+                    analyze_single_stock_complete_v3,
+                    session, sector_avgs, code, name, market, sector,
+                    offline=True
+                )
+                for (code, name, market, sector) in tasks
+            ]
+            try:
+                for i, fut in enumerate(as_completed(futs), 1):
+                    if graceful_shutdown.shutdown:
+                        logger.info("shutdown requested; stopping analyze loop")
+                        break
+                    results.append(fut.result())
+                    if i % 200 == 0 or i == len(futs):
+                        ok_cnt = sum(1 for r in results if r.get("success"))
+                        _cli_print(
+                            f"  ⏱ {i}/{len(futs)} 完了 (OK={ok_cnt})",
+                            f"  [{i}/{len(futs)}] 完了 (OK={ok_cnt})",
+                        )
+            finally:
+                _executor_shutdown_interrupt(ex, futs)
 
-        outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
-        _cli_print(f"✅ オフライン分析出力: {master}", f"[OK] オフライン分析出力: {master}")
-        _cli_print(f"✅ 出力先: {outdir}", f"[OK] 出力先: {outdir}")
-        print("=== 生成物 ===")
-        for p in outputs:
-            print(f"  - {p}")
+            if graceful_shutdown.shutdown and len(results) < len(futs):
+                _cli_print(
+                    "🛑 中断のため一括分析を打ち切りました（CSVは保存していません）",
+                    "[中断] 一括分析を打ち切り",
+                )
+                return 130
+
+            flat = pd.DataFrame([_flatten_result(r) for r in results])
+            master = outdir / "screening_offline.csv"
+            flat.to_csv(master, index=False, encoding="utf-8-sig")
+
+            outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
+            _cli_print(f"✅ オフライン分析出力: {master}", f"[OK] オフライン分析出力: {master}")
+            _cli_print(f"✅ 出力先: {outdir}", f"[OK] 出力先: {outdir}")
+            print("=== 生成物 ===")
+            for p in outputs:
+                print(f"  - {p}")
+            return 130 if graceful_shutdown.shutdown else 0
+
+    except KeyboardInterrupt:
+        graceful_shutdown.shutdown = True
+        _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+        return 130
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    _main_exit = 0
+    try:
+        _main_exit = int(main() or 0)
+    except KeyboardInterrupt:
+        graceful_shutdown.shutdown = True
+        _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+        _main_exit = 130
+    finally:
+        graceful_shutdown.print_safe_exit_once()
+    raise SystemExit(_main_exit)

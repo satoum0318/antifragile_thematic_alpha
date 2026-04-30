@@ -219,15 +219,31 @@ def collect_all_daemon(session: requests.Session,
 class GracefulShutdown:
     def __init__(self):
         self.shutdown = False
+        self._signal_received = False
+        self._final_user_message_printed = False
         try:
             signal.signal(signal.SIGINT, self.exit_gracefully)
-            signal.signal(signal.SIGTERM, self.exit_gracefully)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, self.exit_gracefully)
         except Exception:
             pass
+
     def exit_gracefully(self, signum, frame):
-        print(f"\n[警告] 中断シグナル受信: {signum}\n[停止] 安全に終了します")
+        if self._signal_received:
+            self.shutdown = True
+            return
+        self._signal_received = True
         self.shutdown = True
-        sys.exit(130)
+        print(f"\n[警告] 中断シグナル受信: {signum}\n[停止] 現在の処理を区切りで停止します")
+
+    def print_safe_exit_once(self) -> None:
+        if not self.shutdown:
+            return
+        if self._final_user_message_printed:
+            return
+        self._final_user_message_printed = True
+        print("[終了] 安全に終了しました")
+
 
 graceful_shutdown = GracefulShutdown()
 
@@ -2600,4 +2616,14 @@ def main():
 
 if __name__ == "__main__":
     # 引数未指定で△ボタン実行→メニュー表示
-    main()
+    _code = 0
+    try:
+        main()
+        _code = 130 if graceful_shutdown.shutdown else 0
+    except KeyboardInterrupt:
+        graceful_shutdown.shutdown = True
+        print("\n[中断] 終了しました")
+        _code = 130
+    finally:
+        graceful_shutdown.print_safe_exit_once()
+    raise SystemExit(_code)
