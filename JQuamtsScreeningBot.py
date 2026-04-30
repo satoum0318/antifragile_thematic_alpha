@@ -91,6 +91,32 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOOKBACK_DAYS = 700
 REPORTS_DIR = Path("output") / "reports"
 
+_CANDIDATE_LANE_SORT: Dict[str, int] = {
+    "ma200_reclaim_core": 1,
+    "bottom_reversal_core": 2,
+    "weak_reclaim_watch": 4,
+    "watch_fundamental_core": 5,
+    "data_review_light": 6,  # rec_priority で reclaim 時は上位へ寄せる
+    "extended_above_ma200": 7,
+    "satellite_valuation": 8,
+    "satellite_ps_only": 8,
+    "data_review": 9,
+    "cyclical_value_trap": 10,
+    "core": 12,
+    "excluded": 99,
+}
+
+_LANE_EXPORT_NAMES: Dict[str, str] = {
+    "ma200_reclaim_core": "ma200_reclaim_core_candidates.csv",
+    "bottom_reversal_core": "bottom_reversal_core_candidates.csv",
+    "weak_reclaim_watch": "weak_reclaim_watch_candidates.csv",
+    "watch_fundamental_core": "watch_fundamental_core_candidates.csv",
+    "extended_above_ma200": "extended_above_ma200_candidates.csv",
+    "cyclical_value_trap": "cyclical_value_traps.csv",
+    "data_review": "data_review_candidates.csv",
+    "data_review_light": "data_review_light_candidates.csv",
+}
+
 
 def _default_collect_budget_from_env() -> int:
     """インタラクティブ・CLI --budget 未指定・collect_all の日次デフォルトなどに使用。"""
@@ -145,8 +171,51 @@ MAX_PER_CORE = float(os.getenv("MAX_PER_CORE", "60.0"))
 
 # 収益安定性（営業利益）判定
 OP_INCOME_YEARS = int(os.getenv("OP_INCOME_YEARS", "3"))                # 直近何年見るか（新しい年度順）
-OP_INCOME_DROP_FLOOR = float(os.getenv("OP_INCOME_DROP_FLOOR", "0.3"))  # 直近営業利益が過去年中央値の何倍以上ならOK
+OP_INCOME_DROP_FLOOR = float(os.getenv("OP_INCOME_DROP_FLOOR", "0.6"))  # 直近営業利益が過去年中央値の何倍以上ならOK
 EXCLUDE_OP_INCOME_DEFICIT = (os.getenv("EXCLUDE_OP_INCOME_DEFICIT", "1") != "0")  # 直近年に赤字があれば除外（デフォON）
+
+# 200日線局面・大底レーン・ファンダエッジ（環境変数で上書き可）
+MA200_CROSS_LOOKBACK_DAYS = int(os.getenv("MA200_CROSS_LOOKBACK_DAYS", "20"))
+MA200_IDEAL_MAX_DISTANCE = float(os.getenv("MA200_IDEAL_MAX_DISTANCE", "0.08"))
+MA200_EXTENDED_DISTANCE = float(os.getenv("MA200_EXTENDED_DISTANCE", "0.15"))
+MA200_BELOW_MIN_RATIO = float(os.getenv("MA200_BELOW_MIN_RATIO", "0.75"))
+
+BASING_MIN_REBOUND_FROM_LOW = float(os.getenv("BASING_MIN_REBOUND_FROM_LOW", "0.08"))
+BASING_LOOKBACK_LOW_DAYS = int(os.getenv("BASING_LOOKBACK_LOW_DAYS", "120"))
+RECENT_LOW_LOOKBACK_DAYS = int(os.getenv("RECENT_LOW_LOOKBACK_DAYS", "60"))
+RECENT_LOW_NO_UPDATE_DAYS = int(os.getenv("RECENT_LOW_NO_UPDATE_DAYS", "10"))
+
+MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY = float(os.getenv("MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY", "75"))
+MIN_PIOTROSKI_CORE = int(os.getenv("MIN_PIOTROSKI_CORE", "6"))
+MIN_PIOTROSKI_COVERAGE_CORE = float(os.getenv("MIN_PIOTROSKI_COVERAGE_CORE", "0.60"))
+
+MAX_PS_VS_SECTOR_CORE = float(os.getenv("MAX_PS_VS_SECTOR_CORE", "1.10"))
+MAX_CRITICAL_MISSING_CORE = int(os.getenv("MAX_CRITICAL_MISSING_CORE", "2"))
+MAX_STATEMENT_STALENESS_DAYS_CORE = int(os.getenv("MAX_STATEMENT_STALENESS_DAYS_CORE", "270"))
+STALE_STATEMENT_MEDIUM_DAYS = int(os.getenv("STALE_STATEMENT_MEDIUM_DAYS", "180"))
+
+WATCH_FUNDAMENTAL_EDGE_MIN = float(os.getenv("WATCH_FUNDAMENTAL_EDGE_MIN", "60"))
+MA200_RECLAIM_EDGE_MIN = float(os.getenv("MA200_RECLAIM_EDGE_MIN", "70"))
+RECLAIM_CORE_MIN_FUNDAMENTAL = float(os.getenv("RECLAIM_CORE_MIN_FUNDAMENTAL", "70"))
+WEAK_RECLAIM_MAX_FUNDAMENTAL = float(os.getenv("WEAK_RECLAIM_MAX_FUNDAMENTAL", "69"))
+WEAK_RECLAIM_MIN_FUNDAMENTAL = float(os.getenv("WEAK_RECLAIM_MIN_FUNDAMENTAL", "60"))
+EXTENDED_FUNDAMENTAL_EDGE_MIN = float(os.getenv("EXTENDED_FUNDAMENTAL_EDGE_MIN", "60"))
+
+LANE_ENTRY_CAP: Dict[str, float] = {
+    "ma200_reclaim_core": float(os.getenv("LANE_CAP_RECLAIM", "92")),
+    "bottom_reversal_core": float(os.getenv("LANE_CAP_BOTTOM", "85")),
+    "weak_reclaim_watch": float(os.getenv("LANE_CAP_WEAK_RECLAIM", "78")),
+    "watch_fundamental_core": float(os.getenv("LANE_CAP_WATCH", "75")),
+    "extended_above_ma200": float(os.getenv("LANE_CAP_EXTENDED", "65")),
+    "data_review_light": float(os.getenv("LANE_CAP_DATA_REVIEW_LIGHT", "80")),
+    "data_review": float(os.getenv("LANE_CAP_DATA_REVIEW", "70")),
+    "data_review_severe": float(os.getenv("LANE_CAP_DATA_REVIEW_SEVERE", "55")),
+    "cyclical_value_trap": float(os.getenv("LANE_CAP_CYCLICAL", "45")),
+    "excluded": float(os.getenv("LANE_CAP_EXCLUDED", "30")),
+    "satellite_valuation": float(os.getenv("LANE_CAP_SATELLITE", "72")),
+    "satellite_ps_only": float(os.getenv("LANE_CAP_SATELLITE", "72")),
+    "core": float(os.getenv("LANE_CAP_CORE_LEGACY", "88")),
+}
 
 # ------------------------------------------------------------
 # ヘルパ
@@ -945,6 +1014,19 @@ class DynamicSectorAverages:
         "情報・通信業": {"ca_ratio": 0.57, "cl_ratio": 0.32, "gpm": 0.34},
         "サービス": {"ca_ratio": 0.60, "cl_ratio": 0.35, "gpm": 0.29},
         "化学":     {"ca_ratio": 0.58, "cl_ratio": 0.37, "gpm": 0.27},
+        "小売": {"ca_ratio": 0.58, "cl_ratio": 0.38, "gpm": 0.26},
+        "卸売": {"ca_ratio": 0.55, "cl_ratio": 0.42, "gpm": 0.18},
+        "建設": {"ca_ratio": 0.62, "cl_ratio": 0.38, "gpm": 0.20},
+        "陸運": {"ca_ratio": 0.50, "cl_ratio": 0.45, "gpm": 0.15},
+        "海運": {"ca_ratio": 0.45, "cl_ratio": 0.48, "gpm": 0.22},
+        "空運": {"ca_ratio": 0.48, "cl_ratio": 0.44, "gpm": 0.18},
+        "電気・ガス": {"ca_ratio": 0.35, "cl_ratio": 0.55, "gpm": 0.25},
+        "食品": {"ca_ratio": 0.55, "cl_ratio": 0.35, "gpm": 0.28},
+        "機械": {"ca_ratio": 0.58, "cl_ratio": 0.38, "gpm": 0.28},
+        "自動車": {"ca_ratio": 0.55, "cl_ratio": 0.40, "gpm": 0.20},
+        "医薬品": {"ca_ratio": 0.58, "cl_ratio": 0.32, "gpm": 0.65},
+        "商社": {"ca_ratio": 0.52, "cl_ratio": 0.38, "gpm": 0.15},
+        "ゲーム": {"ca_ratio": 0.60, "cl_ratio": 0.35, "gpm": 0.55},
         "その他":   {"ca_ratio": 0.60, "cl_ratio": 0.40, "gpm": 0.25},
     }
 
@@ -959,19 +1041,49 @@ class DynamicSectorAverages:
         s = (sector or "").strip()
         if not s:
             return "その他"
+        # J-Quants Sector33Name（および近い表記）→ 社内セクターキー
         if "銀行" in s:
             return "銀行"
-        if "情報" in s or "通信" in s:
-            return "情報・通信業"
-        if "電気機器" in s:
-            return "電気機器"
+        if "小売業" in s or s == "小売":
+            return "小売"
+        if "卸売業" in s or s == "卸売":
+            return "卸売"
+        if "建設業" in s:
+            return "建設"
+        if "陸運業" in s or s == "陸運":
+            return "陸運"
+        if "海運業" in s or s == "海運":
+            return "海運"
+        if "空運業" in s or s == "空運":
+            return "空運"
+        if "電気・ガス業" in s or "ガス業" in s:
+            return "電気・ガス"
+        if "食料品" in s or (s.startswith("食品") and len(s) <= 4):
+            return "食品"
         if "輸送用機器" in s or "自動車" in s:
             return "自動車"
-        if "サービス" in s:
-            return "サービス"
+        if s == "機械" or "機械器具" in s:
+            return "機械"
         if "化学" in s:
             return "化学"
-        return s if s in DynamicSectorAverages.SECTOR_MEDIANS else "その他"
+        if "電気機器" in s:
+            return "電気機器"
+        if "半導体" in s:
+            return "半導体"
+        if "情報" in s or "通信" in s:
+            return "情報・通信業"
+        if "サービス業" in s or (s.endswith("サービス") and "情報" not in s):
+            return "サービス"
+        if "医薬品" in s or "製薬" in s:
+            return "医薬品"
+        if "卸売" in s and "小売" not in s:
+            return "卸売"
+        if "運輸" in s and "機器" not in s:
+            return "陸運"
+        known = DynamicSectorAverages.SECTOR_MEDIANS.keys()
+        if s in known:
+            return s
+        return "その他"
 
     @staticmethod
     def get_sector_static(stock_code: str) -> str:
@@ -1014,9 +1126,21 @@ class DynamicSectorAverages:
             '医薬品': {'ps': 3.8},
             '商社': {'ps': 0.4},
             '小売': {'ps': 0.8},
+            '卸売': {'ps': 0.35},
+            '建設': {'ps': 0.45},
+            '陸運': {'ps': 0.55},
+            '海運': {'ps': 0.5},
+            '空運': {'ps': 0.85},
+            '電気・ガス': {'ps': 0.6},
+            '食品': {'ps': 0.9},
+            '機械': {'ps': 1.1},
             'サービス': {'ps': 2.2},
             'ゲーム': {'ps': 3.5},
             '化学': {'ps': 1.0},
+            '鉄鋼': {'ps': 0.35},
+            '不動産': {'ps': 0.9},
+            'エネルギー': {'ps': 0.5},
+            '証券': {'ps': 1.8},
             'その他': {'ps': 1.5},
         }
         default = defaults.get(sector, defaults['その他'])
@@ -1048,7 +1172,11 @@ class DynamicSectorAverages:
                 pass
 
         _cli_print("📊 セクター平均: 静的デフォルト", "[セクター平均] 静的デフォルト")
-        sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+        sectors = [
+            '自動車', '半導体', '電気機器', '銀行', '情報・通信業', '医薬品', '商社',
+            '小売', '卸売', '建設', '陸運', '海運', '空運', '電気・ガス', '食品', '機械',
+            'サービス', 'ゲーム', '化学', '鉄鋼', '不動産', 'エネルギー', '証券', 'その他',
+        ]
         data = {s: self.default_sector_average(s) for s in sectors}
         cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
         self.sector_cache = data
@@ -1957,6 +2085,679 @@ def calculate_medium_term_momentum(prices: pd.Series) -> dict:
     out["momentum_3m_1m"] = _window_ret(63, 21)
     return out
 
+
+def _recent_ma200_cross_up(close: pd.Series, lookback: int) -> bool:
+    if close is None or len(close) < 200 + lookback + 2:
+        return False
+    s = close.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 200 + lookback + 2:
+        return False
+    ma200 = s.rolling(200, min_periods=200).mean()
+    for k in range(1, lookback + 1):
+        if k + 1 > len(s):
+            break
+        i = len(s) - k
+        i_prev = i - 1
+        c0 = float(s.iloc[i_prev])
+        c1 = float(s.iloc[i])
+        m0 = float(ma200.iloc[i_prev])
+        m1 = float(ma200.iloc[i])
+        if not (np.isfinite(c0) and np.isfinite(c1) and np.isfinite(m0) and np.isfinite(m1)):
+            continue
+        if c0 < m0 and c1 >= m1:
+            return True
+    return False
+
+
+def _new_low_in_last_n_days(close: pd.Series, window: int, days_back: int) -> Optional[bool]:
+    if close is None or len(close) < window + days_back + 1:
+        return None
+    s = close.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < window + days_back + 1:
+        return None
+    for k in range(days_back):
+        i = len(s) - 1 - k
+        if i < window:
+            return None
+        prior = s.iloc[i - window : i]
+        if len(prior) < window:
+            return None
+        if float(s.iloc[i]) <= float(prior.min()):
+            return True
+    return False
+
+
+def _ma_slope_ratio(ma_series: pd.Series, lookback: int) -> Optional[float]:
+    if ma_series is None or len(ma_series) < lookback + 2:
+        return None
+    last = float(ma_series.iloc[-1])
+    prev = float(ma_series.iloc[-1 - lookback])
+    if not (np.isfinite(last) and np.isfinite(prev)) or prev == 0:
+        return None
+    return (last - prev) / abs(prev)
+
+
+def _adx_compare_recent(high: pd.Series, low: pd.Series, close: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+    """直近終値のADXと、5本前までを除いた終値のADX（低下傾向の判定用）。"""
+    adx_now: Optional[float] = None
+    adx_prev: Optional[float] = None
+    try:
+        if len(close) >= 30:
+            adx_now, _, _ = calculate_adx_and_di(high, low, close)
+        if len(close) >= 35:
+            adx_prev, _, _ = calculate_adx_and_di(high.iloc[:-5], low.iloc[:-5], close.iloc[:-5])
+    except Exception:
+        return None, None
+    return adx_now, adx_prev
+
+
+def evaluate_ma200_entry_state(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    *,
+    adx: Optional[float] = None,
+    plus_di: Optional[float] = None,
+    minus_di: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    200日線を「単純除外」ではなく局面分類に使用。計算不能は None / False 相当で ma200_unknown へ。
+    """
+    empty = {
+        "ma200_state": "ma200_unknown",
+        "ma200_timing_score": 0.0,
+        "ma200_risk_penalty": 0.0,
+        "ma200_reason": "insufficient_price_history",
+        "distance_from_ma200": None,
+        "crossed_above_ma200_recently": False,
+        "below_ma200_basing": False,
+        "below_ma200_downtrend": False,
+        "above_ma200_extended": False,
+        "recent_60d_low_update": None,
+    }
+    if close is None or len(close) < 200:
+        return empty
+
+    s = close.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    hi = high.reindex(s.index).astype(float).replace([np.inf, -np.inf], np.nan)
+    lo = low.reindex(s.index).astype(float).replace([np.inf, -np.inf], np.nan)
+    if len(s) < 200:
+        return empty
+
+    current_price = float(s.iloc[-1])
+    ma200_s = s.rolling(200, min_periods=200).mean()
+    ma25_s = s.rolling(25, min_periods=25).mean()
+    ma200 = float(ma200_s.iloc[-1])
+    ma25 = float(ma25_s.iloc[-1]) if len(s) >= 25 and np.isfinite(ma25_s.iloc[-1]) else None
+    if not np.isfinite(ma200) or ma200 <= 0 or not np.isfinite(current_price):
+        out = dict(empty)
+        out["ma200_reason"] = "ma200_not_finite"
+        return out
+
+    distance_from_ma200 = float(current_price / ma200 - 1.0)
+    crossed = _recent_ma200_cross_up(s, MA200_CROSS_LOOKBACK_DAYS)
+    mom = calculate_medium_term_momentum(s)
+    ret_20 = mom.get("return_21d")
+    ma25_slope = _ma_slope_ratio(ma25_s, 20) if len(s) >= 45 else None
+
+    adx_now, adx_prev = _adx_compare_recent(hi, lo, s)
+    adx_use = adx if (adx is not None and np.isfinite(adx)) else adx_now
+    adx_falling = (
+        adx_use is not None
+        and adx_prev is not None
+        and np.isfinite(adx_use)
+        and np.isfinite(adx_prev)
+        and float(adx_use) < float(adx_prev)
+    )
+    adx_high = bool(adx_use is not None and np.isfinite(adx_use) and float(adx_use) > 35.0)
+
+    ratio_pm = None
+    if (
+        plus_di is not None
+        and minus_di is not None
+        and np.isfinite(plus_di)
+        and np.isfinite(minus_di)
+        and float(plus_di) > 0
+    ):
+        ratio_pm = float(minus_di) / float(plus_di)
+
+    new_60_low = _new_low_in_last_n_days(s, RECENT_LOW_LOOKBACK_DAYS, RECENT_LOW_NO_UPDATE_DAYS)
+    low120 = float(s.tail(min(BASING_LOOKBACK_LOW_DAYS, len(s))).min())
+    low60 = float(s.tail(min(RECENT_LOW_LOOKBACK_DAYS, len(s))).min())
+    rebound_from_120 = (current_price / low120 - 1.0) if low120 > 0 else None
+
+    cond_below = current_price < ma200
+    cond_above = current_price > ma200
+
+    downtrend = False
+    dt_reasons: list[str] = []
+    if ma25 is not None and np.isfinite(ma25):
+        if current_price < ma25 and ma25_slope is not None and ma25_slope < 0:
+            downtrend = True
+            dt_reasons.append("price_below_ma25_and_ma25_slope_negative")
+    if new_60_low is True:
+        downtrend = True
+        dt_reasons.append("new_60d_low_recent")
+    if ret_20 is not None and np.isfinite(ret_20) and ret_20 < 0:
+        downtrend = True
+        dt_reasons.append("return_20d_negative")
+    if (
+        ratio_pm is not None
+        and adx_use is not None
+        and np.isfinite(adx_use)
+        and ratio_pm > 1.3
+        and float(adx_use) >= 20.0
+    ):
+        downtrend = True
+        dt_reasons.append("minus_di_dominant_adx_strong")
+    if distance_from_ma200 < (MA200_BELOW_MIN_RATIO - 1.0):
+        downtrend = True
+        dt_reasons.append("deep_below_ma200")
+
+    basing = False
+    bs_reasons: list[str] = []
+    if cond_below and not downtrend:
+        ok_ratio = distance_from_ma200 >= (MA200_BELOW_MIN_RATIO - 1.0)
+        ok_ma25 = (ma25 is not None and current_price > ma25) or (
+            ma25_slope is not None and ma25_slope > 0
+        )
+        ok_ret = ret_20 is not None and np.isfinite(ret_20) and ret_20 > 0
+        ok_no_60 = new_60_low is False
+        ok_rebound = (
+            rebound_from_120 is not None
+            and np.isfinite(rebound_from_120)
+            and rebound_from_120 >= BASING_MIN_REBOUND_FROM_LOW
+        )
+        ok_adx = (not adx_high) or adx_falling
+        ok_di = ratio_pm is None or ratio_pm <= 1.2
+        ok_struct = low60 > low120 * 1.0001
+        basing = bool(
+            ok_ratio
+            and ok_ma25
+            and ok_ret
+            and ok_no_60
+            and ok_rebound
+            and ok_adx
+            and ok_di
+            and ok_struct
+        )
+        if basing:
+            bs_reasons.append("basing_pattern")
+
+    ma200_state = "ma200_unknown"
+    reason = ""
+    timing = 35.0
+    risk_pen = 0.0
+    above_ext = False
+    below_base_flag = False
+    below_dt_flag = False
+
+    if cond_above:
+        if crossed:
+            ma200_state = "ma200_reclaim"
+            reason = "cross_up_recent_below_to_above_ma200"
+            ideal_lo = 0.0
+            ideal_hi = MA200_IDEAL_MAX_DISTANCE
+            if ideal_lo <= distance_from_ma200 <= ideal_hi:
+                timing = 95.0
+            elif distance_from_ma200 > MA200_EXTENDED_DISTANCE:
+                timing = 55.0
+                risk_pen += 8.0
+            else:
+                timing = 78.0
+        elif distance_from_ma200 > MA200_EXTENDED_DISTANCE:
+            ma200_state = "above_ma200_extended"
+            above_ext = True
+            reason = "extended_above_ma200"
+            timing = 40.0
+            risk_pen = 12.0 + min(18.0, max(0.0, distance_from_ma200 - MA200_EXTENDED_DISTANCE) * 60.0)
+        else:
+            ma200_state = "above_ma200_near"
+            reason = "above_ma200_not_recent_cross"
+            timing = 70.0
+            if distance_from_ma200 > MA200_IDEAL_MAX_DISTANCE:
+                risk_pen += 4.0
+    elif cond_below:
+        below_dt_flag = bool(downtrend)
+        below_base_flag = bool(basing)
+        if downtrend:
+            ma200_state = "below_ma200_downtrend"
+            reason = ";".join(dt_reasons) if dt_reasons else "below_ma200_downtrend"
+            timing = 15.0
+            risk_pen = 20.0
+        elif basing:
+            ma200_state = "below_ma200_basing"
+            reason = ";".join(bs_reasons) if bs_reasons else "below_ma200_basing"
+            timing = 55.0
+            risk_pen = 6.0
+        else:
+            ma200_state = "below_ma200_downtrend"
+            reason = "below_ma200_unconfirmed_not_basing"
+            below_dt_flag = True
+            timing = 22.0
+            risk_pen = 14.0
+
+    return {
+        "ma200_state": ma200_state,
+        "ma200_timing_score": round(float(timing), 2),
+        "ma200_risk_penalty": round(float(risk_pen), 2),
+        "ma200_reason": reason,
+        "distance_from_ma200": round(float(distance_from_ma200), 5) if np.isfinite(distance_from_ma200) else None,
+        "crossed_above_ma200_recently": bool(crossed),
+        "below_ma200_basing": bool(below_base_flag),
+        "below_ma200_downtrend": bool(below_dt_flag),
+        "above_ma200_extended": bool(above_ext),
+        "recent_60d_low_update": new_60_low,
+    }
+
+
+def _ps_vs_sector_ratio(ps: Optional[float], sector_ps_benchmark: Optional[float], sector_med: Optional[float]) -> Optional[float]:
+    med = sector_ps_benchmark
+    if med is None or (isinstance(med, float) and (not np.isfinite(med) or med <= 0)):
+        med = sector_med
+    if ps is None or med is None or (not np.isfinite(ps)) or (not np.isfinite(med)) or med <= 0:
+        return None
+    return float(ps) / float(med)
+
+
+def compute_fundamental_edge_score(
+    *,
+    ps_ratio: Optional[float],
+    ps_vs_sector: Optional[float],
+    reference_peg: Optional[float],
+    eps_growth_rate: Optional[float],
+    piot: dict,
+    peg_quality: dict,
+    op_income_stable: Optional[bool],
+    sales_cagr: Optional[float],
+    per: Optional[float],
+    critical_missing_count: int,
+    statement_basis_used: Optional[str],
+    statement_staleness_days: Optional[float],
+) -> float:
+    """ファンダ優先の 0〜100 スコア（total_score とは別軸）。"""
+    s = 0.0
+    if ps_ratio is not None and np.isfinite(ps_ratio) and ps_ratio > 0:
+        if ps_ratio <= 0.35:
+            s += 18.0
+        elif ps_ratio <= 0.7:
+            s += 15.0
+        elif ps_ratio <= 1.2:
+            s += 11.0
+        elif ps_ratio <= MAX_PS_DEFENSIVE:
+            s += 7.0
+        else:
+            s += 3.0
+
+    if ps_vs_sector is not None and np.isfinite(ps_vs_sector):
+        if ps_vs_sector <= 0.55:
+            s += 22.0
+        elif ps_vs_sector <= 0.8:
+            s += 18.0
+        elif ps_vs_sector <= 1.0:
+            s += 14.0
+        elif ps_vs_sector <= MAX_PS_VS_SECTOR_CORE:
+            s += 9.0
+        else:
+            s += 3.0
+
+    pt = peg_quality.get("peg_trusted")
+    pw = str(peg_quality.get("peg_warning") or "")
+    if pt is True and pw == "ok":
+        s += 14.0
+    elif pt is True and pw == "expensive_or_moderate":
+        s += 8.0
+    elif pt == "caution":
+        s += 5.0
+    else:
+        s += 1.0
+
+    eff = piot.get("piotroski_effective_score")
+    cov = piot.get("piotroski_coverage_ratio")
+    if eff is not None and np.isfinite(eff):
+        w = 22.0
+        if cov is not None and np.isfinite(cov):
+            w *= 0.65 + 0.35 * min(1.0, float(cov) / 0.85)
+        s += min(22.0, float(eff) / 9.0 * w)
+    if op_income_stable is True:
+        s += 9.0
+    elif op_income_stable is None:
+        s += 2.0
+
+    if sales_cagr is not None and np.isfinite(sales_cagr):
+        if sales_cagr >= 0.15:
+            s += 6.0
+        elif sales_cagr >= 0.08:
+            s += 4.0
+        elif sales_cagr >= 0.0:
+            s += 2.5
+    if eps_growth_rate is not None and np.isfinite(eps_growth_rate):
+        eg = float(eps_growth_rate)
+        if 5.0 <= eg <= 45.0:
+            s += 5.0
+        elif eg > 45.0 and eg <= 80.0:
+            s += 2.0
+
+    # 低PS・セクター割安だけが効いていて実体（Piotroski）が弱い場合の切り上げ抑制
+    adj_q = piot.get("piotroski_adjusted_score")
+    val_screen_heavy = False
+    if ps_vs_sector is not None and np.isfinite(ps_vs_sector) and float(ps_vs_sector) <= 0.72:
+        val_screen_heavy = True
+    if ps_ratio is not None and np.isfinite(ps_ratio) and float(ps_ratio) <= 0.65:
+        val_screen_heavy = True
+    if val_screen_heavy and adj_q is not None and np.isfinite(float(adj_q)) and float(adj_q) < 6.0:
+        if pt is not True or pw != "ok":
+            s -= 14.0
+
+    if per is not None and np.isfinite(per):
+        if per > 120:
+            s -= 6.0
+        elif per > 90:
+            s -= 3.0
+
+    if critical_missing_count > 0:
+        s -= min(18.0, 3.5 * max(0, critical_missing_count - 1))
+    if (statement_basis_used or "") != "annual":
+        s -= 10.0
+    if statement_staleness_days is not None and np.isfinite(statement_staleness_days):
+        if statement_staleness_days > float(MAX_STATEMENT_STALENESS_DAYS_CORE):
+            s -= 10.0
+        elif statement_staleness_days > 200:
+            s -= 4.0
+    if piot.get("piotroski_confidence_low"):
+        s -= 6.0
+
+    raw_adj = piot.get("piotroski_raw_score")
+    if raw_adj is None:
+        raw_adj = piot.get("score")
+    adj_adj = piot.get("piotroski_adjusted_score")
+    if adj_adj is not None and np.isfinite(float(adj_adj)) and float(adj_adj) < 5.0:
+        s -= 15.0
+    if raw_adj is not None and np.isfinite(float(raw_adj)) and int(float(raw_adj)) <= 3:
+        s -= 12.0
+
+    return float(round(max(0.0, min(100.0, s)), 2))
+
+
+def compute_entry_score(fundamental_edge: float, ma_eval: dict) -> float:
+    st = str(ma_eval.get("ma200_state") or "ma200_unknown")
+    bonuses = {
+        "ma200_reclaim": 15.0,
+        "below_ma200_basing": 8.0,
+        "above_ma200_near": 5.0,
+        "above_ma200_extended": -10.0,
+        "below_ma200_downtrend": -25.0,
+        "ma200_unknown": -5.0,
+    }
+    out = float(fundamental_edge) + bonuses.get(st, -5.0)
+    dist = ma_eval.get("distance_from_ma200")
+    if dist is not None and np.isfinite(dist):
+        if st in ("ma200_reclaim", "above_ma200_near", "above_ma200_extended") and dist > MA200_IDEAL_MAX_DISTANCE:
+            out -= min(14.0, max(0.0, (float(dist) - MA200_IDEAL_MAX_DISTANCE) * 65.0))
+    return float(round(max(0.0, min(100.0, out)), 2))
+
+
+def _piot_raw_int(piot: Optional[dict]) -> Optional[int]:
+    if not piot:
+        return None
+    v = piot.get("piotroski_raw_score")
+    if v is None:
+        v = piot.get("score")
+    try:
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return None
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _piot_adj_float(piot: Optional[dict]) -> Optional[float]:
+    if not piot:
+        return None
+    v = piot.get("piotroski_adjusted_score")
+    try:
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_data_review_meta(
+    *,
+    critical_missing_count: int,
+    statement_basis_used: Optional[str],
+    fallback_basis_flag: bool,
+    piot_coverage: Optional[float],
+    statement_staleness_days: Optional[float],
+    financial_data_mode: Optional[str],
+    fins_details_available: Optional[bool],
+    sector_normalized: str,
+    sector33_raw: Optional[str],
+    piot_adjusted: Optional[float],
+    piot_raw: Optional[float],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    levels: list[int] = []
+
+    def add(reason: str, lvl: int) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+        levels.append(lvl)
+
+    if (statement_basis_used or "") != "annual" or fallback_basis_flag:
+        add("statement_basis_fallback", 1)
+    if critical_missing_count > MAX_CRITICAL_MISSING_CORE:
+        add("critical_missing_too_many", 2)
+    if (
+        piot_coverage is not None
+        and np.isfinite(float(piot_coverage))
+        and float(piot_coverage) < MIN_PIOTROSKI_COVERAGE_CORE
+    ):
+        add("piotroski_coverage_low", 1)
+    fdm = (financial_data_mode or "").strip().lower()
+    if fdm == "summary_only":
+        add("summary_only_financials", 1)
+    elif fins_details_available is False and fdm and "summary" in fdm:
+        add("summary_only_financials", 1)
+    sn = (sector33_raw or "").strip()
+    if sector_normalized == "その他" and (not sn):
+        add("sector_unknown", 1)
+    if piot_adjusted is not None and np.isfinite(float(piot_adjusted)) and float(piot_adjusted) < 4.0:
+        add("piotroski_too_low", 2)
+    if statement_staleness_days is not None and np.isfinite(float(statement_staleness_days)):
+        sd = float(statement_staleness_days)
+        if sd > float(MAX_STATEMENT_STALENESS_DAYS_CORE):
+            add("stale_statement", 2)
+        elif sd > float(STALE_STATEMENT_MEDIUM_DAYS):
+            add("stale_statement", 1)
+    if piot_raw is not None and np.isfinite(float(piot_raw)) and int(float(piot_raw)) <= 3:
+        add("piotroski_raw_weak", 1)
+
+    if not reasons:
+        return {
+            "has_issues": False,
+            "data_review_level": "",
+            "data_review_reason": "",
+            "data_review_reasons": [],
+        }
+
+    mx = max(levels)
+    if set(reasons) <= {"summary_only_financials"} and (
+        piot_coverage is None
+        or (
+            np.isfinite(float(piot_coverage))
+            and float(piot_coverage) >= MIN_PIOTROSKI_COVERAGE_CORE
+        )
+    ):
+        final_level = "light"
+    elif mx >= 2:
+        final_level = "severe"
+    elif mx >= 1:
+        final_level = "medium"
+    else:
+        final_level = "light"
+
+    return {
+        "has_issues": True,
+        "data_review_level": final_level,
+        "data_review_reason": ",".join(reasons),
+        "data_review_reasons": reasons,
+    }
+
+
+def cap_entry_score(raw: float, lane: str, dr_meta: dict) -> float:
+    cap = float(LANE_ENTRY_CAP.get(lane, 88.0))
+    if lane == "data_review":
+        dl = dr_meta.get("data_review_level")
+        if dl == "severe":
+            cap = min(cap, float(LANE_ENTRY_CAP["data_review_severe"]))
+        elif dl == "medium":
+            cap = min(cap, float(LANE_ENTRY_CAP["data_review"]))
+    return float(round(min(float(raw), cap), 2))
+
+
+def assign_entry_candidate_lane(
+    *,
+    fundamental_edge: float,
+    ma_eval: dict,
+    peg_quality: dict,
+    eps_growth_rate: Optional[float],
+    op_income_stable: Optional[bool],
+    op_income_yoy: Optional[float],
+    piot: dict,
+    ret_21d: Optional[float],
+    dr_meta: dict,
+    valuation_satellite_candidate: bool,
+    ps_only_satellite_candidate: bool,
+    buy_timing_gate: bool,
+    downtrend_rejection_gate: bool,
+) -> str:
+    """推奨レーン（CSV・MD 用）。data_review_* は dr_meta と整合させる。"""
+    pw = str(peg_quality.get("peg_warning") or "")
+    peg_extreme = pw in ("extremely_low_possible_oneoff", "very_low_check_cyclical")
+    peg_reclaim_bad = pw in ("extremely_low_possible_oneoff", "eps_growth_too_high_oneoff_risk")
+    eps_spike = eps_growth_rate is not None and np.isfinite(eps_growth_rate) and float(eps_growth_rate) > 80.0
+    op_bad = op_income_stable is False or (
+        op_income_yoy is not None and np.isfinite(op_income_yoy) and float(op_income_yoy) < 0
+    )
+    cyclical_trap = (peg_extreme or eps_spike) and op_bad
+
+    raw_i = _piot_raw_int(piot)
+    adj_f = _piot_adj_float(piot)
+    cov = piot.get("piotroski_coverage_ratio")
+    cov_f = float(cov) if cov is not None and np.isfinite(float(cov)) else None
+
+    st = str(ma_eval.get("ma200_state") or "")
+    r60 = ma_eval.get("recent_60d_low_update")
+
+    dr_lvl = str(dr_meta.get("data_review_level") or "")
+    dr_bad = bool(dr_meta.get("has_issues")) and dr_lvl in ("medium", "severe")
+    dr_light_only = bool(dr_meta.get("has_issues")) and dr_lvl == "light"
+
+    reclaim_quality = (
+        op_income_stable is True
+        and not peg_reclaim_bad
+        and adj_f is not None
+        and adj_f >= 6.0
+        and cov_f is not None
+        and cov_f >= MIN_PIOTROSKI_COVERAGE_CORE
+        and raw_i is not None
+        and raw_i > 3
+    )
+
+    bottom_quality = (
+        reclaim_quality
+        and adj_f is not None
+        and adj_f >= 6.5
+        and ret_21d is not None
+        and np.isfinite(ret_21d)
+        and float(ret_21d) > 0
+        and r60 is False
+    )
+
+    if cyclical_trap:
+        return "cyclical_value_trap"
+
+    if adj_f is not None and np.isfinite(adj_f) and float(adj_f) < 4.0:
+        return "data_review"
+
+    if dr_bad:
+        return "data_review"
+
+    if downtrend_rejection_gate:
+        return "excluded"
+
+    if raw_i is not None and raw_i <= 3:
+        return "data_review"
+
+    if (
+        st == "ma200_reclaim"
+        and (not downtrend_rejection_gate)
+        and reclaim_quality
+        and fundamental_edge >= RECLAIM_CORE_MIN_FUNDAMENTAL
+        and (not dr_meta.get("has_issues"))
+    ):
+        return "ma200_reclaim_core"
+
+    if (
+        st == "ma200_reclaim"
+        and (not downtrend_rejection_gate)
+        and reclaim_quality
+        and fundamental_edge >= RECLAIM_CORE_MIN_FUNDAMENTAL
+        and dr_light_only
+    ):
+        return "data_review_light"
+
+    if (
+        st == "ma200_reclaim"
+        and (not downtrend_rejection_gate)
+        and reclaim_quality
+        and WEAK_RECLAIM_MIN_FUNDAMENTAL <= fundamental_edge < RECLAIM_CORE_MIN_FUNDAMENTAL
+        and (not dr_bad)
+    ):
+        return "weak_reclaim_watch"
+
+    if (
+        fundamental_edge >= MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY
+        and st == "below_ma200_basing"
+        and ma_eval.get("below_ma200_downtrend") is not True
+        and op_income_stable is True
+        and (not downtrend_rejection_gate)
+        and bottom_quality
+    ):
+        return "bottom_reversal_core"
+
+    if (
+        st == "above_ma200_extended"
+        and fundamental_edge >= EXTENDED_FUNDAMENTAL_EDGE_MIN
+        and raw_i is not None
+        and raw_i > 3
+        and adj_f is not None
+        and adj_f >= 5.0
+        and (not dr_bad)
+    ):
+        return "extended_above_ma200"
+
+    if (
+        fundamental_edge >= WATCH_FUNDAMENTAL_EDGE_MIN
+        and (not buy_timing_gate)
+        and st not in ("above_ma200_extended",)
+        and raw_i is not None
+        and raw_i > 3
+        and (not dr_bad)
+    ):
+        return "watch_fundamental_core"
+
+    if dr_light_only:
+        return "data_review_light"
+
+    if valuation_satellite_candidate or ps_only_satellite_candidate:
+        return "satellite_valuation"
+
+    return "excluded"
+
+
 def compute_sales_cagr(history: List[dict], years: int = 3) -> Optional[float]:
     if not history or len(history) <= years:
         return None
@@ -2202,6 +3003,28 @@ def calculate_piotroski_real(fin: dict) -> dict:
     observed_score = sum(1 for v in comp.values() if v is True)
     coverage_ratio = (observed_items / possible_items) if possible_items else None
 
+    if observed_items == 0:
+        piotroski_adjusted_score = None
+    else:
+        piotroski_adjusted_score = round(float(observed_score) / float(observed_items) * 9.0, 3)
+    conf_mult = 1.0
+    if coverage_ratio is not None and np.isfinite(coverage_ratio):
+        conf_mult = 0.55 + 0.45 * min(1.0, float(coverage_ratio) / 0.80)
+    piotroski_effective_score = (
+        None if piotroski_adjusted_score is None else round(piotroski_adjusted_score * conf_mult, 3)
+    )
+    piotroski_quality_positive = False
+    if piotroski_adjusted_score is not None:
+        piotroski_quality_positive = bool(
+            observed_score >= MIN_PIOTROSKI_CORE
+            or piotroski_adjusted_score >= 6.5
+        )
+    piotroski_confidence_low = (
+        coverage_ratio is not None
+        and np.isfinite(coverage_ratio)
+        and float(coverage_ratio) < MIN_PIOTROSKI_COVERAGE_CORE
+    )
+
     base_eval = (
         "優秀" if observed_score >= 7 else "良好" if observed_score >= 5 else "普通" if observed_score >= 3 else "注意"
     )
@@ -2212,6 +3035,13 @@ def calculate_piotroski_real(fin: dict) -> dict:
 
     return {
         "score": observed_score,
+        "piotroski_raw_score": observed_score,
+        "piotroski_available_items": observed_items,
+        "piotroski_coverage_ratio": coverage_ratio,
+        "piotroski_adjusted_score": piotroski_adjusted_score,
+        "piotroski_effective_score": piotroski_effective_score,
+        "piotroski_quality_positive": piotroski_quality_positive,
+        "piotroski_confidence_low": piotroski_confidence_low,
         "details": comp,
         "evaluation": evaluation,
         "mode": "real",
@@ -2259,6 +3089,47 @@ def calculate_peg_ratio(per: Optional[float], eps_growth_rate_pct: Optional[floa
         return peg
     except Exception:
         return None
+
+def evaluate_peg_quality(
+    reference_peg: Optional[float],
+    eps_growth_rate: Optional[float],
+) -> dict:
+    """PEG の信頼区間と警告理由（総合スコア直結はせず、ファンダエッジ・レーン判定に使用）。"""
+    def _bad_num(x: Optional[float]) -> bool:
+        return x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x)))
+
+    out: dict[str, Any] = {"peg_trusted": False, "peg_warning": "missing"}
+    if _bad_num(reference_peg):
+        return out
+    rp = float(reference_peg)
+    if rp <= 0:
+        out["peg_warning"] = "non_positive"
+        return out
+    if rp < 0.10:
+        out["peg_warning"] = "extremely_low_possible_oneoff"
+        return out
+    if 0.10 <= rp < 0.30:
+        if _bad_num(eps_growth_rate):
+            out["peg_warning"] = "eps_growth_missing"
+            return out
+        out["peg_trusted"] = "caution"
+        out["peg_warning"] = "very_low_check_cyclical"
+        return out
+    if _bad_num(eps_growth_rate):
+        out["peg_warning"] = "eps_growth_missing"
+        return out
+    eg = float(eps_growth_rate)
+    if eg > 80.0:
+        out["peg_warning"] = "eps_growth_too_high_oneoff_risk"
+        return out
+    if 0.30 <= rp <= 1.20:
+        out["peg_trusted"] = True
+        out["peg_warning"] = "ok"
+        return out
+    out["peg_trusted"] = True
+    out["peg_warning"] = "expensive_or_moderate"
+    return out
+
 
 def estimate_eps_growth_rate(net_income_current: Optional[float],
                              net_income_previous: Optional[float],
@@ -2522,8 +3393,9 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                                      ) -> dict:
     try:
         fdm = FinancialDataManager(session)
-        sector_raw = sector_hint or DynamicSectorAverages.get_sector_static(code)
-        sector = DynamicSectorAverages.normalize_sector(sector_raw)
+        sector33_raw = (sector_hint or "").strip() or None
+        sector_src = sector33_raw or DynamicSectorAverages.get_sector_static(code)
+        sector = DynamicSectorAverages.normalize_sector(str(sector_src or ""))
         fc = FrozenCache()
         fin_meta_src: Dict[str, Any] = {}
         inst_t = (instrument_type or "stock").strip() or "stock"
@@ -2569,6 +3441,20 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         mas = calculate_moving_averages(close) if len(close) else {}
         rsi = float(calculate_rsi(close)) if len(close) else None
         adx, plus_di, minus_di = calculate_adx_and_di(high, low, close) if len(close) else (None, None, None)
+        ma200_eval = evaluate_ma200_entry_state(
+            close, high, low, adx=adx, plus_di=plus_di, minus_di=minus_di,
+        ) if len(close) else {
+            "ma200_state": "ma200_unknown",
+            "ma200_timing_score": 0.0,
+            "ma200_risk_penalty": 0.0,
+            "ma200_reason": "insufficient_price_history",
+            "distance_from_ma200": None,
+            "crossed_above_ma200_recently": False,
+            "below_ma200_basing": False,
+            "below_ma200_downtrend": False,
+            "above_ma200_extended": False,
+            "recent_60d_low_update": None,
+        }
         cur_vol, avg_vol = calculate_volatility(close) if len(close) else (None, None)
         momentum = calculate_medium_term_momentum(close) if len(close) else {}
 
@@ -2615,7 +3501,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 
         sector_benchmark = (
             sector_averages.get(sector)
-            or sector_averages.get(sector_raw or "")
+            or sector_averages.get(sector_src or "")
             or DynamicSectorAverages.default_sector_average(sector)
         ) if isinstance(sector_averages, dict) else DynamicSectorAverages.default_sector_average(sector)
 
@@ -2629,6 +3515,9 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             shares_outstanding=raw_fin["current"].get("shares_outstanding"),
             shares_outstanding_previous=raw_fin["previous"].get("shares_outstanding"),
         )
+        peg_quality = evaluate_peg_quality(val.get("reference_peg"), val.get("eps_growth_rate"))
+        val["peg_trusted"] = peg_quality.get("peg_trusted")
+        val["peg_warning"] = peg_quality.get("peg_warning")
         eps_growth_for_scoring = val.get("eps_growth_rate")
         safety = calculate_safety_score_v3(
             yoy_eps_growth=eps_growth_for_scoring,
@@ -2800,6 +3689,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "growth_proxy_detached_from_scoring": False,
             "imputation": imputation,
             "critical_missing_count": critical_missing,
+            "sector33_name_raw": sector33_raw,
             "raw_financial_fields": {
                 "has_current_shares": raw_fin["current"].get("shares_outstanding") is not None,
                 "has_previous_net_income": raw_fin["previous"].get("net_income") is not None,
@@ -2822,13 +3712,81 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         satellite_candidate = bool(valuation_satellite_candidate or ps_only_satellite_candidate)
         excluded_candidate = bool((not core_candidate) and (not satellite_candidate))
         if core_candidate:
-            candidate_lane = "core"
+            valuation_lane = "core"
         elif valuation_satellite_candidate:
-            candidate_lane = "satellite_valuation"
+            valuation_lane = "satellite_valuation"
         elif ps_only_satellite_candidate:
-            candidate_lane = "satellite_ps_only"
+            valuation_lane = "satellite_ps_only"
         else:
-            candidate_lane = "excluded"
+            valuation_lane = "excluded"
+
+        op_income_yoy_pct = None
+        try:
+            _opc = raw_fin["current"].get("operating_income")
+            _opp = raw_fin["previous"].get("operating_income")
+            if _opc is not None and _opp is not None and float(_opp) != 0:
+                op_income_yoy_pct = (float(_opc) / float(_opp) - 1.0) * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            op_income_yoy_pct = None
+
+        ps_vs_sector_pre = _ps_vs_sector_ratio(ps_ratio, sector_ps_benchmark, None)
+        _op_stable_tri = op_income_eval.get("stable")
+        fundamental_edge_score = compute_fundamental_edge_score(
+            ps_ratio=ps_ratio,
+            ps_vs_sector=ps_vs_sector_pre,
+            reference_peg=val.get("reference_peg"),
+            eps_growth_rate=val.get("eps_growth_rate"),
+            piot=piot if isinstance(piot, dict) else {},
+            peg_quality=peg_quality,
+            op_income_stable=_op_stable_tri if _op_stable_tri is not None else None,
+            sales_cagr=sales_cagr,
+            per=per,
+            critical_missing_count=critical_missing,
+            statement_basis_used=statement_basis_used,
+            statement_staleness_days=float(statement_staleness_days) if statement_staleness_days is not None else None,
+        )
+        _pr_meta = piot.get("piotroski_raw_score")
+        if _pr_meta is None:
+            _pr_meta = piot.get("score")
+        dr_meta = compute_data_review_meta(
+            critical_missing_count=critical_missing,
+            statement_basis_used=statement_basis_used,
+            fallback_basis_flag=(statement_basis_used == "fallback_primary_type"),
+            piot_coverage=piot.get("piotroski_coverage_ratio") if isinstance(piot, dict) else None,
+            statement_staleness_days=float(statement_staleness_days) if statement_staleness_days is not None else None,
+            financial_data_mode=fin_diag.get("financial_data_mode"),
+            fins_details_available=fin_diag.get("fins_details_available"),
+            sector_normalized=sector,
+            sector33_raw=sector33_raw,
+            piot_adjusted=piot.get("piotroski_adjusted_score") if isinstance(piot, dict) else None,
+            piot_raw=float(_pr_meta) if _pr_meta is not None and np.isfinite(float(_pr_meta)) else None,
+        )
+        buy_timing_gate = bool(
+            (str(ma200_eval.get("ma200_state")) == "ma200_reclaim")
+            or (
+                str(ma200_eval.get("ma200_state")) == "below_ma200_basing"
+                and fundamental_edge_score >= MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY
+            )
+            or (str(ma200_eval.get("ma200_state")) == "above_ma200_near")
+        )
+        downtrend_rejection_gate = bool(ma200_eval.get("below_ma200_downtrend"))
+        _entry_raw = compute_entry_score(fundamental_edge_score, ma200_eval)
+        entry_candidate_lane = assign_entry_candidate_lane(
+            fundamental_edge=fundamental_edge_score,
+            ma_eval=ma200_eval,
+            peg_quality=peg_quality,
+            eps_growth_rate=val.get("eps_growth_rate"),
+            op_income_stable=_op_stable_tri if _op_stable_tri is not None else None,
+            op_income_yoy=op_income_yoy_pct,
+            piot=piot if isinstance(piot, dict) else {},
+            ret_21d=momentum.get("return_21d"),
+            dr_meta=dr_meta,
+            valuation_satellite_candidate=valuation_satellite_candidate,
+            ps_only_satellite_candidate=ps_only_satellite_candidate,
+            buy_timing_gate=buy_timing_gate,
+            downtrend_rejection_gate=downtrend_rejection_gate,
+        )
+        entry_score = cap_entry_score(_entry_raw, entry_candidate_lane, dr_meta)
 
         filter_details = {
             "liquidity_ok": liquidity_ok,
@@ -2847,7 +3805,15 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "valuation_satellite_candidate": valuation_satellite_candidate,
             "ps_only_satellite_candidate": ps_only_satellite_candidate,
             "ps_satellite_limit": ps_satellite_limit,
-            "candidate_lane": candidate_lane,
+            "valuation_lane": valuation_lane,
+            "candidate_lane": valuation_lane,
+            "entry_candidate_lane": entry_candidate_lane,
+            "fundamental_edge_score": fundamental_edge_score,
+            "entry_score": entry_score,
+            "buy_timing_gate": buy_timing_gate,
+            "downtrend_rejection_gate": downtrend_rejection_gate,
+            "data_review_reason": dr_meta.get("data_review_reason"),
+            "data_review_level": dr_meta.get("data_review_level"),
             "excluded_candidate": excluded_candidate,
             "thresholds": {
                 "MIN_AVG_VOLUME_30D": MIN_AVG_VOLUME_30D,
@@ -2895,13 +3861,25 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "sector_benchmark": sector_benchmark,
             "diagnostics": diagnostics,
             "filters": filter_details,
-            "candidate_lane": candidate_lane,
+            "candidate_lane": entry_candidate_lane,
+            "valuation_lane": valuation_lane,
+            "fundamental_edge_score": fundamental_edge_score,
+            "entry_score": entry_score,
+            "ma200_evaluation": ma200_eval,
+            "peg_warning": peg_quality.get("peg_warning"),
+            "peg_quality": peg_quality,
+            "buy_timing_gate": buy_timing_gate,
+            "downtrend_rejection_gate": downtrend_rejection_gate,
+            "op_income_yoy_pct": op_income_yoy_pct,
+            "ps_vs_sector_pre": ps_vs_sector_pre,
             "ps_satellite_limit": ps_satellite_limit,
             "financial_data_mode": fin_diag.get("financial_data_mode"),
             "fins_details_available": fin_diag.get("fins_details_available"),
             "fins_details_status": fin_diag.get("fins_details_status"),
             "fins_details_error": fin_diag.get("fins_details_error"),
             "instrument_type": inst_t,
+            "data_review_reason": dr_meta.get("data_review_reason"),
+            "data_review_level": dr_meta.get("data_review_level"),
         }
     except Exception as e:
         return {
@@ -3190,7 +4168,17 @@ def _extract_filters(d: dict) -> dict:
         "valuation_satellite_candidate": _safe_bool(f.get("valuation_satellite_candidate")),
         "ps_only_satellite_candidate": _safe_bool(f.get("ps_only_satellite_candidate")),
         "ps_satellite_limit": f.get("ps_satellite_limit"),
-        "candidate_lane": f.get("candidate_lane"),
+        "valuation_lane": f.get("valuation_lane") or f.get("candidate_lane"),
+        "entry_candidate_lane": f.get("entry_candidate_lane"),
+        "fundamental_edge_score": f.get("fundamental_edge_score"),
+        "entry_score": f.get("entry_score"),
+        "buy_timing_gate": _safe_bool(f.get("buy_timing_gate")),
+        "downtrend_rejection_gate": _safe_bool(f.get("downtrend_rejection_gate")),
+        "data_review_reason": f.get("data_review_reason"),
+        "data_review_level": f.get("data_review_level"),
+        "candidate_lane": d.get("candidate_lane")
+        or f.get("entry_candidate_lane")
+        or f.get("candidate_lane"),
         "excluded_candidate": _safe_bool(f.get("excluded_candidate")),
     }
 
@@ -3230,6 +4218,11 @@ def _flatten_result(d: dict) -> dict:
         "piot_eval": pio.get("evaluation"),
         "piot_observed_items": pio.get("observed_items"),
         "piot_coverage_ratio": pio.get("coverage_ratio"),
+        "piotroski_raw_score": pio.get("piotroski_raw_score"),
+        "piotroski_available_items": pio.get("piotroski_available_items"),
+        "piotroski_coverage_ratio": pio.get("piotroski_coverage_ratio"),
+        "piotroski_adjusted_score": pio.get("piotroski_adjusted_score"),
+        "piotroski_effective_score": pio.get("piotroski_effective_score"),
         "safety": saf.get("total_score"),
         "safety_level": saf.get("safety_level"),
         "safety_coverage_ratio": saf.get("coverage_ratio"),
@@ -3274,6 +4267,23 @@ def _flatten_result(d: dict) -> dict:
         "fins_details_available": diagnostics.get("fins_details_available"),
         "fins_details_status": diagnostics.get("fins_details_status"),
         "fins_details_error": diagnostics.get("fins_details_error"),
+        "fundamental_edge_score": d.get("fundamental_edge_score"),
+        "entry_score": d.get("entry_score"),
+        "data_review_reason": flt.get("data_review_reason") or d.get("data_review_reason"),
+        "data_review_level": flt.get("data_review_level") or d.get("data_review_level"),
+        "ps_vs_sector_pre": d.get("ps_vs_sector_pre"),
+        "peg_warning": d.get("peg_warning"),
+        "op_income_yoy_pct": d.get("op_income_yoy_pct"),
+        "valuation_lane": d.get("valuation_lane") or flt.get("valuation_lane") or flt.get("candidate_lane"),
+        "ma200_state": (d.get("ma200_evaluation") or {}).get("ma200_state"),
+        "ma200_timing_score": (d.get("ma200_evaluation") or {}).get("ma200_timing_score"),
+        "ma200_risk_penalty": (d.get("ma200_evaluation") or {}).get("ma200_risk_penalty"),
+        "ma200_reason": (d.get("ma200_evaluation") or {}).get("ma200_reason"),
+        "distance_from_ma200": (d.get("ma200_evaluation") or {}).get("distance_from_ma200"),
+        "crossed_above_ma200_recently": (d.get("ma200_evaluation") or {}).get("crossed_above_ma200_recently"),
+        "below_ma200_basing": (d.get("ma200_evaluation") or {}).get("below_ma200_basing"),
+        "below_ma200_downtrend": (d.get("ma200_evaluation") or {}).get("below_ma200_downtrend"),
+        "above_ma200_extended": (d.get("ma200_evaluation") or {}).get("above_ma200_extended"),
         **flt,
         "ok": d.get("success"),
         "error": d.get("error"),
@@ -3378,6 +4388,24 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
     p_sum.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return [p_core, p_sat, p_sat_val, p_sat_ps, p_exc, p_sum]
 
+
+def write_ma200_lane_csvs(flat: pd.DataFrame, outdir: Path) -> list[Path]:
+    """MA200・ファンダレーン別の候補CSV（推奨順位は candidate_lane ベース）。"""
+    outdir.mkdir(parents=True, exist_ok=True)
+    ok = flat[flat["ok"] == True].copy()
+    if ok.empty or "candidate_lane" not in ok.columns:
+        return []
+    outs: list[Path] = []
+    for lane, fname in _LANE_EXPORT_NAMES.items():
+        sub = ok[ok["candidate_lane"].astype(str) == lane].copy()
+        sort_cols = [c for c in ("entry_score", "fundamental_edge_score", "total_score") if c in sub.columns]
+        if sort_cols:
+            sub = sub.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
+        p = outdir / fname
+        sub.to_csv(p, index=False, encoding="utf-8-sig")
+        outs.append(p)
+    return outs
+
 def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: Optional[str] = None) -> list[Path]:
     outdir.mkdir(exist_ok=True, parents=True)
     ok = flat[flat["ok"] == True].copy()
@@ -3398,7 +4426,11 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
 
     if not ranked_core.empty:
         p1 = outdir / "top_recommended_core.csv"
-        ranked_core.sort_values(by=["total_score"], ascending=[False]).head(topn).to_csv(p1, index=False, encoding="utf-8-sig")
+        _rc_sort = ["rec_priority", "rec_secondary", "total_score"]
+        _rc_sort = [c for c in _rc_sort if c in ranked_core.columns]
+        ranked_core.sort_values(by=_rc_sort, ascending=[True] + [False] * (len(_rc_sort) - 1)).head(topn).to_csv(
+            p1, index=False, encoding="utf-8-sig",
+        )
         outs.append(p1)
 
         p2 = outdir / "top_safety_core.csv"
@@ -3420,7 +4452,11 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
 
     if not ranked_sat.empty:
         p6 = outdir / "top_recommended_satellite.csv"
-        ranked_sat.sort_values(by=["total_score"], ascending=[False]).head(topn).to_csv(p6, index=False, encoding="utf-8-sig")
+        _rs_sort = ["rec_priority", "rec_secondary", "total_score"]
+        _rs_sort = [c for c in _rs_sort if c in ranked_sat.columns]
+        ranked_sat.sort_values(by=_rs_sort, ascending=[True] + [False] * (len(_rs_sort) - 1)).head(topn).to_csv(
+            p6, index=False, encoding="utf-8-sig",
+        )
         outs.append(p6)
 
     return outs
@@ -3436,17 +4472,31 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         if c in core.columns:
             core[c] = pd.to_numeric(core[c], errors="coerce")
 
-    rec = _build_ranked(core).sort_values(by=["total_score"], ascending=[False]).head(topn)
+    ranked_md = _build_ranked(core)
+    _md_sort = [c for c in ["rec_priority", "rec_secondary", "total_score"] if c in ranked_md.columns]
+    if len(_md_sort) >= 2:
+        rec = ranked_md.sort_values(by=_md_sort, ascending=[True] + [False] * (len(_md_sort) - 1)).head(topn)
+    else:
+        rec = ranked_md.sort_values(by=["total_score"], ascending=[False]).head(topn)
 
     lines = ["# おすすめトップテン（Core候補）", ""]
     lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
     lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
     lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
+    lines.append(
+        "**注:** `legacy_total` は従来の総合スコア（バリュエーション・財務・安全性等の合成）です。"
+        "`entry_timing_score` は買いタイミング評価であり、銘柄品質そのものではありません。"
+        "最終判断は candidate_lane、fundamental_edge、data_review_reason を併用します。"
+    )
     lines.append("")
     if timestamp:
         lines.append(f"**生成日時:** {timestamp.replace('_', ' ')}")
         lines.append("")
-    lines.append(f"**フィルタ:** avg_volume_30d>={MIN_AVG_VOLUME_30D}, ADV20>={MIN_ADV_JPY_20D:,}JPY, market_cap>={MIN_MARKET_CAP_JPY:,}JPY, PS<={MAX_PS_DEFENSIVE}, PER<={MAX_PER_CORE}, 営業利益安定")
+    lines.append(
+        f"**フィルタ:** avg_volume_30d>={MIN_AVG_VOLUME_30D}, ADV20>={MIN_ADV_JPY_20D:,}JPY, "
+        f"market_cap>={MIN_MARKET_CAP_JPY:,}JPY, PS<={MAX_PS_DEFENSIVE}, PER<={MAX_PER_CORE}, "
+        f"営業利益安定（急落floor={OP_INCOME_DROP_FLOOR}）"
+    )
     lines.append("")
     for _, r in rec.iterrows():
         mc = r.get("market_cap")
@@ -3458,9 +4508,16 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
             peg_str = "N/A"
         else:
             peg_str = f"{float(rp):.2f}"
+        fe = r.get("fundamental_edge_score")
+        es = r.get("entry_score")
+        fe_s = f"{float(fe):.1f}" if fe is not None and pd.notna(fe) else "N/A"
+        es_s = f"{float(es):.1f}" if es is not None and pd.notna(es) else "N/A"
+        lane = r.get("candidate_lane", "")
+        dr_r = r.get("data_review_reason") or ""
         lines.append(
-            f"- **{r['code']} {r['name']}** | 総合 {r['total_score']:.1f} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
-            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
+            f"- **{r['code']} {r['name']}** | lane `{lane}` | legacy_total {r['total_score']:.1f} | "
+            f"fundamental_edge {fe_s} | entry_timing_score {es_s} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
+            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
     p = outdir / f"report_core_top{topn}.md"
@@ -3559,8 +4616,6 @@ def _momentum_score_from_returns(
             score += 0.5
         elif ret_21d > 0.20:
             score -= 1.0
-    if below_ma200 is True:
-        score = max(0.0, score - 3.0)
     return score
 
 def _data_quality_penalty(imputed_field_count: Optional[float], critical_missing_count: Optional[float], statement_staleness_days: Optional[float]) -> float:
@@ -3580,6 +4635,14 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df = flat.copy()
     if "reference_peg" not in df.columns and "peg" in df.columns:
         df["reference_peg"] = df["peg"]
+    if "candidate_lane" not in df.columns:
+        if "valuation_lane" in df.columns:
+            df["candidate_lane"] = df["valuation_lane"]
+        else:
+            df["candidate_lane"] = "excluded"
+    for _c in ("fundamental_edge_score", "entry_score"):
+        if _c not in df.columns:
+            df[_c] = np.nan
     for c in [
         "ps", "reference_peg", "per", "rsi", "adx", "piot", "safety", "spec_score", "below_ma200",
         "return_21d", "return_63d", "return_126d", "return_252d",
@@ -3615,14 +4678,13 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df["resilience_drawdown"] = df["max_drawdown"].apply(_resilience_score_from_drawdown)
     df["resilience_score"] = df["resilience_safety_criteria"] + df["resilience_drawdown"]  # 0-20
 
-    bm200 = df.get("below_ma200", pd.Series([np.nan] * len(df)))
     df["technical_score"] = [
-        _momentum_score_from_returns(r21, r63, r126, m61, m63, m31, (False if pd.isna(x) else bool(x)))
-        for r21, r63, r126, m61, m63, m31, x in zip(
+        _momentum_score_from_returns(r21, r63, r126, m61, m63, m31, False)
+        for r21, r63, r126, m61, m63, m31 in zip(
             df["return_21d"], df["return_63d"], df["return_126d"],
-            df["momentum_6m_1m"], df["momentum_6m_3m"], df["momentum_3m_1m"], bm200
+            df["momentum_6m_1m"], df["momentum_6m_3m"], df["momentum_3m_1m"],
         )
-    ]  # 0-22
+    ]  # 0-22（200日線単純ペナルティは廃止）
 
     safety_base = df["safety"].fillna(0.0).clip(lower=0, upper=25.0)
     adv_bonus = np.where(df["adv_jpy_20d"] >= 1_000_000_000, 2.0, np.where(df["adv_jpy_20d"] >= 500_000_000, 1.0, 0.0))
@@ -3669,6 +4731,36 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df["total_score"] = df["total_score"].clip(lower=0, upper=100)
     df["grade"] = df["total_score"].apply(_grade_from_score)
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
+    df["candidate_lane_sort"] = df["candidate_lane"].astype(str).map(
+        lambda x: _CANDIDATE_LANE_SORT.get(str(x).strip(), 50)
+    )
+
+    lane = df["candidate_lane"].astype(str)
+    ma_state = df["ma200_state"].astype(str) if "ma200_state" in df.columns else pd.Series("", index=df.index, dtype=str)
+    dr_light_reclaim = (lane == "data_review_light") & (ma_state == "ma200_reclaim")
+    dr_light_other = (lane == "data_review_light") & ~dr_light_reclaim
+    df["rec_priority"] = np.select(
+        [
+            lane == "ma200_reclaim_core",
+            lane == "bottom_reversal_core",
+            dr_light_reclaim,
+            lane == "watch_fundamental_core",
+            lane == "weak_reclaim_watch",
+            lane == "extended_above_ma200",
+            lane == "data_review",
+            dr_light_other,
+            lane == "cyclical_value_trap",
+            lane.isin(["satellite_valuation", "satellite_ps_only"]),
+        ],
+        [10, 20, 30, 40, 45, 50, 60, 65, 70, 80],
+        default=200 + df["candidate_lane_sort"].fillna(50).astype(int),
+    ).astype(int)
+
+    ent = pd.to_numeric(df["entry_score"], errors="coerce")
+    fed = pd.to_numeric(df["fundamental_edge_score"], errors="coerce")
+    df["rec_secondary"] = ent
+    df.loc[df["rec_priority"] == 40, "rec_secondary"] = fed.loc[df["rec_priority"] == 40]
+
     return df
 
 def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
@@ -3682,6 +4774,14 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         return []
 
     ranked = _build_ranked(core)
+
+    _sort_cols2 = [c for c in ["rec_priority", "rec_secondary", "total_score"] if c in ranked.columns]
+    if len(_sort_cols2) < 2:
+        _sort_cols2 = [c for c in ["candidate_lane_sort", "entry_score", "fundamental_edge_score", "total_score"] if c in ranked.columns]
+    ranked = ranked.sort_values(
+        by=_sort_cols2,
+        ascending=[True] + [False] * (len(_sort_cols2) - 1),
+    )
 
     now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M")
     n = len(ranked)
@@ -3704,7 +4804,7 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     peg_min = refpeg.min(skipna=True)
     peg_max = refpeg.max(skipna=True)
 
-    top = ranked.sort_values("total_score", ascending=False).head(topn)
+    top = ranked.head(topn)
 
     lines: list[str] = []
     lines.append("# 🏆 PS・PEGレシオ対応 投資銘柄スクリーニング レポート（Core候補）")
@@ -3712,6 +4812,12 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
     lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
     lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
+    lines.append(
+        "**注:** 推奨順は rec_priority（例: ma200_reclaim_core→bottom→data_review_light+reclaim→watch…）を最優先し、"
+        "次に entry_timing_score（タイミング）または watch の fundamental_edge を参照します。"
+        "`legacy_total` は旧総合スコア、`entry_timing_score` は買いタイミング評価です（品質そのものではありません）。"
+        "`bottom_reversal_core` は200日線下の逆張り候補です。"
+    )
     lines.append("")
     lines.append(f"**📅 生成日時:** {now}")
     lines.append(f"**📊 分析対象(Core):** {n}銘柄")
@@ -3749,12 +4855,14 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append(f"- 最小: {peg_min:.2f}")
     lines.append(f"- 最大: {peg_max:.2f}")
     lines.append("")
-    lines.append(f"## 🏆 投資推奨 Top{topn}銘柄（Core）")
+    lines.append(f"## 🏆 投資推奨 Top{topn}銘柄（Core、lane優先・legacy_total / entry_timing_score は別軸）")
     lines.append("")
-    lines.append("| 順位 | 銘柄コード | 銘柄名 | グレード | スコア | セクター | PS比 | PEG | ピオトロスキー |")
-    lines.append("|------|------------|--------|----------|--------|----------|------|-----|---------------|")
+    lines.append("| 順位 | 銘柄 | 名 | G | legacy_total | lane | MA200局面 | fundamental_edge | entry_timing_score | dr_reason | dr_lvl | d200 | 上抜け | basing | down | peg_w | p_adj | p_cov | PS/防 | refPEG | pio |")
+    lines.append("|---|---|---|---|---:|---|---|---|---:|---|---|---|---:|---:|---|---|---|---|---|---:|---:|---|")
     for i, r in enumerate(top.itertuples(index=False), 1):
         ps_vs = 0 if pd.isna(r.ps_vs_sector) else r.ps_vs_sector
+        psp = getattr(r, "ps_vs_sector_pre", np.nan)
+        psp_c = "N/A" if psp is None or (isinstance(psp, float) and pd.isna(psp)) else f"{float(psp):.2f}"
         rpeg = getattr(r, "reference_peg", None)
         if rpeg is None or (isinstance(rpeg, float) and pd.isna(rpeg)):
             rpeg = getattr(r, "peg", np.nan)
@@ -3762,15 +4870,47 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
             peg_cell = "N/A"
         else:
             peg_cell = f"{float(rpeg):.2f}"
-        lines.append(f"| {i} | {r.code} | {r.name} | {r.grade} | {r.total_score:.1f} | {r.sector} | "
-                     f"{ps_vs:.2f} | {peg_cell} | {r.pio_disp} |")
+        lane = getattr(r, "candidate_lane", "")
+        ms = getattr(r, "ma200_state", "")
+        fe = getattr(r, "fundamental_edge_score", np.nan)
+        es = getattr(r, "entry_score", np.nan)
+        dm = getattr(r, "distance_from_ma200", np.nan)
+        xr = getattr(r, "crossed_above_ma200_recently", "")
+        bs = getattr(r, "below_ma200_basing", "")
+        dn = getattr(r, "below_ma200_downtrend", "")
+        pwg = getattr(r, "peg_warning", "")
+        pad = getattr(r, "piotroski_adjusted_score", np.nan)
+        pcv = getattr(r, "piotroski_coverage_ratio", np.nan)
+        drr = getattr(r, "data_review_reason", "") or ""
+        drl = getattr(r, "data_review_level", "") or ""
+        fe_s = "N/A" if fe is None or (isinstance(fe, float) and pd.isna(fe)) else f"{float(fe):.1f}"
+        es_s = "N/A" if es is None or (isinstance(es, float) and pd.isna(es)) else f"{float(es):.1f}"
+        dm_s = "N/A" if dm is None or (isinstance(dm, float) and pd.isna(dm)) else f"{float(dm):.3f}"
+        pad_s = "N/A" if pad is None or (isinstance(pad, float) and pd.isna(pad)) else f"{float(pad):.2f}"
+        pcv_s = "N/A" if pcv is None or (isinstance(pcv, float) and pd.isna(pcv)) else f"{float(pcv):.2f}"
+        lines.append(
+            f"| {i} | {r.code} | {r.name} | {r.grade} | {r.total_score:.1f} | {lane} | {ms} | {fe_s} | {es_s} | {drr} | {drl} | {dm_s} | {xr} | {bs} | {dn} | {pwg} | {pad_s} | {pcv_s} | {psp_c} | {peg_cell} | {r.pio_disp} |"
+        )
     lines.append("")
     lines.append(f"## 📊 詳細分析（上位{details_n}銘柄）")
     lines.append("")
-    detail_df = ranked.sort_values("total_score", ascending=False).head(details_n)
+    detail_df = ranked.head(details_n)
     for i, r in enumerate(detail_df.itertuples(index=False), 1):
         lines.append(f"### {i}. [{r.code}] {r.name} ({r.sector})")
-        lines.append(f"**総合スコア:** {r.total_score:.1f}点 | **グレード:** {r.grade}")
+        lines.append(f"**legacy_total（旧総合）:** {r.total_score:.1f}点 | **グレード:** {r.grade}")
+        _lane = getattr(r, "candidate_lane", "")
+        _ms = getattr(r, "ma200_state", "")
+        _fe = getattr(r, "fundamental_edge_score", np.nan)
+        _es = getattr(r, "entry_score", np.nan)
+        _drr = getattr(r, "data_review_reason", "") or ""
+        _drl = getattr(r, "data_review_level", "") or ""
+        _fe_s = "N/A" if _fe is None or (isinstance(_fe, float) and pd.isna(_fe)) else f"{float(_fe):.1f}"
+        _es_s = "N/A" if _es is None or (isinstance(_es, float) and pd.isna(_es)) else f"{float(_es):.1f}"
+        lines.append(
+            f"**レーン:** {_lane} | **MA200局面:** {_ms} | **fundamental_edge:** {_fe_s} | **entry_timing_score:** {_es_s}"
+        )
+        if _drr or _drl:
+            lines.append(f"**データ要レビュー:** `{_drr}` （level: {_drl}）")
         lines.append("**スコア内訳:**")
         lines.append(f"- バリュエーション: {r.valuation_score:.1f}点")
         lines.append(f"- 財務健全性: {r.financial_score:.1f}点")
@@ -3822,6 +4962,7 @@ def generate_reports_from_master_csv(
     outputs.append(master_csv_path)
 
     outputs += write_candidate_sets(flat, reports_dir, timestamp=ts)
+    outputs += write_ma200_lane_csvs(flat, reports_dir)
     outputs += write_reports(flat, reports_dir, topn=topn, timestamp=ts)
 
     p_md = write_markdown_report(flat, reports_dir, topn=min(10, topn), timestamp=ts)
@@ -3916,7 +5057,11 @@ def run_interactive():
             updated_avgs = sector_avgs_obj.calculate_sector_averages_from_cache()
             if updated_avgs:
                 cache_file = CACHE_DIR / "sector_averages.json"
-                sectors = ['自動車','半導体','電気機器','銀行','情報・通信業','医薬品','商社','小売','サービス','ゲーム','化学','その他']
+                sectors = [
+            '自動車', '半導体', '電気機器', '銀行', '情報・通信業', '医薬品', '商社',
+            '小売', '卸売', '建設', '陸運', '海運', '空運', '電気・ガス', '食品', '機械',
+            'サービス', 'ゲーム', '化学', '鉄鋼', '不動産', 'エネルギー', '証券', 'その他',
+        ]
                 data = {}
                 for sector in sectors:
                     if sector in updated_avgs:

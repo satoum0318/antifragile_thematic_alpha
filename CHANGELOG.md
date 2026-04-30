@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.6.0] - 2026-04-28
+
+### JQuamtsScreeningBot（MA200局面・candidate_lane・データレビュー）
+
+- **200日線局面分類**（`evaluate_ma200_entry_state`）：reclaim / basing / extended / downtrend 等。`recent_60d_low_update`（直近N日での60日底更新）をレーン判定に利用。
+- **`fundamental_edge_score`**（0–100）と **`compute_entry_score`** による生エントリー得点を分離。表示用 **`entry_score`** は **`cap_entry_score`** でレーン別上限（`LANE_ENTRY_CAP` / `LANE_CAP_*` 環境変数）。
+- **`assign_entry_candidate_lane`**：`ma200_reclaim_core`、`bottom_reversal_core`、`weak_reclaim_watch`、`watch_fundamental_core`、`extended_above_ma200`、`data_review` / `data_review_light`、`cyclical_value_trap` 等。reclaim/core は Piotroski（生>3、調整≥6、カバレッジ≥0.6）、PEG警告、営業利益安定を要件化。bottom はファンダ≥75・basing・調整≥6.5・21日リターン正・60日底未更新など。
+- **`compute_data_review_meta`**：`data_review_reason` / `data_review_level`（light/medium/severe）。フラットCSV・投資助言MD・トップMDに出力。
+- **営業利益急落判定**：`OP_INCOME_DROP_FLOOR` デフォルト **0.6**（環境変数で上書き可）。レポート必須フィルタに明示。
+- **セクター**：`Sector33Name` 優先、`normalize_sector` / `SECTOR_MEDIANS` 拡張で「その他」依存を低減。
+- **推奨並び**：`_build_ranked` で **`rec_priority`** / **`rec_secondary`**（watch はファンダ優先）。`top_recommended_*.csv` と助言レポートで利用。MD表は `legacy_total` / `fundamental_edge` / `entry_timing_score` 表記と注記を追加。
+- **ドキュメント**：`docs/スクリーニング仕様マニュアル.md` §7 に本仕様を記載。
+
+タグ: `v1.6.0`
+
 ## [1.5.1] - 2026-04-28
 
 ### JQuamtsScreeningBot（収集フィルタ・マスタ正規化・CF 別名）

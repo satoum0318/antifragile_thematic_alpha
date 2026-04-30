@@ -65,7 +65,8 @@ python runner.py --phase analyze --profile aging_dx_alpha --top 20
 
 - `real_data_screening.py`: メインスクリーニングスクリプト
 - `runner.py`: 便利なランナースクリプト
-- `JQuamtsScreeningBot.py`: 旧バージョン（参考用）
+- `JQuamtsScreeningBot.py`: J-Quants V2 オフライン一括スクリーニング（`output/reports/`）
+- `docs/スクリーニング仕様マニュアル.md`: **Bot / real_data_screening の仕様・MA200レーン詳細**
 - `config/theme_tags.yaml`: テーマタグ定義
 - `.jquants_cache/`: データキャッシュディレクトリ
 - `output/`: 分析結果出力ディレクトリ
