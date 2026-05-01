@@ -48,6 +48,7 @@ import re
 import sys
 import json
 import time
+import math
 import copy
 import signal
 import logging
@@ -303,6 +304,10 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
     sh = _non_null(out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"), out.get("ShOutFY"))
     if out.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock") is None and sh is not None:
         out["NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"] = sh
+    cfo_unify = _pick_cfo_scalar_from_rows(out)
+    if cfo_unify is not None:
+        out["NetCashProvidedByUsedInOperatingActivities"] = cfo_unify
+        out["CashFlowsFromOperatingActivities"] = cfo_unify
     return out
 
 def _strip_slash(endpoint: str) -> str:
@@ -484,14 +489,195 @@ def _non_null(*vals: Any) -> Any:
     return None
 
 def _financial_scalar_absent(val: Any) -> bool:
-    """0 は有効値として欠損扱いしない。"""
+    """0 は有効値として欠損扱いしない。None / "" / NaN のみ欠損。"""
     if val is None:
-        return True
-    if isinstance(val, float) and pd.isna(val):
         return True
     if val == "":
         return True
+    if isinstance(val, bool):
+        return False
+    if isinstance(val, (int, np.integer)):
+        return False
+    if isinstance(val, (float, np.floating)):
+        return bool(pd.isna(val))
+    try:
+        if pd.api.types.is_scalar(val) and pd.isna(val):
+            return True
+    except Exception:
+        pass
     return False
+
+
+def _canonical_internal_stock_code(
+    code: str,
+    valid_stock_codes: Optional[set[str]] = None,
+) -> Optional[str]:
+    """
+    内部4桁コードへ正規化。曖昧・master不一致の場合は None。
+
+    - 数字のみ抽出してから判定
+    - ちょうど4桁: その文字列を候補（master がある場合は集合に存在する場合のみ採用）
+    - 5桁かつ末尾が '0': 先頭4桁
+    - 5桁かつ先頭が '0': 末尾4桁（例: 01301 -> 1301）
+    - 5桁で上記以外: 先頭4桁・末尾4桁のどちらかが master にあればそれを採用（両方なら先に一致した方）
+    - 6桁超: 先頭4桁・末尾4桁を master と照合
+    - 4桁未満: zfill(4) を候補にし、master がある場合は集合に存在するときのみ採用
+    """
+    digits = "".join(ch for ch in str(code).strip() if ch.isdigit())
+    if not digits:
+        return None
+
+    def _member(cand: str) -> bool:
+        if valid_stock_codes is None:
+            return True
+        return cand in valid_stock_codes
+
+    def _first_matching(cands: List[str]) -> Optional[str]:
+        seen: set[str] = set()
+        for cand in cands:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if _member(cand):
+                return cand
+        return None
+
+    if len(digits) == 4:
+        return digits if _member(digits) else None
+
+    if len(digits) == 5:
+        if digits.endswith("0"):
+            cand = digits[:4]
+            return cand if _member(cand) else None
+        if digits.startswith("0"):
+            cand = digits[-4:]
+            return cand if _member(cand) else None
+        cands = [digits[:4], digits[-4:]]
+        if valid_stock_codes is None:
+            return None
+        return _first_matching(cands)
+
+    if len(digits) > 5:
+        if valid_stock_codes is None:
+            return None
+        cands = [digits[:4], digits[-4:]]
+        return _first_matching(cands)
+
+    # 1〜3桁
+    cand = digits.zfill(4)
+    return cand if _member(cand) else None
+
+
+def _pick_cfo_scalar_from_rows(*rows: Optional[Dict[str, Any]]) -> Any:
+    """top-level と FS 内から営業CF相当を1つ拾う（0は有効）。複数 dict を順に見る。"""
+    keys = (
+        "NetCashProvidedByUsedInOperatingActivities",
+        "CashFlowsFromOperatingActivities",
+        "OperatingCashFlow",
+        "OCF",
+        "ocf",
+        "CFO",
+        "Cfo",
+        "cfo",
+    )
+    for row in rows:
+        if not row or not isinstance(row, dict):
+            continue
+        fs = row.get("FS") if isinstance(row.get("FS"), dict) else None
+        for src in (row, fs):
+            if not isinstance(src, dict):
+                continue
+            for k in keys:
+                if k not in src:
+                    continue
+                v = src[k]
+                if v is None or v == "":
+                    continue
+                if isinstance(v, (float, np.floating)) and pd.isna(v):
+                    continue
+                if isinstance(v, (np.integer, np.floating)) and pd.isna(v):
+                    continue
+                if isinstance(v, str):
+                    st = v.strip().replace(",", "")
+                    if not st or st in ("-", "—", "–", "NaN", "nan", "None"):
+                        continue
+                    try:
+                        fv = float(st)
+                    except ValueError:
+                        continue
+                    if not math.isfinite(fv):
+                        continue
+                    return fv
+                return v
+    return None
+
+
+def _valid_collectable_stock_codes(df: pd.DataFrame) -> set[str]:
+    """collectable マスタ上の有効 Code（4桁・空白除去済み）。"""
+    if df is None or df.empty or "Code" not in df.columns:
+        return set()
+    return {str(x).strip() for x in df["Code"].astype(str)}
+
+
+def sanitize_pending_codes(codes: List[str], valid_stock_codes: set[str]) -> List[str]:
+    """pending を内部4桁に正規化し、collectable master に存在するものだけ残す。"""
+    out: List[str] = []
+    seen: set[str] = set()
+    dropped = 0
+    for c in codes:
+        cc = _canonical_internal_stock_code(str(c).strip(), valid_stock_codes)
+        if cc is None:
+            dropped += 1
+            continue
+        if cc in seen:
+            continue
+        seen.add(cc)
+        out.append(cc)
+    if dropped:
+        logger.info(
+            "[INFO] sanitize_pending: dropped %s codes (non-canonical / not in collectable master / duplicate)",
+            dropped,
+        )
+    return out
+
+
+def prune_stale_collection_sidecars(valid_stock_codes: set[str]) -> None:
+    """master に存在しない skiplist / missing_financials CSV 行を削除（キーは4桁に統一）。"""
+    blob = _load_skiplist_raw()
+    skipped = blob.get("skipped") or {}
+    new_skipped: Dict[str, Any] = {}
+    rm_sl = 0
+    for k, v in skipped.items():
+        ck = _canonical_internal_stock_code(str(k).strip(), valid_stock_codes)
+        if ck is not None and ck in valid_stock_codes:
+            new_skipped[ck] = v
+        else:
+            rm_sl += 1
+    blob["skipped"] = new_skipped
+    if rm_sl:
+        logger.info("[INFO] prune_stale_collection_sidecars: removed %s skiplist keys not in collectable master", rm_sl)
+    _save_skiplist_raw(blob)
+
+    if MISSING_FINANCIALS_CSV.exists():
+        try:
+            mdf = pd.read_csv(MISSING_FINANCIALS_CSV, encoding="utf-8-sig")
+            if "code" in mdf.columns:
+                def _cell(x: Any) -> str:
+                    c = _canonical_internal_stock_code(str(x).strip(), valid_stock_codes)
+                    return c if c else ""
+
+                mdf["code"] = mdf["code"].astype(str).map(_cell)
+                mdf = mdf[mdf["code"] != ""]
+                before = len(mdf)
+                mdf = mdf[mdf["code"].isin(valid_stock_codes)]
+                if len(mdf) != before:
+                    logger.info(
+                        "[INFO] prune missing_financials_symbols: %s rows removed (stale codes)",
+                        before - len(mdf),
+                    )
+                mdf.sort_values("code").to_csv(MISSING_FINANCIALS_CSV, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            logger.warning("prune missing_financials_symbols.csv skip: %s", e)
 
 def _audit_v2_legacy_statement_fields(
     legacy: List[Dict[str, Any]],
@@ -530,6 +716,19 @@ def _audit_v2_legacy_statement_fields(
     for label, keys in groups:
         if all(_financial_scalar_absent(latest.get(k)) for k in keys):
             missing_labels.append(label)
+    if summary_only:
+        ocf_label = "NetCashProvidedByUsedInOperatingActivities"
+        if ocf_label in missing_labels:
+            cf_schema_keys = (
+                "CFO", "CFF", "CFI", "OCF", "Cfo", "cfo", "ocf",
+            )
+            if any(k in latest for k in cf_schema_keys):
+                missing_labels = [x for x in missing_labels if x != ocf_label]
+                logger.debug(
+                    "V2財務変換 [%s]: summary_only で CF スキーマキーはあるが最新行の値が null — "
+                    "営業CFは API 上未開示の可能性（監査WARNING省略）",
+                    log_code or "?",
+                )
     if missing_labels:
         sample_keys = sorted(str(k) for k in latest.keys())[:48]
         summary_only_exempt = ("CurrentAssets", "CurrentLiabilities", "GrossProfit")
@@ -629,6 +828,8 @@ def convert_v2_financials_to_legacy_statements(
                 "CashFlowsFromOperatingActivities",
                 "OperatingCashFlow",
                 "CFO",
+                "Cfo",
+                "cfo",
             )),
             ("TotalAssets", ("TotalAssets", "TA", "TotalAsset")),
             ("EquityAttributableToOwnersOfParent", (
@@ -667,10 +868,16 @@ def convert_v2_financials_to_legacy_statements(
             out.get("NetCashProvidedByUsedInOperatingActivities"),
             out.get("CashFlowsFromOperatingActivities"),
             out.get("CFO"),
+            out.get("Cfo"),
+            out.get("cfo"),
         )
         if ocf_val is not None:
             out["NetCashProvidedByUsedInOperatingActivities"] = ocf_val
             out["CashFlowsFromOperatingActivities"] = ocf_val
+        cfo_final = _pick_cfo_scalar_from_rows(out, s_flat, d_flat)
+        if cfo_final is not None:
+            out["NetCashProvidedByUsedInOperatingActivities"] = cfo_final
+            out["CashFlowsFromOperatingActivities"] = cfo_final
         if not out.get("TypeOfDocument") and isinstance(out.get("CurrentPeriodType"), str):
             out["TypeOfDocument"] = str(out["CurrentPeriodType"])
         return out
@@ -725,6 +932,11 @@ def convert_v2_financials_to_legacy_statements(
 
     legacy = list(merged_by_key.values())
     legacy.sort(key=lambda r: _statement_sort_key(r), reverse=True)
+    for row in legacy:
+        ocf_inj = _pick_cfo_scalar_from_rows(row)
+        if ocf_inj is not None:
+            row["NetCashProvidedByUsedInOperatingActivities"] = ocf_inj
+            row["CashFlowsFromOperatingActivities"] = ocf_inj
     if log_code:
         _audit_v2_legacy_statement_fields(
             legacy, log_code, financial_data_mode=financial_data_mode,
@@ -1852,7 +2064,15 @@ def _save_skiplist_raw(blob: dict) -> None:
 def _skiplist_add_entry(code: str, reason: str, **extra: Any) -> None:
     blob = _load_skiplist_raw()
     blob.setdefault("skipped", {})
-    blob["skipped"][str(code).strip()] = {
+    ck = _canonical_internal_stock_code(str(code).strip(), None)
+    if ck is None:
+        dig = "".join(ch for ch in str(code).strip() if ch.isdigit())
+        if len(dig) >= 4:
+            ck = dig[:4]
+        else:
+            logger.warning("skiplist 見送り: コードを正規化できません: %s", code)
+            return
+    blob["skipped"][ck] = {
         "reason": reason,
         "last_attempt_at": datetime.datetime.now().isoformat(timespec="seconds"),
         **extra,
@@ -4345,22 +4565,37 @@ def _load_pending(
     ignore_skiplist: bool = False,
 ) -> list[str]:
     fc = FrozenCache()
-    allowed = set(str(c).strip() for c in df["Code"].astype(str))
+    allowed = {str(c).strip() for c in df["Code"].astype(str)}
     skip_set: set[str] = set()
     if not ignore_skiplist:
-        skip_set = {str(k).strip() for k in _load_skiplist_raw().get("skipped", {}).keys()}
+        for k in _load_skiplist_raw().get("skipped", {}).keys():
+            cc = _canonical_internal_stock_code(str(k).strip(), allowed)
+            if cc:
+                skip_set.add(cc)
 
     def _intersect_allow(codes_in: List[str]) -> List[str]:
-        out = [str(c).strip() for c in codes_in if str(c).strip() in allowed]
-        if len(out) != len(codes_in):
+        seen: set[str] = set()
+        out: List[str] = []
+        dropped = 0
+        for c in codes_in:
+            cc = _canonical_internal_stock_code(str(c).strip(), allowed)
+            if cc is None or cc not in allowed:
+                dropped += 1
+                continue
+            if cc in seen:
+                dropped += 1
+                continue
+            seen.add(cc)
+            out.append(cc)
+        if dropped:
             logger.info(
-                "[INFO] pending_codes dropped %s stale entries not in collectable universe",
-                len(codes_in) - len(out),
+                "[INFO] pending_codes dropped %s stale/duplicate entries (not in collectable master or non-canonical code)",
+                dropped,
             )
         return out
 
     def _skip_skipped(codes_in: List[str]) -> List[str]:
-        return [c for c in codes_in if str(c).strip() not in skip_set]
+        return [c for c in codes_in if c not in skip_set]
 
     if force_full:
         codes = _skip_skipped(_intersect_allow([str(c).strip() for c in df["Code"].astype(str)]))
@@ -4381,8 +4616,7 @@ def _load_pending(
         try:
             raw_pending = json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
             filt = _skip_skipped(_intersect_allow([str(c) for c in raw_pending]))
-            if len(filt) != len(raw_pending):
-                _save_pending(filt)
+            _save_pending(filt)
             return filt
         except Exception:
             pass
@@ -4401,6 +4635,7 @@ def collect_all_daemon(session: requests.Session,
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
+    valid_set = _valid_collectable_stock_codes(df)
 
     if reset_pending and force_full and COLLECTION_SKIPLIST_PATH.exists():
         try:
@@ -4413,6 +4648,9 @@ def collect_all_daemon(session: requests.Session,
             PENDING_FILE.unlink()
         except Exception:
             pass
+
+    if not (reset_pending and force_full):
+        prune_stale_collection_sidecars(valid_set)
 
     ignore_skiplist = bool(force_full)
     pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days, ignore_skiplist=ignore_skiplist)
@@ -4452,6 +4690,8 @@ def collect_all_daemon(session: requests.Session,
             "auth_or_permission_error": 0,
         }
         reset_v2_legacy_batch_audit()
+        batch_attempted_codes: List[str] = []
+        batch_attempt_statuses: List[str] = []
         try:
             for code in list(pending):
                 if graceful_shutdown.shutdown:
@@ -4459,16 +4699,28 @@ def collect_all_daemon(session: requests.Session,
                     break
                 if taken >= daily_budget:
                     break
-                mr = code_to_row.get(str(code).strip())
+                c_norm = _canonical_internal_stock_code(str(code).strip(), valid_set)
+                if c_norm is None:
+                    logger.warning(
+                        "pending から無効コードを除去: %r（正規化不能または collectable master に不在）",
+                        code,
+                    )
+                    pc = str(code).strip()
+                    for alt in list(pending):
+                        if str(alt).strip() == pc:
+                            pending.remove(alt)
+                    _save_pending(pending)
+                    continue
+                batch_attempted_codes.append(c_norm)
+                mr = code_to_row.get(c_norm)
                 res = collect_one_code_result(
                     session,
-                    code,
+                    c_norm,
                     mr,
                     force_refresh=(force_full or refresh_days is not None),
                     instrument_type="stock",
                 )
                 stt = str(res.get("status") or "")
-                c_norm = str(code).strip()
                 if stt == "success":
                     if c_norm in pending:
                         pending.remove(c_norm)
@@ -4487,6 +4739,7 @@ def collect_all_daemon(session: requests.Session,
                     stats["auth_or_permission_error"] += 1
                 else:
                     stats["transient_error"] += 1
+                batch_attempt_statuses.append(stt)
                 _save_pending(pending)
                 taken += 1
                 if taken % 20 == 0 or taken == daily_budget:
@@ -4526,6 +4779,33 @@ def collect_all_daemon(session: requests.Session,
             f"pending_before={pending_before}, pending_after={pending_after}"
         )
         _cli_print("📦 " + summary_lines, "[収集] " + summary_lines)
+        batch_bad = (
+            taken >= 20
+            and stats["success"] == 0
+            and (stats["permanent_missing_financials"] / max(taken, 1)) > 0.8
+        )
+        if batch_bad:
+            logger.warning(
+                "[WARN] no successful collection in this batch; likely stale pending or invalid stock universe. "
+                "transient_error / auth_or_permission_error の銘柄は pending に残し、skiplist には追加しません。"
+            )
+            for bc, stt in zip(batch_attempted_codes, batch_attempt_statuses):
+                if stt in ("transient_error", "auth_or_permission_error"):
+                    continue
+                if stt in ("permanent_missing_financials", "non_stock_or_fund_like", "success"):
+                    continue
+                if bc not in code_to_row:
+                    if bc in pending:
+                        pending.remove(bc)
+                    sk = _load_skiplist_raw().get("skipped") or {}
+                    if bc not in sk:
+                        _skiplist_add_entry(
+                            bc,
+                            "not_in_collectable_master",
+                            detail="batch_anomaly_cleanup",
+                        )
+            _save_pending(pending)
+            break
         if not pending:
             _cli_print("✅ 全銘柄の凍結収集が完了", "[OK] 全銘柄の凍結収集が完了")
             break
@@ -4552,42 +4832,85 @@ def collect_all_daemon(session: requests.Session,
 
     write_sector_normalization_audit_csv(session)
 
-def collect_batch(session: requests.Session, max_codes: int) -> dict:
+def collect_batch(
+    session: requests.Session,
+    max_codes: int,
+    *,
+    force_refresh: bool = False,
+) -> dict:
     reset_v2_legacy_batch_audit()
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
+    valid_cb = _valid_collectable_stock_codes(df)
+    prune_stale_collection_sidecars(valid_cb)
     fc = FrozenCache()
     code_to_row = {str(r.get("Code", "")).strip(): r.to_dict() for _, r in df.iterrows()}
 
-    skip_set = {str(k).strip() for k in _load_skiplist_raw().get("skipped", {}).keys()}
-    pending = [
-        str(c) for c in df["Code"].astype(str) if not fc.has_all(str(c)) and str(c).strip() not in skip_set
-    ]
-    picked = pending[:max_codes]
+    skip_set: set[str] = set()
+    for k in _load_skiplist_raw().get("skipped", {}).keys():
+        cc = _canonical_internal_stock_code(str(k).strip(), valid_cb)
+        if cc:
+            skip_set.add(cc)
+    if force_refresh:
+        pending = [
+            str(c).strip()
+            for c in df["Code"].astype(str)
+            if str(c).strip() not in skip_set
+        ][:max_codes]
+    else:
+        pending = [
+            str(c).strip()
+            for c in df["Code"].astype(str)
+            if not fc.has_all(str(c).strip()) and str(c).strip() not in skip_set
+        ]
+        pending = pending[:max_codes]
+    picked = pending
     ok = 0
     fail = 0
+    stats = {
+        "success": 0,
+        "permanent_missing_financials": 0,
+        "non_stock_or_fund_like": 0,
+        "transient_error": 0,
+        "auth_or_permission_error": 0,
+    }
     start = time.time()
 
     for i, code in enumerate(picked, 1):
         if graceful_shutdown.shutdown:
             logger.info("shutdown requested; stopping collect_batch")
             break
-        mr = code_to_row.get(str(code).strip())
+        cc = _canonical_internal_stock_code(str(code).strip(), valid_cb)
+        if cc is None:
+            fail += 1
+            continue
+        mr = code_to_row.get(cc)
         res = collect_one_code_result(
-            session, code, mr, force_refresh=False, instrument_type="stock",
+            session,
+            cc,
+            mr,
+            force_refresh=force_refresh,
+            instrument_type="stock",
         )
-        stt = res.get("status")
+        stt = str(res.get("status") or "")
         if stt == "success":
             ok += 1
+            stats["success"] += 1
         elif stt == "permanent_missing_financials":
             _record_permanent_missing_financials(res, mr)
             fail += 1
+            stats["permanent_missing_financials"] += 1
         elif stt == "non_stock_or_fund_like":
             _record_non_stock_excluded(res, mr)
             fail += 1
+            stats["non_stock_or_fund_like"] += 1
+        elif stt == "auth_or_permission_error":
+            fail += 1
+            stats["auth_or_permission_error"] += 1
         else:
             fail += 1
+            stats["transient_error"] += 1
         if i % 20 == 0 or i == len(picked):
             elapsed = time.time() - start
             _cli_print(
@@ -4597,7 +4920,12 @@ def collect_batch(session: requests.Session, max_codes: int) -> dict:
             sys.stdout.flush()
 
     flush_v2_legacy_batch_audit_loggers()
-    return {"tried": len(picked), "ok": ok, "fail": fail}
+    return {
+        "tried": len(picked),
+        "ok": ok,
+        "fail": fail,
+        **stats,
+    }
 
 # ------------------------------------------------------------
 # オフライン分析タスク生成 / 銘柄名取得
@@ -5656,6 +5984,11 @@ def main() -> int:
     parser.add_argument("--refresh-days", type=int)
     parser.add_argument("--force-full", action="store_true")
     parser.add_argument("--force", action="store_true", help="--force-full と同等（skiplist 無視・メニュー7相当）")
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="collect のみ: キャッシュをバイパスし、collectable 先頭 N 件を再取得（--budget で件数指定）",
+    )
     args = parser.parse_args()
 
     if args.phase == "interactive":
@@ -5683,8 +6016,16 @@ def main() -> int:
             return 130 if graceful_shutdown.shutdown else 0
 
         if args.phase == "collect":
-            s = collect_batch(session, args.budget)
-            _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
+            s = collect_batch(session, args.budget, force_refresh=bool(args.force_refresh))
+            detail = (
+                f"success={s.get('success', s['ok'])} permanent_missing_financials={s.get('permanent_missing_financials', 0)} "
+                f"non_stock_or_fund_like={s.get('non_stock_or_fund_like', 0)} transient_error={s.get('transient_error', 0)} "
+                f"auth_or_permission_error={s.get('auth_or_permission_error', 0)}"
+            )
+            _cli_print(
+                f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']} | {detail}",
+                f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']} | {detail}",
+            )
             return 130 if graceful_shutdown.shutdown else 0
 
         if args.phase == "single":
@@ -5762,7 +6103,35 @@ def main() -> int:
     return 0
 
 
+def run_canonical_code_selftest() -> None:
+    """_canonical_internal_stock_code の期待ケース検証（手動: --selftest-canonical）。"""
+    v1301 = {"1301"}
+    v0130 = {"0130"}
+    v7203 = {"7203"}
+    cases: List[Tuple[str, Optional[set[str]], Optional[str]]] = [
+        ("7203", None, "7203"),
+        ("72030", None, "7203"),
+        ("13010", v1301, "1301"),
+        ("01301", v1301, "1301"),
+        ("0130", v0130, "0130"),
+        ("0130", v1301, None),
+        ("130", v1301, None),
+        ("130", v0130, "0130"),
+        ("12345", None, None),
+        ("12345", v7203, None),
+        ("720300", v7203, "7203"),
+    ]
+    print("=== _canonical_internal_stock_code selftest ===")
+    for s, v, exp in cases:
+        got = _canonical_internal_stock_code(s, v)
+        ok = "OK" if got == exp else "FAIL"
+        print(f"  {s!r} valid={v!r} -> {got!r} expect {exp!r} [{ok}]")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest-canonical":
+        run_canonical_code_selftest()
+        raise SystemExit(0)
     _main_exit = 0
     try:
         _main_exit = int(main() or 0)

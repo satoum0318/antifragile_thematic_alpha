@@ -15,6 +15,24 @@
 
 タグ: `v1.6.0`
 
+## [1.5.2] - 2026-05-01
+
+### J-Quants V2 stock collection stabilization and collect smoke verification
+
+（ETF/ETN/REIT/fund-like の分離・`instrument_type` 出力は [1.5.1] の instrument split に含む。本リリースは収集パイプラインと検証スナップショットにフォーカス。）
+
+- 内部4桁コードの **正規化**（マスタ照合・曖昧コードの除外）を強化し、collect / pending / skiplist 周りの取りこぼしを低減。
+- **force-refresh** によるキャッシュバイパス収集パスを追加し、検証用途で先頭 N 件のみ再取得可能に。
+- **pending / skiplist** の無効・古いコードの衛生化。
+- **transient / 認可系エラー** を永続 skiplist に載せない（再試行可能な失敗と永久欠損を分離）。
+- V2 **summary-only** における **CFO / 営業キャッシュフロー** の別名・legacy 注入・監査を改善し、**`NetCashProvidedByUsedInOperatingActivities` の偽陽性 WARNING** を抑制。
+- **検証（20 銘柄・force-refresh）**: `tried=20`, `success=20`, `transient_error=0`, exit 0。`NetCash…` を含む WARNING 0 件。
+- **オフライン analyze**: `instrument_type=stock` のみ・ETF/ETN/REIT/投信系のランキング混入なしを確認（件数は当該マスタに依存）。
+- **制限**: V2 summary-only のままでは Piotroski カバレッジは `fins/full` 系に比べ低め。全面な財務項目には fins/details（プラン依存）が必要。
+- **100 件 / 800 件の網羅検証は未実施**。1379 / 1419 など一部銘柄で主要キー欠損 WARNING が残るが本タグのブロッカーではない。ETF 専用スコアは未実装（AUM・信託報酬・NAV 乖離等の外部データ想定）。
+
+タグ: `v1.5.2-jquants-v2-stock-collect-smoke`
+
 ## [1.5.1] - 2026-04-28
 
 ### JQuamtsScreeningBot（収集フィルタ・マスタ正規化・CF 別名）
