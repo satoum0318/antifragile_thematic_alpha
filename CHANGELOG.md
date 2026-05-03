@@ -31,6 +31,22 @@
 - **制限**: V2 summary-only のままでは Piotroski カバレッジは `fins/full` 系に比べ低め。全面な財務項目には fins/details（プラン依存）が必要。
 - **100 件 / 800 件の網羅検証は未実施**。1379 / 1419 など一部銘柄で主要キー欠損 WARNING が残るが本タグのブロッカーではない。ETF 専用スコアは未実装（AUM・信託報酬・NAV 乖離等の外部データ想定）。
 
+### J-Quants V2 instrument split and collect smoke verification (EN)
+
+（ETF/ETN/REIT/fund-like の分離と `instrument_type` の詳細は上記 [1.5.1] の *instrument split* を参照。以下は本スナップショットの英語要約。）
+
+- Added robust internal 4-digit code canonicalization for J-Quants V2 code handling.
+- Separated ETF/ETN/REIT/fund-like instruments from individual-stock financial screening (details: [1.5.1]).
+- Ensured ETF-like instruments do not flow into stock financial collection or stock ranking.
+- Added force-refresh collect path for controlled verification.
+- Sanitized pending / skiplist handling against stale or invalid codes.
+- Prevented transient errors from being persisted into permanent skiplist.
+- Improved V2 summary-only CFO / operating cash flow alias handling.
+- Reduced false `NetCashProvidedByUsedInOperatingActivities` warnings in summary-only mode.
+- Verified collect smoke test with 20 ordinary stocks: tried=20, success=20, transient=0.
+- Verified offline analysis output with stock-only universe and no ETF/ETN/REIT/fund-like ranking contamination.
+- Remaining limitation: V2 summary-only mode still has lower Piotroski coverage; fins/details access is required for full financial coverage.
+
 タグ: `v1.5.2-jquants-v2-stock-collect-smoke`
 
 ## [1.5.1] - 2026-04-28
