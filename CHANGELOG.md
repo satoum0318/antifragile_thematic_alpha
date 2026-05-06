@@ -49,6 +49,20 @@
 
 タグ: `v1.5.2-jquants-v2-stock-collect-smoke`
 
+## [1.5.3] - 2026-05-06
+
+### J-Quants V2 data quality gates
+
+- Added critical financial missing-field gates for V2 summary-only screening.
+- Prevented stocks with critical missing financial fields from entering core candidate outputs.
+- Added Piotroski coverage threshold for core eligibility.
+- Added summary-only grade caps and `grade_capped_reason`.
+- Routed critical missing cases to `data_review` outputs and low-coverage summary-only cases to `data_review_light`.
+- Reduced noisy per-symbol summary-only expected-missing logs and added batch-level V2 financial audit summaries.
+- Added `--max-batches` and `--once` to prevent unintended continuous collection loops.
+
+タグ: `v1.5.3-jquants-v2-data-quality-gates`
+
 ## [1.5.1] - 2026-04-28
 
 ### JQuamtsScreeningBot（収集フィルタ・マスタ正規化・CF 別名）

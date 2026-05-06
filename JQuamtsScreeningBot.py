@@ -138,13 +138,20 @@ DEFAULT_COLLECT_BUDGET = _default_collect_budget_from_env()
 # summary_only での影響説明ログ（セッションにつき1回）
 _SUMMARY_ONLY_MODE_INFO_LOGGED = False
 
-# V2 legacy: 普通株で statements が空の銘柄をバッチ集計（銘柄ごと WARNING 抑制）
+# V2 legacy: 普通株で statements が空の銘柄・summary_only の欠損監査をバッチ集計
 _V2_LEGACY_EMPTY_STOCK_CODES: List[str] = []
+_V2_FINANCIAL_AUDIT_COUNTS: Dict[str, int] = {}
+_V2_FINANCIAL_AUDIT_SAMPLES: Dict[str, List[str]] = {}
+_V2_FINANCIAL_AUDIT_SEEN: Dict[str, set[str]] = {}
+_V2_FINANCIAL_AUDIT_SAMPLE_LIMIT = 10
 
 
 def reset_v2_legacy_batch_audit() -> None:
-    global _V2_LEGACY_EMPTY_STOCK_CODES
+    global _V2_LEGACY_EMPTY_STOCK_CODES, _V2_FINANCIAL_AUDIT_COUNTS, _V2_FINANCIAL_AUDIT_SAMPLES, _V2_FINANCIAL_AUDIT_SEEN
     _V2_LEGACY_EMPTY_STOCK_CODES = []
+    _V2_FINANCIAL_AUDIT_COUNTS = {}
+    _V2_FINANCIAL_AUDIT_SAMPLES = {}
+    _V2_FINANCIAL_AUDIT_SEEN = {}
 
 
 def record_v2_legacy_empty_stock(log_code: str) -> None:
@@ -153,18 +160,55 @@ def record_v2_legacy_empty_stock(log_code: str) -> None:
         _V2_LEGACY_EMPTY_STOCK_CODES.append(c)
 
 
-def flush_v2_legacy_batch_audit_loggers() -> None:
-    global _V2_LEGACY_EMPTY_STOCK_CODES
-    if not _V2_LEGACY_EMPTY_STOCK_CODES:
+def record_v2_financial_audit(key: str, log_code: str) -> None:
+    global _V2_FINANCIAL_AUDIT_COUNTS, _V2_FINANCIAL_AUDIT_SAMPLES, _V2_FINANCIAL_AUDIT_SEEN
+    if not key:
         return
-    n = len(_V2_LEGACY_EMPTY_STOCK_CODES)
-    sample = ",".join(_V2_LEGACY_EMPTY_STOCK_CODES[:24])
-    logger.warning(
-        "[WARN] stock financial statements missing: %s symbols (sample: %s)",
-        n,
-        sample,
-    )
+    c = (log_code or "").strip()
+    if c:
+        seen = _V2_FINANCIAL_AUDIT_SEEN.setdefault(key, set())
+        if c in seen:
+            return
+        seen.add(c)
+    _V2_FINANCIAL_AUDIT_COUNTS[key] = int(_V2_FINANCIAL_AUDIT_COUNTS.get(key, 0)) + 1
+    if c:
+        samples = _V2_FINANCIAL_AUDIT_SAMPLES.setdefault(key, [])
+        if c not in samples and len(samples) < _V2_FINANCIAL_AUDIT_SAMPLE_LIMIT:
+            samples.append(c)
+
+
+def flush_v2_legacy_batch_audit_loggers() -> None:
+    global _V2_LEGACY_EMPTY_STOCK_CODES, _V2_FINANCIAL_AUDIT_COUNTS, _V2_FINANCIAL_AUDIT_SAMPLES, _V2_FINANCIAL_AUDIT_SEEN
+    if _V2_LEGACY_EMPTY_STOCK_CODES:
+        n = len(_V2_LEGACY_EMPTY_STOCK_CODES)
+        sample = ",".join(_V2_LEGACY_EMPTY_STOCK_CODES[:24])
+        logger.warning(
+            "[WARN] stock financial statements missing: %s symbols (sample: %s)",
+            n,
+            sample,
+        )
+    if _V2_FINANCIAL_AUDIT_COUNTS:
+        ordered = [
+            "summary_only_expected_missing",
+            "critical_missing_total_assets_or_equity",
+            "critical_missing_sales_or_income",
+            "critical_missing_shares",
+            "critical_missing_net_income",
+            "critical_missing_any",
+        ]
+        parts = [f"{k}={int(_V2_FINANCIAL_AUDIT_COUNTS.get(k, 0))}" for k in ordered]
+        sample_parts = []
+        for k in ordered:
+            samples = _V2_FINANCIAL_AUDIT_SAMPLES.get(k) or []
+            if samples:
+                sample_parts.append(f"{k}: {','.join(samples)}")
+        logger.info("[SUMMARY] V2 financial audit: %s", " ".join(parts))
+        if sample_parts:
+            logger.warning("[SUMMARY] V2 financial audit samples: %s", " | ".join(sample_parts))
     _V2_LEGACY_EMPTY_STOCK_CODES = []
+    _V2_FINANCIAL_AUDIT_COUNTS = {}
+    _V2_FINANCIAL_AUDIT_SAMPLES = {}
+    _V2_FINANCIAL_AUDIT_SEEN = {}
 
 # ------------------------------------------------------------
 # スクリーニング必須フィルタ（環境変数で上書き可）
@@ -193,10 +237,10 @@ RECENT_LOW_NO_UPDATE_DAYS = int(os.getenv("RECENT_LOW_NO_UPDATE_DAYS", "10"))
 
 MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY = float(os.getenv("MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY", "75"))
 MIN_PIOTROSKI_CORE = int(os.getenv("MIN_PIOTROSKI_CORE", "6"))
-MIN_PIOTROSKI_COVERAGE_CORE = float(os.getenv("MIN_PIOTROSKI_COVERAGE_CORE", "0.60"))
+MIN_PIOTROSKI_COVERAGE_CORE = float(os.getenv("MIN_PIOTROSKI_COVERAGE_CORE", "0.70"))
 
 MAX_PS_VS_SECTOR_CORE = float(os.getenv("MAX_PS_VS_SECTOR_CORE", "1.10"))
-MAX_CRITICAL_MISSING_CORE = int(os.getenv("MAX_CRITICAL_MISSING_CORE", "2"))
+MAX_CRITICAL_MISSING_CORE = int(os.getenv("MAX_CRITICAL_MISSING_CORE", "0"))
 MAX_STATEMENT_STALENESS_DAYS_CORE = int(os.getenv("MAX_STATEMENT_STALENESS_DAYS_CORE", "270"))
 STALE_STATEMENT_MEDIUM_DAYS = int(os.getenv("STALE_STATEMENT_MEDIUM_DAYS", "180"))
 
@@ -508,6 +552,63 @@ def _financial_scalar_absent(val: Any) -> bool:
     return False
 
 
+CRITICAL_FINANCIAL_FIELD_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("missing_total_assets", ("total_assets", "TotalAssets")),
+    ("missing_equity", (
+        "equity",
+        "EquityAttributableToOwnersOfParent",
+        "Equity",
+        "NetAssets",
+        "OwnersEquity",
+    )),
+    ("missing_shares", (
+        "shares_outstanding",
+        "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+        "NumberOfIssuedAndOutstandingShares",
+        "IssuedShares",
+        "SharesOutstanding",
+        "ShOutFY",
+    )),
+    ("missing_sales", ("revenue", "NetSales", "Revenue", "OperatingRevenue")),
+    ("missing_operating_income", (
+        "operating_income",
+        "OperatingIncome",
+        "OperatingIncomeLoss",
+        "OperatingProfit",
+    )),
+    ("missing_net_income", (
+        "net_income",
+        "NetIncomeLoss",
+        "Profit",
+        "ProfitAttributableToOwnersOfParent",
+        "NetIncome",
+    )),
+)
+
+
+def _critical_missing_financial_fields(row: Optional[Dict[str, Any]]) -> List[str]:
+    """Core昇格に必須の財務フィールド欠損を、変換後/生キーの両方で判定する。"""
+    if not row:
+        return [label for label, _ in CRITICAL_FINANCIAL_FIELD_GROUPS]
+    missing: List[str] = []
+    for label, keys in CRITICAL_FINANCIAL_FIELD_GROUPS:
+        if all(_financial_scalar_absent(row.get(k)) for k in keys):
+            missing.append(label)
+    return missing
+
+
+def _critical_missing_reason_groups(missing_fields: List[str]) -> List[str]:
+    reasons: List[str] = []
+    fields = set(missing_fields or [])
+    if fields.intersection({"missing_total_assets", "missing_equity"}):
+        reasons.append("missing_total_assets_or_equity")
+    if fields.intersection({"missing_sales", "missing_operating_income", "missing_net_income"}):
+        reasons.append("missing_sales_or_income")
+    if "missing_shares" in fields:
+        reasons.append("missing_shares")
+    return reasons
+
+
 def _canonical_internal_stock_code(
     code: str,
     valid_stock_codes: Optional[set[str]] = None,
@@ -735,6 +836,11 @@ def _audit_v2_legacy_statement_fields(
         if summary_only:
             severe = [x for x in missing_labels if x not in summary_only_exempt]
             if severe:
+                if {"TotalAssets", "EquityAttributableToOwnersOfParent"}.intersection(severe):
+                    record_v2_financial_audit("critical_missing_total_assets_or_equity", log_code)
+                if "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock" in severe:
+                    record_v2_financial_audit("critical_missing_shares", log_code)
+                record_v2_financial_audit("critical_missing_any", log_code)
                 logger.warning(
                     "V2財務変換 [%s]: 最新行で欠損の可能性がある主要キー: %s — V2のFSキー名・エイリアス不足の疑いあり。キー一覧(抜粋)=%s",
                     log_code or "?",
@@ -742,7 +848,8 @@ def _audit_v2_legacy_statement_fields(
                     sample_keys,
                 )
             elif missing_labels:
-                logger.info(
+                record_v2_financial_audit("summary_only_expected_missing", log_code)
+                logger.debug(
                     "V2財務変換 [%s]: summary_only 想定内欠損のみ %s",
                     log_code or "?",
                     missing_labels,
@@ -763,11 +870,15 @@ def _audit_v2_legacy_statement_fields(
     oi = latest.get("OperatingIncome")
     if summary_only:
         if _financial_scalar_absent(nd) and _financial_scalar_absent(oi):
+            record_v2_financial_audit("critical_missing_sales_or_income", log_code)
+            record_v2_financial_audit("critical_missing_any", log_code)
             logger.warning(
                 "V2財務変換 [%s]: summary_only だが NetSales/OperatingIncome が最新行で欠損",
                 log_code or "?",
             )
         if _financial_scalar_absent(nn):
+            record_v2_financial_audit("critical_missing_net_income", log_code)
+            record_v2_financial_audit("critical_missing_any", log_code)
             logger.warning(
                 "V2財務変換 [%s]: summary_only だが NetIncomeLoss が最新行で欠損",
                 log_code or "?",
@@ -3065,6 +3176,7 @@ def _piot_adj_float(piot: Optional[dict]) -> Optional[float]:
 def compute_data_review_meta(
     *,
     critical_missing_count: int,
+    critical_missing_fields: Optional[List[str]] = None,
     statement_basis_used: Optional[str],
     fallback_basis_flag: bool,
     piot_coverage: Optional[float],
@@ -3086,8 +3198,10 @@ def compute_data_review_meta(
 
     if (statement_basis_used or "") != "annual" or fallback_basis_flag:
         add("statement_basis_fallback", 1)
-    if critical_missing_count > MAX_CRITICAL_MISSING_CORE:
-        add("critical_missing_too_many", 2)
+    if critical_missing_count >= 1:
+        add("critical_missing_financial_fields", 2)
+        for reason in _critical_missing_reason_groups(critical_missing_fields or []):
+            add(reason, 2)
     if (
         piot_coverage is not None
         and np.isfinite(float(piot_coverage))
@@ -3129,6 +3243,8 @@ def compute_data_review_meta(
             and float(piot_coverage) >= MIN_PIOTROSKI_COVERAGE_CORE
         )
     ):
+        final_level = "light"
+    elif set(reasons) <= {"summary_only_financials", "piotroski_coverage_low"}:
         final_level = "light"
     elif mx >= 2:
         final_level = "severe"
@@ -4035,6 +4151,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         cur_fin = financial_history[0].copy() if financial_history else {}
         prv_fin = financial_history[1].copy() if len(financial_history) > 1 else {}
         raw_fin = {"current": cur_fin.copy(), "previous": prv_fin.copy(), "current_price": current_price, "sector": sector}
+        critical_missing_fields = _critical_missing_financial_fields(raw_fin["current"])
+        critical_missing = len(critical_missing_fields)
         imputed_fin = fdm._fill_missing_fields(copy.deepcopy(raw_fin))
         imputation = imputed_fin.get("_imputation", {}) if isinstance(imputed_fin, dict) else {}
 
@@ -4192,16 +4310,6 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             if disclosed_dt:
                 statement_staleness_days = (latest_price_date - disclosed_dt).days
 
-        critical_missing = sum(
-            value is None for value in (
-                val.get("ps_ratio"),
-                val.get("per"),
-                piot.get("score") if isinstance(piot, dict) else None,
-                sales_cagr,
-                adv_jpy_20d,
-                statement_disclosed_date,
-            )
-        )
         fin_diag = {
             "financial_data_mode": fin_meta_src.get("financial_data_mode"),
             "fins_details_available": fin_meta_src.get("fins_details_available"),
@@ -4209,6 +4317,18 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "fins_details_error": fin_meta_src.get("fins_details_error"),
             "instrument_type": inst_t,
         }
+        piot_coverage_value = piot.get("piotroski_coverage_ratio") if isinstance(piot, dict) else None
+        try:
+            piot_coverage_float = float(piot_coverage_value) if piot_coverage_value is not None else None
+        except (TypeError, ValueError):
+            piot_coverage_float = None
+        summary_only_core_limited = bool(
+            str(fin_diag.get("financial_data_mode") or "").strip().lower() == "summary_only"
+            and (
+                piot_coverage_float is None
+                or (np.isfinite(piot_coverage_float) and piot_coverage_float < MIN_PIOTROSKI_COVERAGE_CORE)
+            )
+        )
         diagnostics = {
             **fin_diag,
             "latest_price_date": latest_price_date.isoformat() if latest_price_date else None,
@@ -4228,6 +4348,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "growth_proxy_detached_from_scoring": False,
             "imputation": imputation,
             "critical_missing_count": critical_missing,
+            "critical_missing_fields": ",".join(critical_missing_fields),
             "sector33_name_raw": sector33_raw,
             "raw_financial_fields": {
                 "has_current_shares": raw_fin["current"].get("shares_outstanding") is not None,
@@ -4239,7 +4360,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         }
 
         base_ok = bool(liquidity_ok and market_cap_ok and op_income_stable)
-        core_candidate = bool(base_ok and valuation_available and defensive_ps_ok and per_core_ok)
+        core_candidate = bool(
+            base_ok
+            and valuation_available
+            and defensive_ps_ok
+            and per_core_ok
+            and critical_missing == 0
+            and not summary_only_core_limited
+        )
         valuation_satellite_candidate = bool(base_ok and valuation_available and (not core_candidate))
         ps_only_satellite_candidate = bool(
             base_ok
@@ -4249,6 +4377,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             and (ps_ratio <= ps_satellite_limit)
         )
         satellite_candidate = bool(valuation_satellite_candidate or ps_only_satellite_candidate)
+        if critical_missing >= 1:
+            valuation_satellite_candidate = False
+            ps_only_satellite_candidate = False
+            satellite_candidate = False
+        elif summary_only_core_limited:
+            valuation_satellite_candidate = False
+            ps_only_satellite_candidate = False
+            satellite_candidate = False
         excluded_candidate = bool((not core_candidate) and (not satellite_candidate))
         if core_candidate:
             valuation_lane = "core"
@@ -4289,9 +4425,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             _pr_meta = piot.get("score")
         dr_meta = compute_data_review_meta(
             critical_missing_count=critical_missing,
+            critical_missing_fields=critical_missing_fields,
             statement_basis_used=statement_basis_used,
             fallback_basis_flag=(statement_basis_used == "fallback_primary_type"),
-            piot_coverage=piot.get("piotroski_coverage_ratio") if isinstance(piot, dict) else None,
+            piot_coverage=piot_coverage_value,
             statement_staleness_days=float(statement_staleness_days) if statement_staleness_days is not None else None,
             financial_data_mode=fin_diag.get("financial_data_mode"),
             fins_details_available=fin_diag.get("fins_details_available"),
@@ -4631,7 +4768,8 @@ def collect_all_daemon(session: requests.Session,
                        daily_budget: Optional[int] = None,
                        refresh_days: Optional[int] = None,
                        force_full: bool = False,
-                       reset_pending: bool = False) -> None:
+                       reset_pending: bool = False,
+                       max_batches: Optional[int] = None) -> None:
     fdm = FinancialDataManager(session)
     df = fdm.get_stock_list_v2(force_refresh=False)
     df = filter_collectable_equities_df(df)
@@ -4675,6 +4813,7 @@ def collect_all_daemon(session: requests.Session,
         f"[収集開始] 残り{len(pending)}銘柄  batch_limit={daily_budget}  mode={mode}",
     )
 
+    completed_batches = 0
     while pending:
         if graceful_shutdown.shutdown:
             logger.info("shutdown requested; stopping collect_all_daemon")
@@ -4779,6 +4918,13 @@ def collect_all_daemon(session: requests.Session,
             f"pending_before={pending_before}, pending_after={pending_after}"
         )
         _cli_print("📦 " + summary_lines, "[収集] " + summary_lines)
+        completed_batches += 1
+        if max_batches is not None and completed_batches >= int(max_batches):
+            _cli_print(
+                f"🛑 max_batches={max_batches} reached; stopping collect_all.",
+                f"[INFO] max_batches={max_batches} reached; stopping collect_all.",
+            )
+            break
         batch_bad = (
             taken >= 20
             and stats["success"] == 0
@@ -5098,6 +5244,7 @@ def _flatten_result(d: dict) -> dict:
         "imputed_field_count": imputation.get("field_count"),
         "imputed_fields": ",".join(sorted((imputation.get("fields") or {}).keys())),
         "critical_missing_count": diagnostics.get("critical_missing_count"),
+        "critical_missing_fields": diagnostics.get("critical_missing_fields"),
         "financial_data_mode": diagnostics.get("financial_data_mode"),
         "fins_details_available": diagnostics.get("fins_details_available"),
         "fins_details_status": diagnostics.get("fins_details_status"),
@@ -5173,6 +5320,7 @@ def write_candidate_sets(flat: pd.DataFrame, outdir: Path, timestamp: Optional[s
     ok = flat[flat["ok"] == True].copy()
     if ok.empty:
         return []
+    ok = _build_ranked(ok)
 
     core = ok[ok["core_candidate"] == True].copy()
     sat = ok[ok["satellite_candidate"] == True].copy()
@@ -5230,6 +5378,7 @@ def write_ma200_lane_csvs(flat: pd.DataFrame, outdir: Path) -> list[Path]:
     ok = flat[flat["ok"] == True].copy()
     if ok.empty or "candidate_lane" not in ok.columns:
         return []
+    ok = _build_ranked(ok)
     outs: list[Path] = []
     for lane, fname in _LANE_EXPORT_NAMES.items():
         sub = ok[ok["candidate_lane"].astype(str) == lane].copy()
@@ -5317,6 +5466,8 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
     lines = ["# おすすめトップテン（Core候補）", ""]
     lines.append("**注:** PEG/reference_peg は参考列であり、総合スコア・安全性・投機性判定には未使用です。")
     lines.append("**注:** statement_basis_used が fallback_primary_type の銘柄は通期比較が取れず、順位に軽微なデータ品質ペナルティを加算します。")
+    lines.append("**注:** financial_data_mode が summary_only の銘柄は財務詳細なしの暫定評価で、coverage不足やcritical missingがある場合はCore候補から除外します。")
+    lines.append("**注:** financial_data_mode が summary_only の銘柄は財務詳細なしの暫定評価で、grade_capped_reason に応じてグレード上限を適用します。")
     lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
     lines.append(
         "**注:** `legacy_total` は従来の総合スコア（バリュエーション・財務・安全性等の合成）です。"
@@ -5349,10 +5500,12 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         es_s = f"{float(es):.1f}" if es is not None and pd.notna(es) else "N/A"
         lane = r.get("candidate_lane", "")
         dr_r = r.get("data_review_reason") or ""
+        fdm = r.get("financial_data_mode") or ""
+        cap = r.get("grade_capped_reason") or ""
         lines.append(
             f"- **{r['code']} {r['name']}** | lane `{lane}` | legacy_total {r['total_score']:.1f} | "
             f"fundamental_edge {fe_s} | entry_timing_score {es_s} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
-            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
+            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | data_mode `{fdm}` | grade_cap `{cap}` | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
     p = outdir / f"report_core_top{topn}.md"
@@ -5366,6 +5519,27 @@ def _grade_from_score(s: float) -> str:
     if s >= 65: return "B+"
     if s >= 55: return "B"
     return "C"
+
+
+_GRADE_ORDER = {"C": 0, "B": 1, "B+": 2, "A": 3, "A+": 4}
+
+
+def _cap_grade_value(grade: str, cap: str) -> str:
+    return cap if _GRADE_ORDER.get(str(grade), 0) > _GRADE_ORDER.get(cap, 0) else str(grade)
+
+
+def _summary_only_grade_cap(row: pd.Series) -> Tuple[str, str]:
+    raw = str(row.get("grade_raw") or row.get("grade") or "C")
+    fdm = str(row.get("financial_data_mode") or "").strip().lower()
+    critical = pd.to_numeric(pd.Series([row.get("critical_missing_count")]), errors="coerce").iloc[0]
+    coverage = pd.to_numeric(pd.Series([row.get("piotroski_coverage_ratio")]), errors="coerce").iloc[0]
+    if fdm != "summary_only":
+        return raw, ""
+    if pd.notna(critical) and float(critical) >= 1:
+        return _cap_grade_value(raw, "C"), "critical_missing_cap_C"
+    if pd.isna(coverage) or float(coverage) < MIN_PIOTROSKI_COVERAGE_CORE:
+        return _cap_grade_value(raw, "C"), "coverage_low_cap_C"
+    return _cap_grade_value(raw, "B"), "summary_only_cap_B"
 
 def _val_score_from_ps_vs_sector(x: Optional[float]) -> float:
     if x is None or not np.isfinite(x): return 0.0
@@ -5483,7 +5657,7 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         "return_21d", "return_63d", "return_126d", "return_252d",
         "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "safety_criteria_score",
         "max_drawdown", "sales_cagr", "adv_jpy_20d", "adv_jpy_60d", "sector_ps_benchmark",
-        "imputed_field_count", "critical_missing_count", "statement_staleness_days"
+        "imputed_field_count", "critical_missing_count", "statement_staleness_days", "piotroski_coverage_ratio"
     ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -5564,7 +5738,10 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         df["data_penalty"]
     )
     df["total_score"] = df["total_score"].clip(lower=0, upper=100)
-    df["grade"] = df["total_score"].apply(_grade_from_score)
+    df["grade_raw"] = df["total_score"].apply(_grade_from_score)
+    capped = df.apply(_summary_only_grade_cap, axis=1)
+    df["grade"] = [x[0] for x in capped]
+    df["grade_capped_reason"] = [x[1] for x in capped]
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
     df["candidate_lane_sort"] = df["candidate_lane"].astype(str).map(
         lambda x: _CANDIDATE_LANE_SORT.get(str(x).strip(), 50)
@@ -5692,8 +5869,8 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("")
     lines.append(f"## 🏆 投資推奨 Top{topn}銘柄（Core、lane優先・legacy_total / entry_timing_score は別軸）")
     lines.append("")
-    lines.append("| 順位 | 銘柄 | 名 | G | legacy_total | lane | MA200局面 | fundamental_edge | entry_timing_score | dr_reason | dr_lvl | d200 | 上抜け | basing | down | peg_w | p_adj | p_cov | PS/防 | refPEG | pio |")
-    lines.append("|---|---|---|---|---:|---|---|---|---:|---|---|---|---:|---:|---|---|---|---|---|---:|---:|---|")
+    lines.append("| 順位 | 銘柄 | 名 | G | grade_cap | f_mode | legacy_total | lane | MA200局面 | fundamental_edge | entry_timing_score | dr_reason | dr_lvl | d200 | 上抜け | basing | down | peg_w | p_adj | p_cov | PS/防 | refPEG | pio |")
+    lines.append("|---|---|---|---|---|---|---:|---|---|---|---:|---|---|---|---:|---:|---|---|---|---|---|---:|---:|---|")
     for i, r in enumerate(top.itertuples(index=False), 1):
         ps_vs = 0 if pd.isna(r.ps_vs_sector) else r.ps_vs_sector
         psp = getattr(r, "ps_vs_sector_pre", np.nan)
@@ -5718,13 +5895,15 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
         pcv = getattr(r, "piotroski_coverage_ratio", np.nan)
         drr = getattr(r, "data_review_reason", "") or ""
         drl = getattr(r, "data_review_level", "") or ""
+        fdm = getattr(r, "financial_data_mode", "") or ""
+        gcr = getattr(r, "grade_capped_reason", "") or ""
         fe_s = "N/A" if fe is None or (isinstance(fe, float) and pd.isna(fe)) else f"{float(fe):.1f}"
         es_s = "N/A" if es is None or (isinstance(es, float) and pd.isna(es)) else f"{float(es):.1f}"
         dm_s = "N/A" if dm is None or (isinstance(dm, float) and pd.isna(dm)) else f"{float(dm):.3f}"
         pad_s = "N/A" if pad is None or (isinstance(pad, float) and pd.isna(pad)) else f"{float(pad):.2f}"
         pcv_s = "N/A" if pcv is None or (isinstance(pcv, float) and pd.isna(pcv)) else f"{float(pcv):.2f}"
         lines.append(
-            f"| {i} | {r.code} | {r.name} | {r.grade} | {r.total_score:.1f} | {lane} | {ms} | {fe_s} | {es_s} | {drr} | {drl} | {dm_s} | {xr} | {bs} | {dn} | {pwg} | {pad_s} | {pcv_s} | {psp_c} | {peg_cell} | {r.pio_disp} |"
+            f"| {i} | {r.code} | {r.name} | {r.grade} | {gcr} | {fdm} | {r.total_score:.1f} | {lane} | {ms} | {fe_s} | {es_s} | {drr} | {drl} | {dm_s} | {xr} | {bs} | {dn} | {pwg} | {pad_s} | {pcv_s} | {psp_c} | {peg_cell} | {r.pio_disp} |"
         )
     lines.append("")
     lines.append(f"## 📊 詳細分析（上位{details_n}銘柄）")
@@ -5732,7 +5911,9 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     detail_df = ranked.head(details_n)
     for i, r in enumerate(detail_df.itertuples(index=False), 1):
         lines.append(f"### {i}. [{r.code}] {r.name} ({r.sector})")
-        lines.append(f"**legacy_total（旧総合）:** {r.total_score:.1f}点 | **グレード:** {r.grade}")
+        _fdm = getattr(r, "financial_data_mode", "") or ""
+        _gcr = getattr(r, "grade_capped_reason", "") or ""
+        lines.append(f"**legacy_total（旧総合）:** {r.total_score:.1f}点 | **グレード:** {r.grade} | **data_mode:** {_fdm} | **grade_cap:** {_gcr}")
         _lane = getattr(r, "candidate_lane", "")
         _ms = getattr(r, "ma200_state", "")
         _fe = getattr(r, "fundamental_edge_score", np.nan)
@@ -5984,6 +6165,8 @@ def main() -> int:
     parser.add_argument("--refresh-days", type=int)
     parser.add_argument("--force-full", action="store_true")
     parser.add_argument("--force", action="store_true", help="--force-full と同等（skiplist 無視・メニュー7相当）")
+    parser.add_argument("--max-batches", type=int, help="collect_all の最大バッチ数。1なら1バッチで停止")
+    parser.add_argument("--once", action="store_true", help="collect_all を1バッチだけ実行（--max-batches 1 と同等）")
     parser.add_argument(
         "--force-refresh",
         action="store_true",
@@ -6000,6 +6183,10 @@ def main() -> int:
         return 130 if graceful_shutdown.shutdown else 0
 
     args.force_full = bool(args.force_full or getattr(args, "force", False))
+    if args.once:
+        args.max_batches = 1
+    if args.max_batches is not None and args.max_batches < 1:
+        raise SystemExit("--max-batches は 1 以上を指定してください")
 
     try:
         session = get_authenticated_session_jquants()
@@ -6012,7 +6199,8 @@ def main() -> int:
                                daily_budget=args.budget,
                                refresh_days=args.refresh_days,
                                force_full=args.force_full,
-                               reset_pending=args.reset_pending)
+                               reset_pending=args.reset_pending,
+                               max_batches=args.max_batches)
             return 130 if graceful_shutdown.shutdown else 0
 
         if args.phase == "collect":
