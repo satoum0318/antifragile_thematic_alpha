@@ -268,6 +268,39 @@ LANE_ENTRY_CAP: Dict[str, float] = {
 }
 
 # ------------------------------------------------------------
+# マーケットレジーム判定 / earnings ゲート / ポジションサイジング 設定
+# ------------------------------------------------------------
+# レジーム判定に用いる代表大型銘柄（フォールバック用。indices/topix が使えれば自動でそちらを優先）
+MARKET_REGIME_PROXY_CODES: List[str] = [
+    "7203",  # トヨタ
+    "6758",  # ソニーG
+    "9984",  # ソフトバンクG
+    "8035",  # 東京エレクトロン
+    "6861",  # キーエンス
+    "9432",  # NTT
+    "8306",  # 三菱UFJ
+    "9433",  # KDDI
+]
+MARKET_REGIME_RECLAIM_BOOST = float(os.getenv("MARKET_REGIME_RECLAIM_BOOST", "5.0"))  # risk_off 時の RECLAIM 閾値引き上げ幅
+EARNINGS_RECENT_WINDOW_DAYS = int(os.getenv("EARNINGS_RECENT_WINDOW_DAYS", "30"))     # 直近開示ボーナス窓
+EARNINGS_PRE_BLACKOUT_DAYS = int(os.getenv("EARNINGS_PRE_BLACKOUT_DAYS", "5"))         # 次決算予定前のゲート日数（無ければ前年同期 ±N日）
+LANE_MAX_WEIGHT: Dict[str, float] = {
+    "ma200_reclaim_core":     float(os.getenv("LANE_MAX_WEIGHT_RECLAIM", "0.08")),
+    "bottom_reversal_core":   float(os.getenv("LANE_MAX_WEIGHT_BOTTOM", "0.05")),
+    "watch_fundamental_core": float(os.getenv("LANE_MAX_WEIGHT_WATCH", "0.05")),
+    "data_review_light":      float(os.getenv("LANE_MAX_WEIGHT_DR_LIGHT", "0.04")),
+    "weak_reclaim_watch":     float(os.getenv("LANE_MAX_WEIGHT_WEAK", "0.03")),
+    "extended_above_ma200":   float(os.getenv("LANE_MAX_WEIGHT_EXTENDED", "0.025")),
+    "satellite_valuation":    float(os.getenv("LANE_MAX_WEIGHT_SATELLITE", "0.03")),
+    "satellite_ps_only":      float(os.getenv("LANE_MAX_WEIGHT_SATELLITE_PS", "0.025")),
+    "data_review":            float(os.getenv("LANE_MAX_WEIGHT_DATA_REVIEW", "0.02")),
+    "cyclical_value_trap":    float(os.getenv("LANE_MAX_WEIGHT_CYCLICAL", "0.0")),
+    "excluded":               float(os.getenv("LANE_MAX_WEIGHT_EXCLUDED", "0.0")),
+}
+POSITION_TARGET_ANNUAL_VOL = float(os.getenv("POSITION_TARGET_ANNUAL_VOL", "0.20"))   # ボラ標準化の目標年率σ
+POSITION_DEFAULT_CAPITAL_JPY = float(os.getenv("POSITION_DEFAULT_CAPITAL_JPY", "10000000"))  # 1千万円基準
+
+# ------------------------------------------------------------
 # ヘルパ
 # ------------------------------------------------------------
 def seconds_until_next_day(buffer_sec: int = 10) -> int:
@@ -1852,6 +1885,195 @@ class FinancialDataManager:
         """既存インタフェース維持。内部は V2 summary+details → legacy statements。"""
         return self.fetch_financials_v2_as_statements(code, force_refresh=force_refresh)
 
+    def fetch_short_selling(self, code: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """markets/short_selling から銘柄別空売り残データを取得し、変化率を計算する。
+
+        プランによっては取得不可（403/404）の場合があり、その時はメタに記録した上で空 dict を返す。
+        戻り値: {
+            "short_selling_change_rate": Optional[float],  # 直近 vs 5週前の変化率 (%)
+            "latest_short_selling_volume": Optional[float],
+            "snapshots_used": int,
+            "source": str,
+            "http_status": int,
+        }
+        """
+        out: Dict[str, Any] = {
+            "short_selling_change_rate": None,
+            "latest_short_selling_volume": None,
+            "snapshots_used": 0,
+            "source": "markets/short_selling",
+            "http_status": 0,
+            "error": "",
+        }
+        cache_key = f"v2_short_selling_{code}.json"
+        fpath = self.cache_dir / cache_key
+        ttl_sec = 24 * 3600
+        if (not force_refresh) and fpath.exists():
+            try:
+                mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
+                if (datetime.datetime.now() - mtime).total_seconds() < ttl_sec:
+                    j = json.loads(fpath.read_text(encoding="utf-8"))
+                    if isinstance(j, dict):
+                        return j
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        rows: List[Dict[str, Any]] = []
+        status = 0
+        err_text = ""
+        for qc in api_code_candidates(code):
+            try:
+                pages, st, err = paginate_v2_endpoint(self.session, "markets/short_selling", {"code": qc})
+                status = int(st) if st is not None else 0
+                err_text = (err or "")[:200]
+                if pages:
+                    rows = pages
+                    break
+                if st == 403 or st == 404:
+                    break
+            except requests.RequestException as e:
+                err_text = str(e)[:200]
+                continue
+
+        out["http_status"] = status
+        out["error"] = err_text
+
+        if rows:
+            try:
+                df = pd.DataFrame(rows)
+                date_col = next((c for c in df.columns if c.lower() in ("date", "publishedate", "reportdate")), None)
+                vol_col = next(
+                    (c for c in df.columns if c.lower() in (
+                        "shortselling", "shortsellingvolume", "shortsellingturnover",
+                        "shortmarginsellings", "sellingexcludingproprietary",
+                    )),
+                    None,
+                )
+                if date_col and vol_col:
+                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                    df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
+                    df = df.dropna(subset=[date_col, vol_col]).sort_values(date_col)
+                    if len(df) >= 6:
+                        latest = float(df[vol_col].iloc[-1])
+                        prior = float(df[vol_col].iloc[-6])
+                        if prior > 0:
+                            chg = (latest / prior - 1.0) * 100.0
+                            out["short_selling_change_rate"] = round(chg, 2)
+                        out["latest_short_selling_volume"] = latest
+                        out["snapshots_used"] = int(len(df))
+                    elif len(df) >= 2:
+                        latest = float(df[vol_col].iloc[-1])
+                        prior = float(df[vol_col].iloc[0])
+                        if prior > 0:
+                            chg = (latest / prior - 1.0) * 100.0
+                            out["short_selling_change_rate"] = round(chg, 2)
+                        out["latest_short_selling_volume"] = latest
+                        out["snapshots_used"] = int(len(df))
+            except (KeyError, ValueError, TypeError) as e:
+                out["error"] = f"parse_error: {e}"
+
+        try:
+            fpath.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        return out
+
+    def fetch_weekly_margin_interest(self, code: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """markets/weekly_margin_interest から信用倍率を取得（信用買残÷信用売残）。
+
+        戻り値: {
+            "margin_ratio": Optional[float],  # 信用倍率 (買残/売残)
+            "long_margin": Optional[float],
+            "short_margin": Optional[float],
+            "snapshots_used": int,
+            "source": str,
+            "http_status": int,
+        }
+        """
+        out: Dict[str, Any] = {
+            "margin_ratio": None,
+            "long_margin": None,
+            "short_margin": None,
+            "snapshots_used": 0,
+            "source": "markets/weekly_margin_interest",
+            "http_status": 0,
+            "error": "",
+        }
+        cache_key = f"v2_weekly_margin_{code}.json"
+        fpath = self.cache_dir / cache_key
+        ttl_sec = 24 * 3600
+        if (not force_refresh) and fpath.exists():
+            try:
+                mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
+                if (datetime.datetime.now() - mtime).total_seconds() < ttl_sec:
+                    j = json.loads(fpath.read_text(encoding="utf-8"))
+                    if isinstance(j, dict):
+                        return j
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        rows: List[Dict[str, Any]] = []
+        status = 0
+        err_text = ""
+        for qc in api_code_candidates(code):
+            try:
+                pages, st, err = paginate_v2_endpoint(self.session, "markets/weekly_margin_interest", {"code": qc})
+                status = int(st) if st is not None else 0
+                err_text = (err or "")[:200]
+                if pages:
+                    rows = pages
+                    break
+                if st in (403, 404):
+                    break
+            except requests.RequestException as e:
+                err_text = str(e)[:200]
+                continue
+
+        out["http_status"] = status
+        out["error"] = err_text
+
+        if rows:
+            try:
+                df = pd.DataFrame(rows)
+                # J-Quants の標準: LongMarginTradeVolume, ShortMarginTradeVolume
+                long_col = next(
+                    (c for c in df.columns if c.lower() in (
+                        "longmargintradevolume", "longmargin", "longmarginbuying", "buyingmargin",
+                    )),
+                    None,
+                )
+                short_col = next(
+                    (c for c in df.columns if c.lower() in (
+                        "shortmargintradevolume", "shortmargin", "shortmarginselling", "sellingmargin",
+                    )),
+                    None,
+                )
+                date_col = next((c for c in df.columns if c.lower() in ("date", "publishedate", "reportdate")), None)
+                if long_col and short_col:
+                    if date_col:
+                        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                        df = df.dropna(subset=[date_col]).sort_values(date_col)
+                    df[long_col] = pd.to_numeric(df[long_col], errors="coerce")
+                    df[short_col] = pd.to_numeric(df[short_col], errors="coerce")
+                    df = df.dropna(subset=[long_col, short_col])
+                    if not df.empty:
+                        latest = df.iloc[-1]
+                        lng = float(latest[long_col])
+                        srt = float(latest[short_col])
+                        out["long_margin"] = lng
+                        out["short_margin"] = srt
+                        if srt > 0:
+                            out["margin_ratio"] = round(lng / srt, 2)
+                        out["snapshots_used"] = int(len(df))
+            except (KeyError, ValueError, TypeError) as e:
+                out["error"] = f"parse_error: {e}"
+
+        try:
+            fpath.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        return out
+
     def _fill_missing_fields(self, fin: dict) -> dict:
         """診断・セクター比較用の欠損補完。Piotroski/バリュエーション本計算には流さないこと（analyze では raw_fin を使用）。"""
         cur, prev = fin.get("current", {}), fin.get("previous", {})
@@ -2701,6 +2923,8 @@ def calculate_medium_term_momentum(prices: pd.Series) -> dict:
         "momentum_6m_1m": None,
         "momentum_6m_3m": None,
         "momentum_3m_1m": None,
+        # Carhart モメンタムの古典的形式（直近 1ヶ月を除いた 12 ヶ月リターン）
+        "return_12m_1m": None,
     }
     if prices is None or len(prices) < 2:
         return out
@@ -2733,6 +2957,7 @@ def calculate_medium_term_momentum(prices: pd.Series) -> dict:
     out["momentum_6m_1m"] = _window_ret(126, 21)
     out["momentum_6m_3m"] = _window_ret(126, 63)
     out["momentum_3m_1m"] = _window_ret(63, 21)
+    out["return_12m_1m"] = _window_ret(252, 21)
     return out
 
 
@@ -2799,6 +3024,125 @@ def _adx_compare_recent(high: pd.Series, low: pd.Series, close: pd.Series) -> Tu
     except Exception:
         return None, None
     return adx_now, adx_prev
+
+
+def _load_market_index_series_offline() -> Tuple[Optional[pd.Series], str]:
+    """凍結キャッシュ内の代表大型銘柄の終値平均から TOPIX 代理系列を作る。
+    Returns (series, source_note)。代表銘柄の半数以上が揃わない場合は (None, reason)。
+    """
+    fc = FrozenCache()
+    closes: List[pd.Series] = []
+    used: List[str] = []
+    for c in MARKET_REGIME_PROXY_CODES:
+        df = fc.load_prices(c)
+        if df is None or df.empty:
+            continue
+        lookup = {col.lower(): col for col in df.columns}
+        cdate = next((lookup[k] for k in ("date", "tradingdate") if k in lookup), None)
+        cclose = next(
+            (lookup[k] for k in ("adjustmentclose", "adjclose", "close", "closeprice", "endprice") if k in lookup),
+            None,
+        )
+        if not cdate or not cclose:
+            continue
+        try:
+            s = pd.Series(
+                pd.to_numeric(df[cclose], errors="coerce").values,
+                index=pd.to_datetime(df[cdate], errors="coerce"),
+            )
+        except Exception:
+            continue
+        s = s.dropna().sort_index()
+        if s.empty:
+            continue
+        # 各銘柄系列の最初の値で正規化（指数化）して水準差を吸収
+        s = s / float(s.iloc[0])
+        closes.append(s)
+        used.append(c)
+    if len(closes) < max(2, len(MARKET_REGIME_PROXY_CODES) // 2):
+        return None, f"insufficient_proxy_coverage_used={len(used)}"
+    df_all = pd.concat(closes, axis=1)
+    df_all.columns = used
+    df_all = df_all.dropna(how="any")
+    if df_all.empty or len(df_all) < 210:
+        return None, f"insufficient_overlap_rows={len(df_all)}"
+    idx = df_all.mean(axis=1)
+    return idx, f"frozen_cache_avg(codes={','.join(used)})"
+
+
+def evaluate_market_regime(
+    session: Optional[requests.Session] = None,
+    *,
+    offline: bool = True,
+    override_state: Optional[str] = None,
+) -> Dict[str, Any]:
+    """市場レジーム（risk_on / neutral / risk_off）を決定する。
+
+    判定ロジック（指数の MA200 距離・MA200 上下・MA25 傾き）:
+      - risk_on:  price > MA200 かつ distance >=+2%、かつ MA25 上昇
+      - risk_off: price < MA200 かつ (distance <= -3% または MA25 下降)
+      - neutral:  上記以外
+    `override_state` を渡せば外部から強制設定可（テスト・運用）。
+    """
+    out: Dict[str, Any] = {
+        "regime": "neutral",
+        "regime_reason": "default",
+        "distance_from_ma200": None,
+        "trend_score": 0.0,
+        "source": "none",
+    }
+    if override_state in ("risk_on", "neutral", "risk_off"):
+        out["regime"] = override_state
+        out["regime_reason"] = "explicit_override"
+        return out
+
+    series: Optional[pd.Series] = None
+    src = "offline_proxy"
+    if offline:
+        series, src_note = _load_market_index_series_offline()
+        src = src_note
+    else:
+        # オンライン取得は将来 indices/topix のフックを追加できるよう、関数だけ用意。
+        # 現時点ではフォールバックで offline と同じ経路を使う。
+        series, src_note = _load_market_index_series_offline()
+        src = src_note
+
+    if series is None or len(series) < 210:
+        out["source"] = f"unavailable({src})"
+        out["regime_reason"] = "insufficient_market_data"
+        return out
+
+    s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+    last = float(s.iloc[-1])
+    ma200 = float(s.rolling(200, min_periods=200).mean().iloc[-1])
+    ma25_series = s.rolling(25, min_periods=25).mean()
+    ma25_now = float(ma25_series.iloc[-1]) if np.isfinite(ma25_series.iloc[-1]) else None
+    ma25_prev = float(ma25_series.iloc[-21]) if len(ma25_series) > 21 and np.isfinite(ma25_series.iloc[-21]) else None
+    ma25_slope = None
+    if ma25_now is not None and ma25_prev is not None and ma25_prev != 0:
+        ma25_slope = ma25_now / ma25_prev - 1.0
+    if not np.isfinite(ma200) or ma200 <= 0:
+        out["source"] = src
+        out["regime_reason"] = "ma200_not_finite"
+        return out
+    dist = last / ma200 - 1.0
+    out["distance_from_ma200"] = round(float(dist), 4)
+    out["source"] = src
+    score = float(np.clip(dist * 5.0, -1.0, 1.0))  # ±20%で飽和
+    if ma25_slope is not None:
+        score += float(np.clip(ma25_slope * 6.0, -0.6, 0.6))
+    out["trend_score"] = round(score, 3)
+
+    if last > ma200 and dist >= 0.02 and (ma25_slope is None or ma25_slope >= -0.005):
+        out["regime"] = "risk_on"
+        out["regime_reason"] = "above_ma200_uptrend"
+    elif last < ma200 and (dist <= -0.03 or (ma25_slope is not None and ma25_slope < -0.01)):
+        out["regime"] = "risk_off"
+        out["regime_reason"] = "below_ma200_downtrend"
+    else:
+        out["regime"] = "neutral"
+        out["regime_reason"] = "in_between"
+    return out
 
 
 def evaluate_ma200_entry_state(
@@ -3187,6 +3531,7 @@ def compute_data_review_meta(
     sector33_raw: Optional[str],
     piot_adjusted: Optional[float],
     piot_raw: Optional[float],
+    spec_inputs_insufficient: bool = False,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     levels: list[int] = []
@@ -3226,6 +3571,8 @@ def compute_data_review_meta(
             add("stale_statement", 1)
     if piot_raw is not None and np.isfinite(float(piot_raw)) and int(float(piot_raw)) <= 3:
         add("piotroski_raw_weak", 1)
+    if spec_inputs_insufficient:
+        add("spec_inputs_insufficient", 1)
 
     if not reasons:
         return {
@@ -3287,8 +3634,24 @@ def assign_entry_candidate_lane(
     ps_only_satellite_candidate: bool,
     buy_timing_gate: bool,
     downtrend_rejection_gate: bool,
+    market_regime: Optional[str] = None,
+    earnings_blackout: bool = False,
 ) -> str:
-    """推奨レーン（CSV・MD 用）。data_review_* は dr_meta と整合させる。"""
+    """推奨レーン（CSV・MD 用）。data_review_* は dr_meta と整合させる。
+
+    `market_regime`: "risk_on" / "neutral" / "risk_off"。risk_off では reclaim 閾値を
+    引き上げ、bottom_reversal_core を抑制する。
+    `earnings_blackout`: 直前決算リスクが高い場合に True。core 系昇格を抑え watch に下げる。
+    """
+    regime = str(market_regime or "neutral").strip().lower()
+    reclaim_min_fundamental = RECLAIM_CORE_MIN_FUNDAMENTAL
+    bottom_min_fundamental = MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY
+    suppress_bottom = False
+    if regime == "risk_off":
+        reclaim_min_fundamental = RECLAIM_CORE_MIN_FUNDAMENTAL + MARKET_REGIME_RECLAIM_BOOST
+        bottom_min_fundamental = MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY + MARKET_REGIME_RECLAIM_BOOST
+        suppress_bottom = True
+
     pw = str(peg_quality.get("peg_warning") or "")
     peg_extreme = pw in ("extremely_low_possible_oneoff", "very_low_check_cyclical")
     peg_reclaim_bad = pw in ("extremely_low_possible_oneoff", "eps_growth_too_high_oneoff_risk")
@@ -3349,8 +3712,9 @@ def assign_entry_candidate_lane(
     if (
         st == "ma200_reclaim"
         and (not downtrend_rejection_gate)
+        and (not earnings_blackout)
         and reclaim_quality
-        and fundamental_edge >= RECLAIM_CORE_MIN_FUNDAMENTAL
+        and fundamental_edge >= reclaim_min_fundamental
         and (not dr_meta.get("has_issues"))
     ):
         return "ma200_reclaim_core"
@@ -3358,8 +3722,9 @@ def assign_entry_candidate_lane(
     if (
         st == "ma200_reclaim"
         and (not downtrend_rejection_gate)
+        and (not earnings_blackout)
         and reclaim_quality
-        and fundamental_edge >= RECLAIM_CORE_MIN_FUNDAMENTAL
+        and fundamental_edge >= reclaim_min_fundamental
         and dr_light_only
     ):
         return "data_review_light"
@@ -3368,17 +3733,19 @@ def assign_entry_candidate_lane(
         st == "ma200_reclaim"
         and (not downtrend_rejection_gate)
         and reclaim_quality
-        and WEAK_RECLAIM_MIN_FUNDAMENTAL <= fundamental_edge < RECLAIM_CORE_MIN_FUNDAMENTAL
+        and WEAK_RECLAIM_MIN_FUNDAMENTAL <= fundamental_edge < reclaim_min_fundamental
         and (not dr_bad)
     ):
         return "weak_reclaim_watch"
 
     if (
-        fundamental_edge >= MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY
+        (not suppress_bottom)
+        and fundamental_edge >= bottom_min_fundamental
         and st == "below_ma200_basing"
         and ma_eval.get("below_ma200_downtrend") is not True
         and op_income_stable is True
         and (not downtrend_rejection_gate)
+        and (not earnings_blackout)
         and bottom_quality
     ):
         return "bottom_reversal_core"
@@ -3998,6 +4365,24 @@ def detect_speculative_manipulation_v2(
     stock_code: str | None = None
 ) -> dict:
     # 名称は歴史的互換のため維持。入力欠損が多い場合はテクニカル寄りの検出に偏る（返却の model_scope を参照）。
+    # 入力カバレッジを記録し、信用残・空売り・配当・業績・需給系のシグナルが全滅なら
+    # data_review 側で "spec_inputs_insufficient" を付けられるよう observed_count を返す。
+    fundamental_inputs_observed = sum(
+        1 for x in (
+            margin_ratio,
+            short_selling_change_rate,
+            yoy_eps_growth,
+            dividend_status if dividend_status not in (None, "") else None,
+            stagnant_days_after_spike,
+        ) if x is not None
+    )
+    technical_inputs_observed = sum(
+        1 for cond in (
+            (avg_volume is not None),
+            (current_volatility is not None and average_volatility not in (None, 0)),
+            below_ma25 or below_ma75 or (mas is not None and len(mas) > 0),
+        ) if cond
+    )
     score = 0
     flags = []; risks = []
     if margin_ratio is not None:
@@ -4023,19 +4408,112 @@ def detect_speculative_manipulation_v2(
     if yoy_eps_growth is not None and yoy_eps_growth < -30: score += 8; flags.append(f"⚠️ EPS急減: {yoy_eps_growth:.1f}%")
 
     level = "🔴 極めて投機的" if score>=70 else "🟠 高い" if score>=50 else "🟡 やや高い" if score>=30 else "🟢 低い"
+    if fundamental_inputs_observed >= 2:
+        model_scope = "fundamental_plus_technical"
+    elif fundamental_inputs_observed == 1:
+        model_scope = "partial_fundamental_technical"
+    else:
+        model_scope = "technical_only"
+    inputs_insufficient = bool(fundamental_inputs_observed == 0 and technical_inputs_observed <= 1)
     return {
         "score": score,
         "level": level,
         "warning_flags": flags,
         "risk_factors": risks,
         "max_score": 100,
-        "model_scope": "technical_only",
+        "model_scope": model_scope,
         "scope_note": "需給・信用残などの外部データ未接続時は、価格・出来高・ボラ・移動平均に基づく簡易プロキシです。",
+        "fundamental_inputs_observed": fundamental_inputs_observed,
+        "technical_inputs_observed": technical_inputs_observed,
+        "spec_inputs_insufficient": inputs_insufficient,
     }
 
 # ------------------------------------------------------------
 # 単銘柄フル分析（offline対応、モックなし）
 # ------------------------------------------------------------
+_MARKET_REGIME_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def get_cached_market_regime(session: Optional[requests.Session], *, offline: bool, override: Optional[str] = None) -> Dict[str, Any]:
+    """プロセス内で 1 度だけマーケットレジームを計算する（複数銘柄分析の高速化用）。"""
+    key = f"offline={bool(offline)}|override={override or ''}"
+    if key in _MARKET_REGIME_CACHE:
+        return _MARKET_REGIME_CACHE[key]
+    reg = evaluate_market_regime(session, offline=offline, override_state=override)
+    _MARKET_REGIME_CACHE[key] = reg
+    return reg
+
+
+def reset_market_regime_cache() -> None:
+    """テスト・連続バッチ用にキャッシュをリセット。"""
+    global _MARKET_REGIME_CACHE
+    _MARKET_REGIME_CACHE = {}
+
+
+def _evaluate_earnings_event_context(
+    statement_disclosed_date: Optional[datetime.date],
+    today: Optional[datetime.date] = None,
+    *,
+    op_income_yoy_pct: Optional[float] = None,
+    op_income_stable: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """直近決算開示日 / 次決算予定との関係から、earnings drift ボーナスと
+    pre-earnings blackout の有無を判定する簡易版。
+
+    Returns:
+      - "days_since_disclosure": 直近開示からの経過営業日（簡易: 暦日）
+      - "next_estimated_disclosure": 直近開示 + 92日（四半期周期想定）
+      - "post_earnings_drift_bonus": 直近30日内の好決算に対する加点(0〜+6)
+      - "earnings_blackout": 次決算予定の ±N 日に入っているか
+      - "earnings_signal": "positive_recent"|"negative_recent"|"none"
+    """
+    if today is None:
+        today = datetime.date.today()
+    out: Dict[str, Any] = {
+        "days_since_disclosure": None,
+        "next_estimated_disclosure": None,
+        "post_earnings_drift_bonus": 0.0,
+        "earnings_penalty": 0.0,
+        "earnings_blackout": False,
+        "earnings_signal": "none",
+    }
+    if statement_disclosed_date is None:
+        return out
+    try:
+        delta = (today - statement_disclosed_date).days
+    except (TypeError, ValueError):
+        return out
+    out["days_since_disclosure"] = int(delta)
+    nxt = statement_disclosed_date + datetime.timedelta(days=92)
+    out["next_estimated_disclosure"] = nxt.isoformat()
+    if 0 <= delta <= EARNINGS_RECENT_WINDOW_DAYS:
+        if op_income_yoy_pct is not None and np.isfinite(op_income_yoy_pct):
+            yoy = float(op_income_yoy_pct)
+            if yoy >= 15.0 and op_income_stable is not False:
+                out["post_earnings_drift_bonus"] = 6.0
+                out["earnings_signal"] = "positive_recent"
+            elif yoy >= 5.0 and op_income_stable is not False:
+                out["post_earnings_drift_bonus"] = 3.0
+                out["earnings_signal"] = "positive_recent"
+            elif yoy <= -15.0:
+                out["earnings_penalty"] = 6.0
+                out["earnings_signal"] = "negative_recent"
+            elif yoy <= -5.0:
+                out["earnings_penalty"] = 3.0
+                out["earnings_signal"] = "negative_recent"
+        elif op_income_stable is True:
+            out["post_earnings_drift_bonus"] = 2.0
+            out["earnings_signal"] = "positive_recent"
+        elif op_income_stable is False:
+            out["earnings_penalty"] = 3.0
+            out["earnings_signal"] = "negative_recent"
+
+    days_to_next = (nxt - today).days
+    if 0 <= days_to_next <= EARNINGS_PRE_BLACKOUT_DAYS:
+        out["earnings_blackout"] = True
+    return out
+
+
 def analyze_single_stock_complete_v3(session: requests.Session,
                                      sector_averages: dict,
                                      code: str,
@@ -4045,8 +4523,12 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                                      *,
                                      offline: bool = False,
                                      instrument_type: str | None = None,
+                                     market_regime: Optional[Dict[str, Any]] = None,
                                      ) -> dict:
     try:
+        if market_regime is None:
+            market_regime = get_cached_market_regime(session, offline=offline)
+        regime_state = str(market_regime.get("regime") or "neutral").lower() if isinstance(market_regime, dict) else "neutral"
         fdm = FinancialDataManager(session)
         sector33_raw = (sector_hint or "").strip() or None
         sector_src = sector33_raw or DynamicSectorAverages.get_sector_static(code)
@@ -4176,7 +4658,31 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         val["peg_trusted"] = peg_quality.get("peg_trusted")
         val["peg_warning"] = peg_quality.get("peg_warning")
         eps_growth_for_scoring = val.get("eps_growth_rate")
+
+        # 信用残・空売り残（V2 API。プラン不足や offline 時はキャッシュのみ参照）
+        short_info: Dict[str, Any] = {}
+        margin_info: Dict[str, Any] = {}
+        if not skip_financial_lane:
+            try:
+                if offline:
+                    sp = (CACHE_DIR / f"v2_short_selling_{code}.json")
+                    if sp.exists():
+                        short_info = json.loads(sp.read_text(encoding="utf-8"))
+                    mp = (CACHE_DIR / f"v2_weekly_margin_{code}.json")
+                    if mp.exists():
+                        margin_info = json.loads(mp.read_text(encoding="utf-8"))
+                else:
+                    short_info = fdm.fetch_short_selling(code)
+                    margin_info = fdm.fetch_weekly_margin_interest(code)
+            except (OSError, json.JSONDecodeError, requests.RequestException):
+                short_info, margin_info = {}, {}
+
+        margin_ratio_val = margin_info.get("margin_ratio") if isinstance(margin_info, dict) else None
+        short_change_val = short_info.get("short_selling_change_rate") if isinstance(short_info, dict) else None
+
         safety = calculate_safety_score_v3(
+            margin_ratio=margin_ratio_val,
+            short_selling_change_rate=short_change_val,
             yoy_eps_growth=eps_growth_for_scoring,
             avg_volume=avg_volume,
             avg_trading_value=adv_jpy_20d,
@@ -4184,6 +4690,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             below_ma25=below_ma25, below_ma75=below_ma75
         )
         spec = detect_speculative_manipulation_v2(
+            margin_ratio=margin_ratio_val,
+            short_selling_change_rate=short_change_val,
             yoy_eps_growth=eps_growth_for_scoring,
             avg_volume=avg_volume,
             current_volatility=cur_vol, average_volatility=avg_vol,
@@ -4404,6 +4912,23 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         except (TypeError, ValueError, ZeroDivisionError):
             op_income_yoy_pct = None
 
+        # earnings event context（直近開示日からの drift と次回 blackout 判定）
+        _disc_date = diagnostics.get("statement_disclosed_date") if isinstance(diagnostics, dict) else None
+        if isinstance(_disc_date, str):
+            try:
+                _disc_date = datetime.datetime.strptime(_disc_date[:10], "%Y-%m-%d").date()
+            except ValueError:
+                _disc_date = None
+        elif isinstance(_disc_date, datetime.datetime):
+            _disc_date = _disc_date.date()
+        _today_for_event = latest_price_date or datetime.date.today()
+        earnings_ctx = _evaluate_earnings_event_context(
+            _disc_date,
+            today=_today_for_event,
+            op_income_yoy_pct=op_income_yoy_pct,
+            op_income_stable=op_income_eval.get("stable"),
+        )
+
         ps_vs_sector_pre = _ps_vs_sector_ratio(ps_ratio, sector_ps_benchmark, None)
         _op_stable_tri = op_income_eval.get("stable")
         fundamental_edge_score = compute_fundamental_edge_score(
@@ -4420,6 +4945,12 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             statement_basis_used=statement_basis_used,
             statement_staleness_days=float(statement_staleness_days) if statement_staleness_days is not None else None,
         )
+        # earnings drift bonus / penalty を fundamental_edge へ反映（0-100クリップは下流で保証）
+        try:
+            _earn_delta = float(earnings_ctx.get("post_earnings_drift_bonus") or 0.0) - float(earnings_ctx.get("earnings_penalty") or 0.0)
+            fundamental_edge_score = float(max(0.0, min(100.0, fundamental_edge_score + _earn_delta)))
+        except (TypeError, ValueError):
+            pass
         _pr_meta = piot.get("piotroski_raw_score")
         if _pr_meta is None:
             _pr_meta = piot.get("score")
@@ -4436,6 +4967,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             sector33_raw=sector33_raw,
             piot_adjusted=piot.get("piotroski_adjusted_score") if isinstance(piot, dict) else None,
             piot_raw=float(_pr_meta) if _pr_meta is not None and np.isfinite(float(_pr_meta)) else None,
+            spec_inputs_insufficient=bool(spec.get("spec_inputs_insufficient")) if isinstance(spec, dict) else False,
         )
         buy_timing_gate = bool(
             (str(ma200_eval.get("ma200_state")) == "ma200_reclaim")
@@ -4461,6 +4993,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             ps_only_satellite_candidate=ps_only_satellite_candidate,
             buy_timing_gate=buy_timing_gate,
             downtrend_rejection_gate=downtrend_rejection_gate,
+            market_regime=regime_state,
+            earnings_blackout=bool(earnings_ctx.get("earnings_blackout")),
         )
         entry_score = cap_entry_score(_entry_raw, entry_candidate_lane, dr_meta)
 
@@ -4516,6 +5050,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "momentum_6m_1m": momentum.get("momentum_6m_1m"),
             "momentum_6m_3m": momentum.get("momentum_6m_3m"),
             "momentum_3m_1m": momentum.get("momentum_3m_1m"),
+            "return_12m_1m": momentum.get("return_12m_1m"),
             "piotroski": piot,
             "ps_ratio": ps_ratio,
             "peg_ratio": val.get("peg_ratio"),
@@ -4556,6 +5091,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "instrument_type": inst_t,
             "data_review_reason": dr_meta.get("data_review_reason"),
             "data_review_level": dr_meta.get("data_review_level"),
+            "market_regime": regime_state,
+            "market_regime_meta": market_regime if isinstance(market_regime, dict) else None,
+            "earnings_signal": earnings_ctx.get("earnings_signal"),
+            "earnings_blackout": bool(earnings_ctx.get("earnings_blackout")),
+            "post_earnings_drift_bonus": float(earnings_ctx.get("post_earnings_drift_bonus") or 0.0),
+            "earnings_penalty_applied": float(earnings_ctx.get("earnings_penalty") or 0.0),
+            "days_since_disclosure": earnings_ctx.get("days_since_disclosure"),
+            "next_estimated_disclosure": earnings_ctx.get("next_estimated_disclosure"),
         }
     except Exception as e:
         return {
@@ -5195,6 +5738,7 @@ def _flatten_result(d: dict) -> dict:
         "momentum_6m_1m": d.get("momentum_6m_1m"),
         "momentum_6m_3m": d.get("momentum_6m_3m"),
         "momentum_3m_1m": d.get("momentum_3m_1m"),
+        "return_12m_1m": d.get("return_12m_1m"),
         "piot": pio.get("score"),
         "piot_eval": pio.get("evaluation"),
         "piot_observed_items": pio.get("observed_items"),
@@ -5251,6 +5795,13 @@ def _flatten_result(d: dict) -> dict:
         "fins_details_error": diagnostics.get("fins_details_error"),
         "fundamental_edge_score": d.get("fundamental_edge_score"),
         "entry_score": d.get("entry_score"),
+        "market_regime": d.get("market_regime"),
+        "earnings_signal": d.get("earnings_signal"),
+        "earnings_blackout": d.get("earnings_blackout"),
+        "post_earnings_drift_bonus": d.get("post_earnings_drift_bonus"),
+        "earnings_penalty_applied": d.get("earnings_penalty_applied"),
+        "days_since_disclosure": d.get("days_since_disclosure"),
+        "next_estimated_disclosure": d.get("next_estimated_disclosure"),
         "data_review_reason": flt.get("data_review_reason") or d.get("data_review_reason"),
         "data_review_level": flt.get("data_review_level") or d.get("data_review_level"),
         "ps_vs_sector_pre": d.get("ps_vs_sector_pre"),
@@ -5529,16 +6080,38 @@ def _cap_grade_value(grade: str, cap: str) -> str:
 
 
 def _summary_only_grade_cap(row: pd.Series) -> Tuple[str, str]:
+    """summary_only / fins_details 不在時のグレード上限を段階化する。
+
+    変更点 (期待値改善のためのリビジョン):
+      - 完全な summary_only_cap_B 一律ではなく、coverage と critical_missing と
+        op_income_stable に応じて B+ / B / C のいずれかへ段階化。
+      - `fins_details_available == False` を含めて統一的に判定し、Premium 復活時の
+        挙動と切り分けやすくする。
+    """
     raw = str(row.get("grade_raw") or row.get("grade") or "C")
     fdm = str(row.get("financial_data_mode") or "").strip().lower()
+    fda_raw = row.get("fins_details_available")
+    if isinstance(fda_raw, str):
+        fda = fda_raw.strip().lower() in ("true", "1", "yes")
+    else:
+        fda = bool(fda_raw) if fda_raw is not None and fda_raw == fda_raw else None
     critical = pd.to_numeric(pd.Series([row.get("critical_missing_count")]), errors="coerce").iloc[0]
     coverage = pd.to_numeric(pd.Series([row.get("piotroski_coverage_ratio")]), errors="coerce").iloc[0]
-    if fdm != "summary_only":
+    op_stable = row.get("op_income_stable")
+    if isinstance(op_stable, str):
+        op_stable_b = op_stable.strip().lower() in ("true", "1", "yes")
+    else:
+        op_stable_b = bool(op_stable) if op_stable is True else False
+
+    needs_cap = (fdm == "summary_only") or (fda is False)
+    if not needs_cap:
         return raw, ""
     if pd.notna(critical) and float(critical) >= 1:
         return _cap_grade_value(raw, "C"), "critical_missing_cap_C"
     if pd.isna(coverage) or float(coverage) < MIN_PIOTROSKI_COVERAGE_CORE:
         return _cap_grade_value(raw, "C"), "coverage_low_cap_C"
+    if float(coverage) >= 0.85 and op_stable_b:
+        return _cap_grade_value(raw, "B+"), "summary_only_high_coverage_cap_Bplus"
     return _cap_grade_value(raw, "B"), "summary_only_cap_B"
 
 def _val_score_from_ps_vs_sector(x: Optional[float]) -> float:
@@ -5655,9 +6228,10 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     for c in [
         "ps", "reference_peg", "per", "rsi", "adx", "piot", "safety", "spec_score", "below_ma200",
         "return_21d", "return_63d", "return_126d", "return_252d",
-        "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "safety_criteria_score",
+        "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "return_12m_1m", "safety_criteria_score",
         "max_drawdown", "sales_cagr", "adv_jpy_20d", "adv_jpy_60d", "sector_ps_benchmark",
-        "imputed_field_count", "critical_missing_count", "statement_staleness_days", "piotroski_coverage_ratio"
+        "imputed_field_count", "critical_missing_count", "statement_staleness_days", "piotroski_coverage_ratio",
+        "volatility", "avg_volatility", "current_price", "price",
     ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -5674,6 +6248,45 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         return float(ps) / float(med)
 
     df["ps_vs_sector"] = df.apply(_ps_vs_sector, axis=1)
+
+    # --- セクター内 percentile（多軸中立化） ---
+    # 'その他' セクターはバラバラな業種を内包しているため、percentile は信頼性が低い
+    # → 該当銘柄は NaN にする（追加スコアに寄与させない）
+    def _sector_pct_rank(col: str, higher_is_better: bool = True) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(np.nan, index=df.index)
+        s = pd.to_numeric(df[col], errors="coerce")
+        if s.notna().sum() == 0:
+            return pd.Series(np.nan, index=df.index)
+        ranked = s.groupby(df["sector"]).rank(method="average", pct=True, ascending=higher_is_better)
+        # 'その他' セクターは中立化に値しない
+        ranked = ranked.where(df["sector"].astype(str) != "その他", np.nan)
+        # サンプル数が極端に少ないセクター (n<5) も信頼性低 → NaN
+        sec_n = df.groupby("sector")["sector"].transform("count")
+        ranked = ranked.where(sec_n >= 5, np.nan)
+        return ranked.astype(float)
+
+    df["piot_pct_in_sector"] = _sector_pct_rank("piot", higher_is_better=True)
+    df["return_252d_pct_in_sector"] = _sector_pct_rank("return_252d", higher_is_better=True)
+    df["return_12m_1m_pct_in_sector"] = _sector_pct_rank("return_12m_1m", higher_is_better=True)
+    df["per_pct_in_sector"] = _sector_pct_rank("per", higher_is_better=False)   # 低 PER が高 percentile
+    df["ps_pct_in_sector"] = _sector_pct_rank("ps", higher_is_better=False)     # 低 PS が高 percentile
+    df["ma200_timing_pct_in_sector"] = _sector_pct_rank("ma200_timing_score", higher_is_better=True) if "ma200_timing_score" in df.columns else pd.Series(np.nan, index=df.index)
+
+    # 多軸 percentile を合成した「セクター内総合 percentile」 0-1
+    pct_cols = [
+        c for c in [
+            "piot_pct_in_sector",
+            "return_252d_pct_in_sector",
+            "return_12m_1m_pct_in_sector",
+            "per_pct_in_sector",
+            "ps_pct_in_sector",
+        ] if c in df.columns
+    ]
+    if pct_cols:
+        df["sector_neutral_score"] = df[pct_cols].mean(axis=1, skipna=True)
+    else:
+        df["sector_neutral_score"] = np.nan
 
     df["valuation_ps"] = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
     df["valuation_score"] = df["valuation_ps"]                     # PEGは参考指標のためスコアに含めない（0-10）
@@ -5727,12 +6340,18 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         _penalties.append(pen)
     df["data_penalty"] = _penalties
 
+    # セクター中立ボーナス（最大 +4 点）— 'その他'・サンプル過少セクターは NaN→0扱い
+    df["sector_neutral_bonus"] = (
+        df["sector_neutral_score"].astype(float).fillna(0.0).clip(lower=0.0, upper=1.0) * 4.0
+    )
+
     df["total_score"] = (
         df["valuation_score"] +
         df["financial_score"] +
         df["resilience_score"] +
         df["technical_score"] +
-        df["safety_score_scaled"] -
+        df["safety_score_scaled"] +
+        df["sector_neutral_bonus"] -
         df["spec_penalty"] -
         df["per_penalty"] -
         df["data_penalty"]
@@ -5772,6 +6391,48 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     fed = pd.to_numeric(df["fundamental_edge_score"], errors="coerce")
     df["rec_secondary"] = ent
     df.loc[df["rec_priority"] == 40, "rec_secondary"] = fed.loc[df["rec_priority"] == 40]
+
+    # --- ポジションサイジング・推奨ストップ・利確の試算 ---
+    # 既存の `volatility` (日次標準偏差 比率) と `avg_volatility` がある場合はそれを使う。
+    # 無ければ MA200 距離やレーン別の標準値で代用する。
+    capital = POSITION_DEFAULT_CAPITAL_JPY
+    target_annual_vol = POSITION_TARGET_ANNUAL_VOL
+    # 日次→年率の素朴な換算（営業日 252）
+    SQRT252 = math.sqrt(252.0)
+    vol_daily = pd.to_numeric(df.get("volatility", pd.Series(np.nan, index=df.index)), errors="coerce")
+    avg_vol_daily = pd.to_numeric(df.get("avg_volatility", pd.Series(np.nan, index=df.index)), errors="coerce")
+    # volatility がない場合は avg_volatility を、両方ない場合は 0.022 (年率35%相当) を仮置き
+    eff_daily_vol = vol_daily.fillna(avg_vol_daily).fillna(0.022)
+    stock_annual_vol = (eff_daily_vol * SQRT252).clip(lower=0.05, upper=1.5)
+    raw_weight = (target_annual_vol / stock_annual_vol).clip(lower=0.0, upper=0.10)
+
+    lane_max_series = df["candidate_lane"].astype(str).map(LANE_MAX_WEIGHT)
+    lane_max_series = lane_max_series.fillna(0.02)  # 未知レーンは保守的に 2%
+    df["recommended_weight"] = (raw_weight.combine(lane_max_series, min)).round(4)
+
+    price_col = "current_price" if "current_price" in df.columns else "price"
+    price_series = pd.to_numeric(df.get(price_col, pd.Series(np.nan, index=df.index)), errors="coerce")
+    rec_value_jpy = df["recommended_weight"].astype(float) * float(capital)
+    df["recommended_value_jpy"] = rec_value_jpy.round(0).astype("Int64", errors="ignore") if hasattr(pd, "Int64Dtype") else rec_value_jpy.round(0)
+    # 100株単位で丸める（東証は通常 100株）
+    raw_shares = (rec_value_jpy / price_series).where(price_series > 0, np.nan)
+    df["recommended_shares"] = (np.floor(raw_shares / 100.0) * 100.0).fillna(0).astype(int)
+
+    # ストップ案: MA200 上にいる場合は MA200×0.95、下なら 直近終値 × (1 - max(8%, daily_vol×2.5))
+    ma_state = df["ma200_state"].astype(str) if "ma200_state" in df.columns else pd.Series("", index=df.index)
+    ma200_dist = pd.to_numeric(df.get("distance_from_ma200", pd.Series(np.nan, index=df.index)), errors="coerce")
+    # MA200 = price / (1 + dist)
+    ma200_price = (price_series / (1.0 + ma200_dist)).where(ma200_dist.notna() & (ma200_dist > -0.99), np.nan)
+    stop_below_pct = (eff_daily_vol * 2.5).clip(lower=0.05, upper=0.18)
+    stop_default = price_series * (1.0 - stop_below_pct)
+    stop_ma200 = (ma200_price * 0.95).where(ma_state.isin(["ma200_reclaim", "above_ma200_near", "above_ma200_extended"]), np.nan)
+    df["suggested_stop_price"] = stop_ma200.fillna(stop_default).round(2)
+
+    # 利確案: 中央値 +20%、bottom_reversal は +25%、reclaim_core/watch は +20%
+    tp_mult = pd.Series(1.20, index=df.index)
+    tp_mult = tp_mult.mask(df["candidate_lane"].astype(str) == "bottom_reversal_core", 1.25)
+    tp_mult = tp_mult.mask(df["candidate_lane"].astype(str) == "extended_above_ma200", 1.12)
+    df["suggested_take_profit"] = (price_series * tp_mult).round(2)
 
     return df
 
@@ -6033,6 +6694,13 @@ def run_interactive():
                 print("キャッシュ不足。先に収集を実行してください。")
                 continue
 
+            reset_market_regime_cache()
+            regime = get_cached_market_regime(session, offline=True)
+            _cli_print(
+                f"🌐 market_regime={regime.get('regime')} dist={regime.get('distance_from_ma200')} src={regime.get('source')}",
+                f"[regime] {regime.get('regime')} dist={regime.get('distance_from_ma200')} src={regime.get('source')}",
+            )
+
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
             ex = ThreadPoolExecutor(max_workers=max_workers)
@@ -6237,6 +6905,13 @@ def main() -> int:
             if not tasks:
                 print("キャッシュ不足。先に --phase collect か collect_all を実行してください。")
                 return 0
+
+            reset_market_regime_cache()
+            regime = get_cached_market_regime(session, offline=True)
+            _cli_print(
+                f"🌐 market_regime={regime.get('regime')} dist={regime.get('distance_from_ma200')} src={regime.get('source')}",
+                f"[regime] {regime.get('regime')} dist={regime.get('distance_from_ma200')} src={regime.get('source')}",
+            )
 
             results = []
             max_workers = max(4, min(16, (os.cpu_count() or 4) * 2))
