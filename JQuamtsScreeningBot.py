@@ -1131,6 +1131,7 @@ def fetch_prices_v2_with_meta(
             "err": last_err,
             "from_cache": False,
             "transient": transient,
+            "empty_http200": last_st == 200,
         }
     df = normalize_prices_v2(pd.DataFrame(rows))
     try:
@@ -5160,6 +5161,12 @@ def collect_one_code_result(
             ph = int(pmeta.get("http", 200) or 200)
             if ph in (401, 403):
                 return {**out, "status": "auth_or_permission_error", "reason": f"price_http_{ph}"}
+            if bool(pmeta.get("transient")):
+                return {**out, "status": "transient_error", "reason": f"price_transient_http_{ph}"}
+            if bool(pmeta.get("empty_http200")):
+                return {**out, "status": "permanent_missing_financials", "reason": "price_empty_http200"}
+            if ph != 200:
+                return {**out, "status": "permanent_missing_financials", "reason": f"price_http_{ph}"}
             return {**out, "status": "transient_error", "reason": f"price_http_{ph}"}
 
         df_p, pmeta = fetch_prices_v2_with_meta(
@@ -5175,6 +5182,10 @@ def collect_one_code_result(
                 return {**out, "status": "auth_or_permission_error", "reason": f"price_http_{ph}"}
             if bool(pmeta.get("transient")):
                 return {**out, "status": "transient_error", "reason": f"price_transient_http_{ph}"}
+            if bool(pmeta.get("empty_http200")):
+                return {**out, "status": "permanent_missing_financials", "reason": "price_empty_http200"}
+            if ph != 200:
+                return {**out, "status": "permanent_missing_financials", "reason": f"price_http_{ph}"}
 
         fdm = FinancialDataManager(session)
         stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
@@ -5243,7 +5254,7 @@ def _load_pending(
     force_full: bool = False,
     refresh_days: Optional[int] = None,
     ignore_skiplist: bool = False,
-) -> list[str]:
+) -> Tuple[list[str], Dict[str, Any]]:
     fc = FrozenCache()
     allowed = {str(c).strip() for c in df["Code"].astype(str)}
     skip_set: set[str] = set()
@@ -5280,7 +5291,7 @@ def _load_pending(
     if force_full:
         codes = _skip_skipped(_intersect_allow([str(c).strip() for c in df["Code"].astype(str)]))
         _save_pending(codes)
-        return codes
+        return codes, {}
 
     if refresh_days is not None:
         codes_raw = [
@@ -5288,16 +5299,17 @@ def _load_pending(
             for c in df["Code"].astype(str)
             if str(c).strip() in allowed and not fc.has_all(str(c).strip(), max_age_days=refresh_days)
         ]
-        codes = _skip_skipped(_intersect_allow(codes_raw))
+        canon_stale = _intersect_allow(codes_raw)
+        codes = _skip_skipped(canon_stale)
         _save_pending(codes)
-        return codes
+        return codes, {"refresh_stale_before_skip": len(canon_stale)}
 
     if PENDING_FILE.exists():
         try:
             raw_pending = json.loads(PENDING_FILE.read_text(encoding="utf-8")).get("codes", [])
             filt = _skip_skipped(_intersect_allow([str(c) for c in raw_pending]))
             _save_pending(filt)
-            return filt
+            return filt, {}
         except Exception:
             pass
 
@@ -5305,7 +5317,7 @@ def _load_pending(
         _intersect_allow([str(c).strip() for c in df["Code"].astype(str) if not fc.has_all(str(c).strip())])
     )
     _save_pending(codes)
-    return codes
+    return codes, {}
 
 def collect_all_daemon(session: requests.Session,
                        daily_budget: Optional[int] = None,
@@ -5334,9 +5346,34 @@ def collect_all_daemon(session: requests.Session,
         prune_stale_collection_sidecars(valid_set)
 
     ignore_skiplist = bool(force_full)
-    pending = _load_pending(df, force_full=force_full, refresh_days=refresh_days, ignore_skiplist=ignore_skiplist)
+    pending, pending_meta = _load_pending(
+        df, force_full=force_full, refresh_days=refresh_days, ignore_skiplist=ignore_skiplist,
+    )
     if not pending:
-        _cli_print("📦 すでに全件取得済み", "[収集] すでに全件取得済み")
+        if refresh_days is not None:
+            stale_before_skip = int(pending_meta.get("refresh_stale_before_skip", 0))
+            if stale_before_skip <= 0:
+                _cli_print(
+                    f"📦 鮮度再取得の対象はありません（価格・財務の凍結があり、"
+                    f"更新から {refresh_days} 日より古い組み合わせはありません）。",
+                    f"[収集] refresh_days={refresh_days}: no stale frozen caches",
+                )
+            else:
+                _cli_print(
+                    f"📦 価格・財務キャッシュが {refresh_days} 日より古い銘柄は {stale_before_skip} 件ありますが、"
+                    f"すべて収集スキップリスト対象のため今回はバッチしません。"
+                    f"（先に permanent_missing_financials 等で落ちた銘柄がここに残りやすいです）",
+                    f"[収集] refresh_days={refresh_days}: {stale_before_skip} stale codes excluded by skiplist",
+                )
+                logger.info(
+                    "[INFO] refresh_days mode: %s collectable codes exceed freshness threshold before skiplist; "
+                    "0 pending after skiplist — see %s / %s",
+                    stale_before_skip,
+                    COLLECTION_SKIPLIST_PATH,
+                    MISSING_FINANCIALS_CSV,
+                )
+        else:
+            _cli_print("📦 すでに全件取得済み", "[収集] すでに全件取得済み")
         write_sector_normalization_audit_csv(session)
         return
 
@@ -6656,6 +6693,22 @@ def generate_reports_from_master_csv(
 # ------------------------------------------------------------
 # インタラクティブUI / CLI
 # ------------------------------------------------------------
+def _interactive_input(prompt: str) -> Optional[str]:
+    """
+    メニュー・サブプロンプト用 input。
+    Ctrl+C（KeyboardInterrupt）、Ctrl+Z やパイプ終端（EOFError）、
+    および Windows で SIGINT 後に input が EOFError になるケースを捕捉し、
+    トレースバックで終了しないようにする。
+    戻り値が None のときは呼び出し側でメニューループを抜ける。
+    """
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        graceful_shutdown.shutdown = True
+        _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+        return None
+
+
 def run_interactive():
     session = get_authenticated_session_jquants()
     sector_avgs = DynamicSectorAverages(session).get_sector_averages()
@@ -6675,16 +6728,16 @@ def run_interactive():
         print("6) 鮮度で取り直し収集（例: 7日より古いものだけ）")
         print("7) 全銘柄“強制”再収集（pending初期化＋当日再取得）")
         print("q) 終了")
-        try:
-            choice = input("選択: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            graceful_shutdown.shutdown = True
-            _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
+        choice_line = _interactive_input("選択: ")
+        if choice_line is None:
             break
+        choice = choice_line.lower()
 
         if choice == "1":
-            budget = input(f"本日収集する銘柄数（推奨既定{DEFAULT_COLLECT_BUDGET}、Enter で既定）: ").strip()
-            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
+            budget_line = _interactive_input(f"本日収集する銘柄数（推奨既定{DEFAULT_COLLECT_BUDGET}、Enter で既定）: ")
+            if budget_line is None:
+                break
+            budget = int(budget_line) if budget_line.isdigit() else DEFAULT_COLLECT_BUDGET
             s = collect_batch(session, budget)
             _cli_print(f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']}", f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']}")
 
@@ -6746,7 +6799,10 @@ def run_interactive():
                 print(f"  - {p}")
 
         elif choice == "3":
-            code = input("銘柄コード4桁: ").strip()
+            code_line = _interactive_input("銘柄コード4桁: ")
+            if code_line is None:
+                break
+            code = code_line
             name, inst = lookup_equity_name_and_instrument(session, code)
             res = analyze_single_stock_complete_v3(
                 session, sector_avgs, code, name=name, offline=True, instrument_type=inst,
@@ -6798,20 +6854,28 @@ def run_interactive():
                 )
 
         elif choice == "5":
-            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
-            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
+            budget_line = _interactive_input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ")
+            if budget_line is None:
+                break
+            budget = int(budget_line) if budget_line.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget)
 
         elif choice == "6":
-            days = input("何日より古ければ取り直すか（日数。例: 7）: ").strip()
-            days = int(days) if days.isdigit() else 7
-            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
-            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
+            days_line = _interactive_input("何日より古ければ取り直すか（日数。例: 7）: ")
+            if days_line is None:
+                break
+            days = int(days_line) if days_line.isdigit() else 7
+            budget_line = _interactive_input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ")
+            if budget_line is None:
+                break
+            budget = int(budget_line) if budget_line.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget, refresh_days=days, reset_pending=True)
 
         elif choice == "7":
-            budget = input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ").strip()
-            budget = int(budget) if budget.isdigit() else DEFAULT_COLLECT_BUDGET
+            budget_line = _interactive_input(f"1日あたりの最大収集銘柄数（既定{DEFAULT_COLLECT_BUDGET}）: ")
+            if budget_line is None:
+                break
+            budget = int(budget_line) if budget_line.isdigit() else DEFAULT_COLLECT_BUDGET
             collect_all_daemon(session, daily_budget=budget, force_full=True, reset_pending=True)
 
         elif choice == "q":
@@ -6845,7 +6909,7 @@ def main() -> int:
     if args.phase == "interactive":
         try:
             run_interactive()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             graceful_shutdown.shutdown = True
             _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
         return 130 if graceful_shutdown.shutdown else 0
@@ -6958,7 +7022,7 @@ def main() -> int:
                 print(f"  - {p}")
             return 130 if graceful_shutdown.shutdown else 0
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         graceful_shutdown.shutdown = True
         _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
         return 130
@@ -6998,7 +7062,7 @@ if __name__ == "__main__":
     _main_exit = 0
     try:
         _main_exit = int(main() or 0)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         graceful_shutdown.shutdown = True
         _cli_print("\n🛑 中断しました", "\n[中断] 終了しました")
         _main_exit = 130
