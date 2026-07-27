@@ -104,6 +104,7 @@ _CANDIDATE_LANE_SORT: Dict[str, int] = {
     "watch_fundamental_core": 5,
     "data_review_light": 6,  # rec_priority で reclaim 時は上位へ寄せる
     "extended_above_ma200": 7,
+    "forward_downgrade_watch": 8,
     "satellite_valuation": 8,
     "satellite_ps_only": 8,
     "data_review": 9,
@@ -118,6 +119,7 @@ _LANE_EXPORT_NAMES: Dict[str, str] = {
     "weak_reclaim_watch": "weak_reclaim_watch_candidates.csv",
     "watch_fundamental_core": "watch_fundamental_core_candidates.csv",
     "extended_above_ma200": "extended_above_ma200_candidates.csv",
+    "forward_downgrade_watch": "forward_downgrade_watch_candidates.csv",
     "cyclical_value_trap": "cyclical_value_traps.csv",
     "data_review": "data_review_candidates.csv",
     "data_review_light": "data_review_light_candidates.csv",
@@ -241,8 +243,8 @@ MIN_PIOTROSKI_COVERAGE_CORE = float(os.getenv("MIN_PIOTROSKI_COVERAGE_CORE", "0.
 
 MAX_PS_VS_SECTOR_CORE = float(os.getenv("MAX_PS_VS_SECTOR_CORE", "1.10"))
 MAX_CRITICAL_MISSING_CORE = int(os.getenv("MAX_CRITICAL_MISSING_CORE", "0"))
-MAX_STATEMENT_STALENESS_DAYS_CORE = int(os.getenv("MAX_STATEMENT_STALENESS_DAYS_CORE", "270"))
-STALE_STATEMENT_MEDIUM_DAYS = int(os.getenv("STALE_STATEMENT_MEDIUM_DAYS", "180"))
+MAX_STATEMENT_STALENESS_DAYS_CORE = int(os.getenv("MAX_STATEMENT_STALENESS_DAYS_CORE", "400"))
+STALE_STATEMENT_MEDIUM_DAYS = int(os.getenv("STALE_STATEMENT_MEDIUM_DAYS", "270"))
 
 WATCH_FUNDAMENTAL_EDGE_MIN = float(os.getenv("WATCH_FUNDAMENTAL_EDGE_MIN", "60"))
 MA200_RECLAIM_EDGE_MIN = float(os.getenv("MA200_RECLAIM_EDGE_MIN", "70"))
@@ -260,6 +262,7 @@ LANE_ENTRY_CAP: Dict[str, float] = {
     "data_review_light": float(os.getenv("LANE_CAP_DATA_REVIEW_LIGHT", "80")),
     "data_review": float(os.getenv("LANE_CAP_DATA_REVIEW", "70")),
     "data_review_severe": float(os.getenv("LANE_CAP_DATA_REVIEW_SEVERE", "55")),
+    "forward_downgrade_watch": float(os.getenv("LANE_CAP_FORWARD_DOWNGRADE", "62")),
     "cyclical_value_trap": float(os.getenv("LANE_CAP_CYCLICAL", "45")),
     "excluded": float(os.getenv("LANE_CAP_EXCLUDED", "30")),
     "satellite_valuation": float(os.getenv("LANE_CAP_SATELLITE", "72")),
@@ -283,7 +286,7 @@ MARKET_REGIME_PROXY_CODES: List[str] = [
 ]
 MARKET_REGIME_RECLAIM_BOOST = float(os.getenv("MARKET_REGIME_RECLAIM_BOOST", "5.0"))  # risk_off 時の RECLAIM 閾値引き上げ幅
 EARNINGS_RECENT_WINDOW_DAYS = int(os.getenv("EARNINGS_RECENT_WINDOW_DAYS", "30"))     # 直近開示ボーナス窓
-EARNINGS_PRE_BLACKOUT_DAYS = int(os.getenv("EARNINGS_PRE_BLACKOUT_DAYS", "5"))         # 次決算予定前のゲート日数（無ければ前年同期 ±N日）
+EARNINGS_PRE_BLACKOUT_DAYS = int(os.getenv("EARNINGS_PRE_BLACKOUT_DAYS", "2"))         # スイング前提では決算前ゲートを弱める
 LANE_MAX_WEIGHT: Dict[str, float] = {
     "ma200_reclaim_core":     float(os.getenv("LANE_MAX_WEIGHT_RECLAIM", "0.08")),
     "bottom_reversal_core":   float(os.getenv("LANE_MAX_WEIGHT_BOTTOM", "0.05")),
@@ -291,6 +294,7 @@ LANE_MAX_WEIGHT: Dict[str, float] = {
     "data_review_light":      float(os.getenv("LANE_MAX_WEIGHT_DR_LIGHT", "0.04")),
     "weak_reclaim_watch":     float(os.getenv("LANE_MAX_WEIGHT_WEAK", "0.03")),
     "extended_above_ma200":   float(os.getenv("LANE_MAX_WEIGHT_EXTENDED", "0.025")),
+    "forward_downgrade_watch": float(os.getenv("LANE_MAX_WEIGHT_FORWARD_DOWNGRADE", "0.015")),
     "satellite_valuation":    float(os.getenv("LANE_MAX_WEIGHT_SATELLITE", "0.03")),
     "satellite_ps_only":      float(os.getenv("LANE_MAX_WEIGHT_SATELLITE_PS", "0.025")),
     "data_review":            float(os.getenv("LANE_MAX_WEIGHT_DATA_REVIEW", "0.02")),
@@ -341,6 +345,14 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
     if not row:
         return row
     out = dict(row)
+
+    def alias(target: str, *srcs: str) -> None:
+        if out.get(target) is not None:
+            return
+        picked = _non_null(*(out.get(s) for s in srcs))
+        if picked is not None:
+            out[target] = picked
+
     if out.get("DisclosedDate") is None and out.get("DiscDate") is not None:
         out["DisclosedDate"] = out.get("DiscDate")
     if out.get("TypeOfDocument") is None and out.get("DocType") is not None:
@@ -361,6 +373,21 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
         out["TotalAssets"] = out.get("TA")
     if out.get("EquityAttributableToOwnersOfParent") is None and out.get("Eq") is not None:
         out["EquityAttributableToOwnersOfParent"] = out.get("Eq")
+    alias("OrdinaryIncome", "OrdinaryIncome", "OrdinaryProfit", "RecurringProfit", "OrdProfit", "OrdPr", "OdP", "ORP")
+    alias("ForecastNetSales", "ForecastNetSales", "ForecastSales", "FcstSales", "FcstNetSales", "ForecastRevenue", "FSales")
+    alias("ForecastOperatingIncome", "ForecastOperatingIncome", "ForecastOperatingProfit", "FcstOP", "FcstOperatingIncome", "FOP")
+    alias("ForecastOrdinaryIncome", "ForecastOrdinaryIncome", "ForecastOrdinaryProfit", "FcstOrdinaryIncome", "FcstOrdProfit", "FcstOrdPr", "FOdP")
+    alias("ForecastNetIncome", "ForecastNetIncome", "ForecastProfit", "ForecastNP", "FcstNP", "FcstProfit", "FNP")
+    alias("ForecastEarningsPerShare", "ForecastEarningsPerShare", "ForecastEPS", "FcstEPS", "FcstEarningsPerShare", "FEPS")
+    alias("NextForecastNetSales", "NextForecastNetSales", "NextForecastSales", "NextFcstSales", "NxFSales")
+    alias("NextForecastOperatingIncome", "NextForecastOperatingIncome", "NextForecastOperatingProfit", "NextFcstOP", "NxFOP")
+    alias("NextForecastOrdinaryIncome", "NextForecastOrdinaryIncome", "NextForecastOrdinaryProfit", "NextFcstOrdProfit", "NxFOdP")
+    alias("NextForecastNetIncome", "NextForecastNetIncome", "NextForecastProfit", "NextFcstNP", "NxFNP", "NxFNp")
+    alias("NextForecastEarningsPerShare", "NextForecastEarningsPerShare", "NextForecastEPS", "NextFcstEPS", "NxFEPS")
+    alias("DividendPerShare", "DividendPerShare", "AnnualDividendPerShare", "ResultDividendPerShare", "DPS", "DivAnn", "DivFY")
+    alias("ForecastDividendPerShare", "ForecastDividendPerShare", "ForecastDPS", "FcstDPS", "ForecastAnnualDividendPerShare", "FDivAnn", "FDivFY")
+    alias("RetrospectiveRestatement", "RetrospectiveRestatement", "RetrospectiveRestatementFlag", "RestatementFlag", "RetroRst")
+    alias("AccountingRevisionFlag", "AccountingRevisionFlag", "AccountingChangesFlag", "CorrectionFlag", "ChgAcEst", "ChgByASRev", "ChgNoASRev")
     for _cfo_alt in ("CFO", "Cfo", "cfo"):
         if _cfo_alt in out and out.get(_cfo_alt) not in (None, "", "NA"):
             if out.get("NetCashProvidedByUsedInOperatingActivities") is None:
@@ -845,6 +872,10 @@ def _audit_v2_legacy_statement_fields(
             "SharesOutstanding",
             "ShOutFY",
         )),
+        ("OrdinaryIncome", ("OrdinaryIncome", "OrdinaryProfit", "OrdProfit", "OrdPr")),
+        ("ForecastNetIncome", ("ForecastNetIncome", "ForecastProfit", "ForecastNP", "FcstNP")),
+        ("ForecastEarningsPerShare", ("ForecastEarningsPerShare", "ForecastEPS", "FcstEPS")),
+        ("DividendPerShare", ("DividendPerShare", "AnnualDividendPerShare", "DPS")),
     ]
     missing_labels: List[str] = []
     for label, keys in groups:
@@ -864,6 +895,13 @@ def _audit_v2_legacy_statement_fields(
                     log_code or "?",
                 )
     if missing_labels:
+        optional_labels = {"OrdinaryIncome", "ForecastNetIncome", "ForecastEarningsPerShare", "DividendPerShare"}
+        optional_missing = [x for x in missing_labels if x in optional_labels]
+        if optional_missing:
+            logger.debug("V2財務変換 [%s]: 追加監査フィールド未検出 %s", log_code or "?", optional_missing)
+            missing_labels = [x for x in missing_labels if x not in optional_labels]
+        if not missing_labels:
+            return
         sample_keys = sorted(str(k) for k in latest.keys())[:48]
         summary_only_exempt = ("CurrentAssets", "CurrentLiabilities", "GrossProfit")
         if summary_only:
@@ -967,6 +1005,21 @@ def convert_v2_financials_to_legacy_statements(
             ("NetSales", ("NetSales", "NetSalesIFRS", "Sales", "RevenueFromOperations")),
             ("OperatingIncome", ("OperatingIncome", "OperatingIncomeIFRS", "OperatingIncomeLoss")),
             ("NetIncomeLoss", ("NetIncomeLoss", "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome")),
+            ("OrdinaryIncome", ("OrdinaryIncome", "OrdinaryProfit", "RecurringProfit", "OrdProfit", "OrdPr", "OdP")),
+            ("ForecastNetSales", ("ForecastNetSales", "ForecastSales", "FcstSales", "FcstNetSales", "ForecastRevenue", "FSales")),
+            ("ForecastOperatingIncome", ("ForecastOperatingIncome", "ForecastOperatingProfit", "FcstOP", "FcstOperatingIncome", "FOP")),
+            ("ForecastOrdinaryIncome", ("ForecastOrdinaryIncome", "ForecastOrdinaryProfit", "FcstOrdinaryIncome", "FcstOrdProfit", "FcstOrdPr", "FOdP")),
+            ("ForecastNetIncome", ("ForecastNetIncome", "ForecastProfit", "ForecastNP", "FcstNP", "FcstProfit", "FNP")),
+            ("ForecastEarningsPerShare", ("ForecastEarningsPerShare", "ForecastEPS", "FcstEPS", "FcstEarningsPerShare", "FEPS")),
+            ("NextForecastNetSales", ("NextForecastNetSales", "NextForecastSales", "NextFcstSales", "NxFSales")),
+            ("NextForecastOperatingIncome", ("NextForecastOperatingIncome", "NextForecastOperatingProfit", "NextFcstOP", "NxFOP")),
+            ("NextForecastOrdinaryIncome", ("NextForecastOrdinaryIncome", "NextForecastOrdinaryProfit", "NextFcstOrdProfit", "NxFOdP")),
+            ("NextForecastNetIncome", ("NextForecastNetIncome", "NextForecastProfit", "NextFcstNP", "NxFNP", "NxFNp")),
+            ("NextForecastEarningsPerShare", ("NextForecastEarningsPerShare", "NextForecastEPS", "NextFcstEPS", "NxFEPS")),
+            ("DividendPerShare", ("DividendPerShare", "AnnualDividendPerShare", "ResultDividendPerShare", "DPS", "DivAnn", "DivFY")),
+            ("ForecastDividendPerShare", ("ForecastDividendPerShare", "ForecastDPS", "FcstDPS", "ForecastAnnualDividendPerShare", "FDivAnn", "FDivFY")),
+            ("RetrospectiveRestatement", ("RetrospectiveRestatement", "RetrospectiveRestatementFlag", "RestatementFlag", "RetroRst")),
+            ("AccountingRevisionFlag", ("AccountingRevisionFlag", "AccountingChangesFlag", "CorrectionFlag", "ChgAcEst", "ChgByASRev", "ChgNoASRev")),
             ("NetCashProvidedByUsedInOperatingActivities", (
                 "NetCashProvidedByUsedInOperatingActivities",
                 "CashFlowsFromOperatingActivities",
@@ -1138,7 +1191,13 @@ def fetch_prices_v2_with_meta(
         df.to_csv(cache_file, index=False)
     except Exception:
         pass
-    return df, {"http": 200, "rows": len(df), "from_cache": False, "transient": False}
+    return df, {
+        "http": 200,
+        "rows": len(df),
+        "from_cache": False,
+        "transient": False,
+        "empty_http200": len(df) == 0,
+    }
 
 
 def fetch_prices_v2(
@@ -1417,7 +1476,10 @@ class FrozenCache:
         except Exception:
             return [], {}
         stmts_raw = j.pop("statements", [])
-        stmts = stmts_raw if isinstance(stmts_raw, list) else []
+        stmts = [
+            apply_v2_fins_summary_field_aliases(_merge_fs_into_row(s)) if isinstance(s, dict) else s
+            for s in (stmts_raw if isinstance(stmts_raw, list) else [])
+        ]
         meta = dict(j)
         if stmts and "financial_data_mode" not in meta:
             meta.setdefault("financial_data_mode", "legacy_frozen_statement_cache")
@@ -1803,7 +1865,10 @@ class FinancialDataManager:
                     meta = {k: v for k, v in j.items() if k != "statements"}
                     self._last_financial_fetch_meta = meta
                     if stmts:
-                        return stmts
+                        return [
+                            apply_v2_fins_summary_field_aliases(_merge_fs_into_row(s)) if isinstance(s, dict) else s
+                            for s in stmts
+                        ]
             except Exception:
                 pass
 
@@ -2838,6 +2903,7 @@ def build_financial_history_from_statements(
             "fiscal_year": fiscal_year,
             "revenue": _pick_numeric_field(stmt, ["NetSales", "Revenue", "OperatingRevenue"]),
             "operating_income": _pick_numeric_field(stmt, ["OperatingIncome", "OperatingIncomeLoss", "OperatingProfit"]),
+            "ordinary_income": _pick_numeric_field(stmt, ["OrdinaryIncome", "OrdinaryProfit", "RecurringProfit"]),
             "net_income": _pick_numeric_field(stmt, ["NetIncomeLoss", "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome"]),
             "operating_cash_flow": _pick_numeric_field(stmt, ["NetCashProvidedByUsedInOperatingActivities", "CashFlowsFromOperatingActivities"]),
             "total_assets": _pick_numeric_field(stmt, ["TotalAssets"]),
@@ -2855,6 +2921,20 @@ def build_financial_history_from_statements(
                     "NumberOfIssuedAndOutstandingShares",
                 ],
             ),
+            "forecast_revenue": _pick_numeric_field(stmt, ["ForecastNetSales", "ForecastSales"]),
+            "forecast_operating_income": _pick_numeric_field(stmt, ["ForecastOperatingIncome", "ForecastOperatingProfit"]),
+            "forecast_ordinary_income": _pick_numeric_field(stmt, ["ForecastOrdinaryIncome", "ForecastOrdinaryProfit"]),
+            "forecast_net_income": _pick_numeric_field(stmt, ["ForecastNetIncome", "ForecastProfit"]),
+            "forecast_eps": _pick_numeric_field(stmt, ["ForecastEarningsPerShare", "ForecastEPS"]),
+            "next_forecast_revenue": _pick_numeric_field(stmt, ["NextForecastNetSales", "NextForecastSales"]),
+            "next_forecast_operating_income": _pick_numeric_field(stmt, ["NextForecastOperatingIncome", "NextForecastOperatingProfit"]),
+            "next_forecast_ordinary_income": _pick_numeric_field(stmt, ["NextForecastOrdinaryIncome", "NextForecastOrdinaryProfit"]),
+            "next_forecast_net_income": _pick_numeric_field(stmt, ["NextForecastNetIncome", "NextForecastProfit"]),
+            "next_forecast_eps": _pick_numeric_field(stmt, ["NextForecastEarningsPerShare", "NextForecastEPS"]),
+            "dividend_per_share": _pick_numeric_field(stmt, ["DividendPerShare", "AnnualDividendPerShare", "ResultDividendPerShare"]),
+            "forecast_dividend_per_share": _pick_numeric_field(stmt, ["ForecastDividendPerShare", "ForecastDPS"]),
+            "retrospective_restatement": stmt.get("RetrospectiveRestatement"),
+            "accounting_revision_flag": stmt.get("AccountingRevisionFlag"),
         }
 
         cash_and_equivalents = _pick_numeric_field(
@@ -3477,12 +3557,12 @@ def compute_fundamental_edge_score(
 def compute_entry_score(fundamental_edge: float, ma_eval: dict) -> float:
     st = str(ma_eval.get("ma200_state") or "ma200_unknown")
     bonuses = {
-        "ma200_reclaim": 15.0,
-        "below_ma200_basing": 8.0,
-        "above_ma200_near": 5.0,
-        "above_ma200_extended": -10.0,
-        "below_ma200_downtrend": -25.0,
-        "ma200_unknown": -5.0,
+        "ma200_reclaim": 8.0,
+        "below_ma200_basing": 4.0,
+        "above_ma200_near": 3.0,
+        "above_ma200_extended": -6.0,
+        "below_ma200_downtrend": -14.0,
+        "ma200_unknown": -3.0,
     }
     out = float(fundamental_edge) + bonuses.get(st, -5.0)
     dist = ma_eval.get("distance_from_ma200")
@@ -3609,7 +3689,7 @@ def compute_data_review_meta(
     }
 
 
-def cap_entry_score(raw: float, lane: str, dr_meta: dict) -> float:
+def cap_entry_score(raw: float, lane: str, dr_meta: dict, shareholder_return_score: Optional[float] = None) -> float:
     cap = float(LANE_ENTRY_CAP.get(lane, 88.0))
     if lane == "data_review":
         dl = dr_meta.get("data_review_level")
@@ -3617,7 +3697,17 @@ def cap_entry_score(raw: float, lane: str, dr_meta: dict) -> float:
             cap = min(cap, float(LANE_ENTRY_CAP["data_review_severe"]))
         elif dl == "medium":
             cap = min(cap, float(LANE_ENTRY_CAP["data_review"]))
-    return float(round(min(float(raw), cap), 2))
+    try:
+        if lane == "data_review_light" and shareholder_return_score is not None and float(shareholder_return_score) >= 70.0:
+            cap = min(88.0, cap + 5.0)
+    except (TypeError, ValueError):
+        pass
+    raw_f = float(raw)
+    if raw_f <= cap:
+        return float(round(raw_f, 2))
+    # ハードクリップで同点化させず、cap 上限近辺に単調圧縮して順序を残す。
+    compressed = cap + (100.0 - cap) * (1.0 - math.exp(-(raw_f - cap) / 24.0)) * 0.35
+    return float(round(min(100.0, compressed), 2))
 
 
 def assign_entry_candidate_lane(
@@ -3637,6 +3727,7 @@ def assign_entry_candidate_lane(
     downtrend_rejection_gate: bool,
     market_regime: Optional[str] = None,
     earnings_blackout: bool = False,
+    forward_np_change: Optional[float] = None,
 ) -> str:
     """推奨レーン（CSV・MD 用）。data_review_* は dr_meta と整合させる。
 
@@ -3704,6 +3795,9 @@ def assign_entry_candidate_lane(
     if dr_bad:
         return "data_review"
 
+    if forward_np_change is not None and np.isfinite(float(forward_np_change)) and float(forward_np_change) <= -0.30:
+        return "forward_downgrade_watch"
+
     if downtrend_rejection_gate:
         return "excluded"
 
@@ -3713,7 +3807,6 @@ def assign_entry_candidate_lane(
     if (
         st == "ma200_reclaim"
         and (not downtrend_rejection_gate)
-        and (not earnings_blackout)
         and reclaim_quality
         and fundamental_edge >= reclaim_min_fundamental
         and (not dr_meta.get("has_issues"))
@@ -3723,7 +3816,6 @@ def assign_entry_candidate_lane(
     if (
         st == "ma200_reclaim"
         and (not downtrend_rejection_gate)
-        and (not earnings_blackout)
         and reclaim_quality
         and fundamental_edge >= reclaim_min_fundamental
         and dr_light_only
@@ -3746,7 +3838,6 @@ def assign_entry_candidate_lane(
         and ma_eval.get("below_ma200_downtrend") is not True
         and op_income_stable is True
         and (not downtrend_rejection_gate)
-        and (not earnings_blackout)
         and bottom_quality
     ):
         return "bottom_reversal_core"
@@ -3834,6 +3925,281 @@ def evaluate_operating_income_stability(history: List[dict],
     out["stable"] = True
     out["reason"] = "ok"
     return out
+
+
+def compute_operating_income_downside_score(history: List[dict], years: int = 5) -> float:
+    """スイング向けに、営業利益の安定性を二値ではなく下方変動の小ささで 0-8 点化する。"""
+    vals: list[float] = []
+    for rec in (history or [])[:years]:
+        v = rec.get("operating_income")
+        try:
+            if v is not None and np.isfinite(float(v)):
+                vals.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if len(vals) < 2 or vals[0] <= 0:
+        return 0.0
+    if any(v <= 0 for v in vals):
+        return 0.0
+    yoys: list[float] = []
+    for cur, prev in zip(vals, vals[1:]):
+        if prev > 0:
+            yoys.append(cur / prev - 1.0)
+    min_yoy = min(yoys) if yoys else 0.0
+    mean_v = float(np.mean(vals))
+    cv = float(np.std(vals) / mean_v) if mean_v > 0 else 1.0
+    yoy_component = np.interp(min_yoy, [-0.45, -0.20, 0.0, 0.20], [0.0, 2.0, 5.5, 8.0])
+    cv_penalty = min(3.0, max(0.0, cv - 0.18) * 8.0)
+    return float(round(max(0.0, min(8.0, yoy_component - cv_penalty)), 2))
+
+
+def compute_earnings_quality_metrics(
+    history: List[dict],
+    *,
+    current_price: Optional[float] = None,
+    shares_outstanding: Optional[float] = None,
+) -> dict[str, Any]:
+    latest = (history or [{}])[0] if history else {}
+    sales = latest.get("revenue")
+    op = latest.get("operating_income")
+    npv = latest.get("net_income")
+    cfo = latest.get("operating_cash_flow")
+    ta = latest.get("total_assets")
+    ordinary = latest.get("ordinary_income")
+    accrual_ratio = None
+    np_to_ordinary = None
+    op_margin_z = None
+    normalized_eps = None
+    normalized_per = None
+    earnings_quality_gap = None
+    warnings: list[str] = []
+
+    try:
+        if npv is not None and cfo is not None and ta is not None and float(ta) > 0:
+            accrual_ratio = (float(npv) - float(cfo)) / float(ta)
+            if accrual_ratio > 0.12:
+                warnings.append("high_accrual")
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    try:
+        if npv is not None and ordinary is not None and float(ordinary) != 0:
+            np_to_ordinary = float(npv) / float(ordinary)
+            if np_to_ordinary > 0.90 or np_to_ordinary < 0.45:
+                warnings.append("np_ordinary_bridge_outlier")
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    margins: list[float] = []
+    for rec in (history or [])[:5]:
+        try:
+            r = rec.get("revenue")
+            o = rec.get("operating_income")
+            if r is not None and o is not None and float(r) > 0:
+                margins.append(float(o) / float(r))
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+    try:
+        if len(margins) >= 3:
+            cur_m = margins[0]
+            base = margins[1:]
+            med_m = float(np.median(base))
+            sd_m = float(np.std(base)) or 0.01
+            op_margin_z = (cur_m - med_m) / sd_m
+            if op_margin_z > 2.0:
+                warnings.append("op_margin_spike")
+            if sales is not None and shares_outstanding is not None and float(shares_outstanding) > 0:
+                normalized_eps = float(sales) * med_m * 0.70 / float(shares_outstanding)
+                if normalized_eps > 0 and current_price is not None and float(current_price) > 0:
+                    normalized_per = float(current_price) / normalized_eps
+        if normalized_eps is not None and npv is not None and shares_outstanding is not None and float(shares_outstanding) > 0:
+            actual_eps = float(npv) / float(shares_outstanding)
+            if actual_eps > 0:
+                earnings_quality_gap = max(0.0, 1.0 - float(normalized_eps) / actual_eps)
+                if earnings_quality_gap >= 0.35:
+                    warnings.append("normalized_eps_gap")
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    flag = "watch" if warnings else "ok"
+    return {
+        "accrual_ratio": accrual_ratio,
+        "np_to_ordinary": np_to_ordinary,
+        "op_margin_z": op_margin_z,
+        "normalized_eps": normalized_eps,
+        "normalized_per": normalized_per,
+        "earnings_quality_gap": earnings_quality_gap,
+        "earnings_quality_flag": flag,
+        "earnings_quality_warnings": ",".join(warnings),
+    }
+
+
+def compute_shareholder_return_quality(history: List[dict]) -> dict[str, Any]:
+    latest = (history or [{}])[0] if history else {}
+    dps = _non_null(latest.get("forecast_dividend_per_share"), latest.get("dividend_per_share"))
+    shares = latest.get("shares_outstanding")
+    cfo = latest.get("operating_cash_flow")
+    npv = latest.get("net_income")
+    eq = latest.get("equity")
+    ta = latest.get("total_assets")
+    cash = latest.get("cash_and_equivalents")
+    payout_capacity = None
+    dividend_payout_ratio = None
+    buyback_consistency = 0.0
+    debt_funded_penalty = 0.0
+    dps_values: list[float] = []
+    share_values: list[float] = []
+    for rec in (history or [])[:7]:
+        try:
+            dv = _non_null(rec.get("dividend_per_share"), rec.get("forecast_dividend_per_share"))
+            if dv is not None and np.isfinite(float(dv)):
+                dps_values.append(float(dv))
+        except (TypeError, ValueError):
+            pass
+        try:
+            sv = rec.get("shares_outstanding")
+            if sv is not None and np.isfinite(float(sv)) and float(sv) > 0:
+                share_values.append(float(sv))
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        if dps is not None and shares is not None and cfo is not None and float(cfo) > 0:
+            payout_capacity = 1.0 - min(1.0, (float(dps) * float(shares)) / float(cfo))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        if dps is not None and shares is not None and npv is not None and float(npv) > 0:
+            dividend_payout_ratio = (float(dps) * float(shares)) / float(npv)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    if len(share_values) >= 4:
+        try:
+            cagr = (share_values[0] / share_values[3]) ** (1 / 3) - 1.0
+            buyback_consistency = 1.0 if cagr < -0.01 else 0.5 if cagr < 0 else 0.0
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            buyback_consistency = 0.0
+    dividend_credibility = 0.0
+    if len(dps_values) >= 3:
+        cuts = sum(1 for cur, prev in zip(dps_values, dps_values[1:]) if cur < prev * 0.95)
+        increases = sum(1 for cur, prev in zip(dps_values, dps_values[1:]) if cur > prev * 1.02)
+        dividend_credibility = max(0.0, min(1.0, 0.45 + increases * 0.12 - cuts * 0.25))
+    elif dps is not None:
+        dividend_credibility = 0.35
+    try:
+        if len(history or []) >= 2 and dividend_payout_ratio is not None:
+            prev = history[1]
+            eq_ratio_cur = float(eq) / float(ta) if eq is not None and ta is not None and float(ta) > 0 else None
+            eq_ratio_prev = (
+                float(prev.get("equity")) / float(prev.get("total_assets"))
+                if prev.get("equity") is not None and prev.get("total_assets") is not None and float(prev.get("total_assets")) > 0
+                else None
+            )
+            cash_prev = prev.get("cash_and_equivalents")
+            if (
+                eq_ratio_cur is not None and eq_ratio_prev is not None and eq_ratio_cur < eq_ratio_prev - 0.03
+                and cash is not None and cash_prev is not None and float(cash) < float(cash_prev)
+                and float(dividend_payout_ratio) > 0.60
+            ):
+                debt_funded_penalty = 1.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    capacity_score = 1.0 if payout_capacity is None else max(0.0, min(1.0, payout_capacity))
+    payout_penalty = 0.0
+    if dividend_payout_ratio is not None and dividend_payout_ratio > 0.8:
+        payout_penalty = min(0.35, (float(dividend_payout_ratio) - 0.8) * 0.6)
+    score = (
+        capacity_score * 35.0
+        + dividend_credibility * 30.0
+        + buyback_consistency * 20.0
+        + (0.0 if dps is None else 15.0)
+        - debt_funded_penalty * 20.0
+        - payout_penalty * 100.0
+    )
+    return {
+        "shareholder_return_score": float(round(max(0.0, min(100.0, score)), 2)),
+        "dividend_payout_capacity": payout_capacity,
+        "dividend_payout_ratio": dividend_payout_ratio,
+        "dividend_policy_credibility": dividend_credibility,
+        "buyback_consistency": buyback_consistency,
+        "debt_funded_payout_penalty": debt_funded_penalty,
+    }
+
+
+def evaluate_accounting_flag(history: List[dict]) -> dict[str, Any]:
+    latest = (history or [{}])[0] if history else {}
+    flags: list[str] = []
+    for key in ("retrospective_restatement", "accounting_revision_flag"):
+        v = latest.get(key)
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in ("false", "0", "none", "nan"):
+            flags.append(key)
+        elif v is True:
+            flags.append(key)
+    return {
+        "accounting_flag": "watch" if flags else "clean",
+        "accounting_reasons": ",".join(flags),
+    }
+
+
+def evaluate_edinet_governance_flag(code: str, *, lookback_days: int = 400) -> dict[str, Any]:
+    """EDINET 書類一覧から会計・監査系の重大フラグを拾う。APIキー未設定時は unknown。"""
+    enabled = os.getenv("EDINET_GOVERNANCE_ENABLED", "1") != "0"
+    api_key = os.getenv("EDINET_API_KEY", "").strip()
+    if not enabled or not api_key:
+        return {"governance_flag": "unknown", "governance_reasons": "edinet_api_key_missing"}
+    c4 = (api_code_candidates(code) or [str(code).strip()])[0]
+    sec_code = c4 + "0" if len(c4) == 4 else c4
+    cache_dir = CACHE_DIR / "edinet_governance"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{c4}.json"
+    try:
+        if cache_file.exists():
+            j = json.loads(cache_file.read_text(encoding="utf-8"))
+            ts = float(j.get("timestamp", 0))
+            if time.time() - ts < 24 * 3600:
+                return j.get("data", {"governance_flag": "unknown", "governance_reasons": "cache_invalid"})
+    except Exception:
+        pass
+
+    severe_terms = ("重要な不備", "不適正意見", "意見不表明", "限定付適正意見")
+    watch_terms = ("訂正", "内部統制", "監査報告", "四半期レビュー")
+    severe = False
+    watch = False
+    reasons: list[str] = []
+    today = datetime.date.today()
+    session = requests.Session()
+    session.headers.update({"Ocp-Apim-Subscription-Key": api_key})
+    # 書類一覧APIは日付指定なので、失敗を許容しつつ直近から薄く走査する。
+    for delta in range(0, max(1, lookback_days), 14):
+        d = today - datetime.timedelta(days=delta)
+        try:
+            resp = session.get(
+                "https://api.edinet-fsa.go.jp/api/v2/documents.json",
+                params={"date": d.isoformat(), "type": 2},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            rows = (resp.json() or {}).get("results") or []
+        except Exception:
+            continue
+        for row in rows:
+            if str(row.get("secCode") or "").strip() != sec_code:
+                continue
+            title = str(row.get("docDescription") or row.get("docTypeCode") or "")
+            if any(t in title for t in severe_terms):
+                severe = True
+                reasons.append(title[:80])
+            elif any(t in title for t in watch_terms):
+                watch = True
+                reasons.append(title[:80])
+    flag = "severe" if severe else "watch" if watch else "clean"
+    data = {"governance_flag": flag, "governance_reasons": ";".join(reasons[:5])}
+    try:
+        cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return data
 
 def calculate_safety_criteria_v1(
     ps_ratio: Optional[float],
@@ -4179,7 +4545,9 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
                                        net_income_previous: Optional[float],
                                        revenue_current: Optional[float],
                                        shares_outstanding: Optional[float],
-                                       shares_outstanding_previous: Optional[float] = None) -> dict:
+                                       shares_outstanding_previous: Optional[float] = None,
+                                       forecast_net_income: Optional[float] = None,
+                                       forecast_eps: Optional[float] = None) -> dict:
     rps = None
     if (
         revenue_current is not None
@@ -4188,27 +4556,64 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
     ):
         rps = float(revenue_current) / float(shares_outstanding)
 
+    per_actual = None
     per = None
+    actual_eps = None
+    forward_eps = None
     if (
         net_income_current is not None
         and shares_outstanding is not None
         and shares_outstanding > 0
     ):
-        eps = float(net_income_current) / float(shares_outstanding)
-        if eps > 0 and current_price is not None and current_price > 0:
-            per = float(current_price) / eps
+        actual_eps = float(net_income_current) / float(shares_outstanding)
+        if actual_eps > 0 and current_price is not None and current_price > 0:
+            per_actual = float(current_price) / actual_eps
+
+    try:
+        if forecast_eps is not None and np.isfinite(float(forecast_eps)):
+            forward_eps = float(forecast_eps)
+        elif (
+            forecast_net_income is not None
+            and shares_outstanding is not None
+            and float(shares_outstanding) > 0
+        ):
+            forward_eps = float(forecast_net_income) / float(shares_outstanding)
+    except (TypeError, ValueError, ZeroDivisionError):
+        forward_eps = None
+
+    eps_used = actual_eps
+    eps_basis = "actual"
+    if actual_eps is not None and forward_eps is not None and np.isfinite(float(forward_eps)):
+        eps_used = min(float(actual_eps), float(forward_eps))
+        eps_basis = "forward_conservative" if float(forward_eps) < float(actual_eps) else "actual"
+    if eps_used is not None and eps_used > 0 and current_price is not None and current_price > 0:
+        per = float(current_price) / float(eps_used)
 
     eps_growth = estimate_eps_growth_rate(
-        net_income_current,
+        (eps_used * float(shares_outstanding)) if eps_used is not None and shares_outstanding is not None else net_income_current,
         net_income_previous,
         shares_outstanding,
         shares_outstanding_previous,
     )
+    forward_np_change = None
+    try:
+        if forecast_net_income is not None and net_income_current is not None and float(net_income_current) != 0:
+            forward_np_change = float(forecast_net_income) / float(net_income_current) - 1.0
+        elif forward_eps is not None and actual_eps is not None and float(actual_eps) != 0:
+            forward_np_change = float(forward_eps) / float(actual_eps) - 1.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        forward_np_change = None
     ps_ratio = calculate_ps_ratio(current_price, revenue_per_share=rps)
     peg_ratio = calculate_peg_ratio(per, eps_growth)
     return {
         "revenue_per_share": rps,
         "per": per,
+        "per_actual": per_actual,
+        "eps_actual": actual_eps,
+        "eps_forward": forward_eps,
+        "eps_used": eps_used,
+        "eps_basis": eps_basis,
+        "forward_np_change": forward_np_change,
         "ps_ratio": ps_ratio,
         "eps_growth_rate": eps_growth,
         "peg_ratio": peg_ratio,
@@ -4654,8 +5059,21 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             revenue_current=raw_fin["current"].get("revenue"),
             shares_outstanding=raw_fin["current"].get("shares_outstanding"),
             shares_outstanding_previous=raw_fin["previous"].get("shares_outstanding"),
+            forecast_net_income=raw_fin["current"].get("forecast_net_income"),
+            forecast_eps=raw_fin["current"].get("forecast_eps"),
         )
         peg_quality = evaluate_peg_quality(val.get("reference_peg"), val.get("eps_growth_rate"))
+        earnings_quality = compute_earnings_quality_metrics(
+            financial_history,
+            current_price=current_price,
+            shares_outstanding=raw_fin["current"].get("shares_outstanding"),
+        )
+        if earnings_quality.get("earnings_quality_flag") == "watch":
+            peg_quality["peg_trusted"] = False
+            peg_quality["peg_warning"] = "earnings_quality_watch"
+        shareholder_return = compute_shareholder_return_quality(financial_history)
+        accounting_flag = evaluate_accounting_flag(financial_history)
+        governance_flag = evaluate_edinet_governance_flag(code)
         val["peg_trusted"] = peg_quality.get("peg_trusted")
         val["peg_warning"] = peg_quality.get("peg_warning")
         eps_growth_for_scoring = val.get("eps_growth_rate")
@@ -4810,6 +5228,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                 "median_prev": None,
             }
         op_income_stable = (op_income_eval.get("stable") is True)
+        op_income_downside_score = compute_operating_income_downside_score(financial_history)
 
         statement_type = financial_history[0].get("statement_type") if financial_history else None
         statement_disclosed_date = financial_history[0].get("disclosed_date") if financial_history else None
@@ -4855,6 +5274,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "eps_growth_input_complete": eps_growth_input_complete,
             "piotroski_input_complete": piotroski_input_complete,
             "growth_proxy_detached_from_scoring": False,
+            "ordinary_income_available": raw_fin["current"].get("ordinary_income") is not None,
+            "forecast_net_income_available": raw_fin["current"].get("forecast_net_income") is not None,
+            "forecast_eps_available": raw_fin["current"].get("forecast_eps") is not None,
+            "dividend_per_share_available": raw_fin["current"].get("dividend_per_share") is not None,
+            "accounting_flag": accounting_flag.get("accounting_flag"),
+            "accounting_reasons": accounting_flag.get("accounting_reasons"),
+            "governance_flag": governance_flag.get("governance_flag"),
+            "governance_reasons": governance_flag.get("governance_reasons"),
             "imputation": imputation,
             "critical_missing_count": critical_missing,
             "critical_missing_fields": ",".join(critical_missing_fields),
@@ -4996,8 +5423,14 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             downtrend_rejection_gate=downtrend_rejection_gate,
             market_regime=regime_state,
             earnings_blackout=bool(earnings_ctx.get("earnings_blackout")),
+            forward_np_change=val.get("forward_np_change"),
         )
-        entry_score = cap_entry_score(_entry_raw, entry_candidate_lane, dr_meta)
+        entry_score = cap_entry_score(
+            _entry_raw,
+            entry_candidate_lane,
+            dr_meta,
+            shareholder_return_score=shareholder_return.get("shareholder_return_score"),
+        )
 
         filter_details = {
             "liquidity_ok": liquidity_ok,
@@ -5010,6 +5443,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "per_core_ok": per_core_ok,
             "op_income_stable": op_income_stable,
             "op_income_reason": op_income_eval.get("reason"),
+            "op_income_downside_score": op_income_downside_score,
             "base_ok": base_ok,
             "core_candidate": core_candidate,
             "satellite_candidate": satellite_candidate,
@@ -5021,6 +5455,12 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "entry_candidate_lane": entry_candidate_lane,
             "fundamental_edge_score": fundamental_edge_score,
             "entry_score": entry_score,
+            "entry_score_raw": _entry_raw,
+            "forward_np_change": val.get("forward_np_change"),
+            "earnings_quality_flag": earnings_quality.get("earnings_quality_flag"),
+            "shareholder_return_score": shareholder_return.get("shareholder_return_score"),
+            "accounting_flag": accounting_flag.get("accounting_flag"),
+            "governance_flag": governance_flag.get("governance_flag"),
             "buy_timing_gate": buy_timing_gate,
             "downtrend_rejection_gate": downtrend_rejection_gate,
             "data_review_reason": dr_meta.get("data_review_reason"),
@@ -5077,12 +5517,24 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "valuation_lane": valuation_lane,
             "fundamental_edge_score": fundamental_edge_score,
             "entry_score": entry_score,
+            "entry_score_raw": _entry_raw,
             "ma200_evaluation": ma200_eval,
             "peg_warning": peg_quality.get("peg_warning"),
             "peg_quality": peg_quality,
+            "per_actual": val.get("per_actual"),
+            "eps_actual": val.get("eps_actual"),
+            "eps_forward": val.get("eps_forward"),
+            "eps_used": val.get("eps_used"),
+            "eps_basis": val.get("eps_basis"),
+            "forward_np_change": val.get("forward_np_change"),
+            "earnings_quality": earnings_quality,
+            "shareholder_return": shareholder_return,
+            "accounting_flag": accounting_flag,
+            "governance_flag": governance_flag,
             "buy_timing_gate": buy_timing_gate,
             "downtrend_rejection_gate": downtrend_rejection_gate,
             "op_income_yoy_pct": op_income_yoy_pct,
+            "op_income_downside_score": op_income_downside_score,
             "ps_vs_sector_pre": ps_vs_sector_pre,
             "ps_satellite_limit": ps_satellite_limit,
             "financial_data_mode": fin_diag.get("financial_data_mode"),
@@ -5182,10 +5634,11 @@ def collect_one_code_result(
                 return {**out, "status": "auth_or_permission_error", "reason": f"price_http_{ph}"}
             if bool(pmeta.get("transient")):
                 return {**out, "status": "transient_error", "reason": f"price_transient_http_{ph}"}
-            if bool(pmeta.get("empty_http200")):
+            if bool(pmeta.get("empty_http200")) or (ph == 200 and int(pmeta.get("rows") or 0) == 0):
                 return {**out, "status": "permanent_missing_financials", "reason": "price_empty_http200"}
             if ph != 200:
                 return {**out, "status": "permanent_missing_financials", "reason": f"price_http_{ph}"}
+            return {**out, "status": "transient_error", "reason": f"price_http_{ph}"}
 
         fdm = FinancialDataManager(session)
         stmts = fdm.fetch_statements(code, force_refresh=force_refresh)
@@ -5215,6 +5668,8 @@ def collect_one_code_result(
         if fc.has_all(code):
             return {**out, "ok": True, "status": "success", "reason": ""}
         if not fc.has_prices(code):
+            if int(out.get("price_rows") or 0) == 0:
+                return {**out, "status": "permanent_missing_financials", "reason": "price_missing_after_fin_save"}
             return {**out, "status": "transient_error", "reason": "price_missing_after_fin_save"}
         return {**out, "status": "transient_error", "reason": "cache_incomplete_after_save"}
 
@@ -5705,6 +6160,44 @@ def lookup_equity_name_and_instrument(session: requests.Session, code: str) -> T
         it = classify_instrument_from_master(row.to_dict())
     return name, str(it)
 
+
+def audit_fins_summary_fields(session: requests.Session, *, budget: int = 50, outdir: Path = REPORTS_DIR) -> Path:
+    """fins/summary の生キーと非null率を確認するための軽量監査CSVを出力する。"""
+    outdir.mkdir(parents=True, exist_ok=True)
+    fdm = FinancialDataManager(session)
+    master = fdm.get_stock_list_v2(force_refresh=False)
+    codes = [str(x).strip() for x in master.get("Code", pd.Series(dtype=str)).dropna().astype(str).head(max(1, budget))]
+    stats: dict[str, dict[str, Any]] = {}
+    total_rows = 0
+    for code in codes:
+        rows: list[dict[str, Any]] = []
+        for qc in api_code_candidates(code):
+            rows, st, _ = paginate_v2_endpoint(session, "fins/summary", {"code": qc}, max_pages=4)
+            if rows or st != 200:
+                break
+        for row in rows or []:
+            total_rows += 1
+            flat = _merge_fs_into_row(row)
+            for k, v in flat.items():
+                if k == "FS":
+                    continue
+                bucket = stats.setdefault(str(k), {"field": str(k), "rows": 0, "non_null": 0, "sample": None})
+                bucket["rows"] += 1
+                if not _financial_scalar_absent(v):
+                    bucket["non_null"] += 1
+                    if bucket["sample"] is None:
+                        bucket["sample"] = str(v)[:120]
+    out = pd.DataFrame(stats.values())
+    if out.empty:
+        out = pd.DataFrame(columns=["field", "rows", "non_null", "non_null_rate", "sample"])
+    else:
+        out["non_null_rate"] = out["non_null"] / max(1, total_rows)
+        out = out.sort_values(["non_null_rate", "field"], ascending=[False, True])
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    p = outdir / f"fins_summary_fields_audit_{ts}.csv"
+    out.to_csv(p, index=False, encoding="utf-8-sig")
+    return p
+
 # ------------------------------------------------------------
 # レポート出力（flatten / csv / md）
 # ------------------------------------------------------------
@@ -5765,6 +6258,30 @@ def _flatten_result(d: dict) -> dict:
         "reference_peg": d.get("reference_peg") if d.get("reference_peg") is not None else d.get("peg_ratio"),
         "peg_trusted": d.get("peg_trusted"),
         "per": d.get("per"),
+        "per_actual": d.get("per_actual"),
+        "eps_actual": d.get("eps_actual"),
+        "eps_forward": d.get("eps_forward"),
+        "eps_used": d.get("eps_used"),
+        "eps_basis": d.get("eps_basis"),
+        "forward_np_change": d.get("forward_np_change"),
+        "earnings_quality_flag": (d.get("earnings_quality") or {}).get("earnings_quality_flag"),
+        "earnings_quality_warnings": (d.get("earnings_quality") or {}).get("earnings_quality_warnings"),
+        "accrual_ratio": (d.get("earnings_quality") or {}).get("accrual_ratio"),
+        "np_to_ordinary": (d.get("earnings_quality") or {}).get("np_to_ordinary"),
+        "op_margin_z": (d.get("earnings_quality") or {}).get("op_margin_z"),
+        "normalized_eps": (d.get("earnings_quality") or {}).get("normalized_eps"),
+        "normalized_per": (d.get("earnings_quality") or {}).get("normalized_per"),
+        "earnings_quality_gap": (d.get("earnings_quality") or {}).get("earnings_quality_gap"),
+        "shareholder_return_score": (d.get("shareholder_return") or {}).get("shareholder_return_score"),
+        "dividend_payout_capacity": (d.get("shareholder_return") or {}).get("dividend_payout_capacity"),
+        "dividend_payout_ratio": (d.get("shareholder_return") or {}).get("dividend_payout_ratio"),
+        "dividend_policy_credibility": (d.get("shareholder_return") or {}).get("dividend_policy_credibility"),
+        "buyback_consistency": (d.get("shareholder_return") or {}).get("buyback_consistency"),
+        "debt_funded_payout_penalty": (d.get("shareholder_return") or {}).get("debt_funded_payout_penalty"),
+        "accounting_flag": (d.get("accounting_flag") or {}).get("accounting_flag"),
+        "accounting_reasons": (d.get("accounting_flag") or {}).get("accounting_reasons"),
+        "governance_flag": (d.get("governance_flag") or {}).get("governance_flag"),
+        "governance_reasons": (d.get("governance_flag") or {}).get("governance_reasons"),
         "rsi": d.get("rsi"),
         "adx": d.get("adx"),
         "below_ma200": d.get("below_ma200"),
@@ -5832,6 +6349,7 @@ def _flatten_result(d: dict) -> dict:
         "fins_details_error": diagnostics.get("fins_details_error"),
         "fundamental_edge_score": d.get("fundamental_edge_score"),
         "entry_score": d.get("entry_score"),
+        "entry_score_raw": d.get("entry_score_raw"),
         "market_regime": d.get("market_regime"),
         "earnings_signal": d.get("earnings_signal"),
         "earnings_blackout": d.get("earnings_blackout"),
@@ -5844,6 +6362,7 @@ def _flatten_result(d: dict) -> dict:
         "ps_vs_sector_pre": d.get("ps_vs_sector_pre"),
         "peg_warning": d.get("peg_warning"),
         "op_income_yoy_pct": d.get("op_income_yoy_pct"),
+        "op_income_downside_score": d.get("op_income_downside_score"),
         "valuation_lane": d.get("valuation_lane") or flt.get("valuation_lane") or flt.get("candidate_lane"),
         "ma200_state": (d.get("ma200_evaluation") or {}).get("ma200_state"),
         "ma200_timing_score": (d.get("ma200_evaluation") or {}).get("ma200_timing_score"),
@@ -6084,16 +6603,22 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
             peg_str = f"{float(rp):.2f}"
         fe = r.get("fundamental_edge_score")
         es = r.get("entry_score")
+        es_raw = r.get("entry_score_raw")
         fe_s = f"{float(fe):.1f}" if fe is not None and pd.notna(fe) else "N/A"
         es_s = f"{float(es):.1f}" if es is not None and pd.notna(es) else "N/A"
+        es_raw_s = f"{float(es_raw):.1f}" if es_raw is not None and pd.notna(es_raw) else "N/A"
         lane = r.get("candidate_lane", "")
         dr_r = r.get("data_review_reason") or ""
         fdm = r.get("financial_data_mode") or ""
         cap = r.get("grade_capped_reason") or ""
+        fchg = r.get("forward_np_change")
+        fchg_s = f"{float(fchg)*100:.1f}%" if fchg is not None and pd.notna(fchg) else "N/A"
+        srq = r.get("shareholder_return_score")
+        srq_s = f"{float(srq):.1f}" if srq is not None and pd.notna(srq) else "N/A"
         lines.append(
             f"- **{r['code']} {r['name']}** | lane `{lane}` | legacy_total {r['total_score']:.1f} | "
-            f"fundamental_edge {fe_s} | entry_timing_score {es_s} | 財務 {r['financial_score']:.1f} | 仕手 {r['spec_score']} | "
-            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | data_mode `{fdm}` | grade_cap `{cap}` | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
+            f"fundamental_edge {fe_s} | entry_timing_score {es_s} (raw {es_raw_s}) | 財務 {r['financial_score']:.1f} | 株主還元Q {srq_s} | 仕手 {r['spec_score']} | "
+            f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | forward_np {fchg_s} | data_mode `{fdm}` | grade_cap `{cap}` | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
 
     p = outdir / f"report_core_top{topn}.md"
@@ -6102,10 +6627,11 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
 
 # ==== 投資助言レポート生成 ====
 def _grade_from_score(s: float) -> str:
-    if s >= 85: return "A+"
-    if s >= 75: return "A"
-    if s >= 65: return "B+"
-    if s >= 55: return "B"
+    # スイング向け再配分後はテクニカル比重を下げたため、実効レンジに合わせて閾値も再調整する。
+    if s >= 70: return "A+"
+    if s >= 62: return "A"
+    if s >= 54: return "B+"
+    if s >= 46: return "B"
     return "C"
 
 
@@ -6117,15 +6643,15 @@ def _cap_grade_value(grade: str, cap: str) -> str:
 
 
 def _summary_only_grade_cap(row: pd.Series) -> Tuple[str, str]:
-    """summary_only / fins_details 不在時のグレード上限を段階化する。
+    """後方互換ラッパー。新規処理は _apply_grade_caps に集約する。"""
+    return _apply_grade_caps(row)
 
-    変更点 (期待値改善のためのリビジョン):
-      - 完全な summary_only_cap_B 一律ではなく、coverage と critical_missing と
-        op_income_stable に応じて B+ / B / C のいずれかへ段階化。
-      - `fins_details_available == False` を含めて統一的に判定し、Premium 復活時の
-        挙動と切り分けやすくする。
-    """
+
+def _apply_grade_caps(row: pd.Series) -> Tuple[str, str]:
+    """summary_only / forward減益 / ガバナンス・会計フラグを集約し、最も厳しい上限を採用する。"""
     raw = str(row.get("grade_raw") or row.get("grade") or "C")
+    caps: list[tuple[str, str]] = []
+
     fdm = str(row.get("financial_data_mode") or "").strip().lower()
     fda_raw = row.get("fins_details_available")
     if isinstance(fda_raw, str):
@@ -6141,15 +6667,44 @@ def _summary_only_grade_cap(row: pd.Series) -> Tuple[str, str]:
         op_stable_b = bool(op_stable) if op_stable is True else False
 
     needs_cap = (fdm == "summary_only") or (fda is False)
-    if not needs_cap:
+    if needs_cap:
+        if pd.notna(critical) and float(critical) >= 1:
+            caps.append(("C", "critical_missing_cap_C"))
+        elif pd.isna(coverage) or float(coverage) < 0.50:
+            caps.append(("C", "coverage_very_low_cap_C"))
+        elif float(coverage) < MIN_PIOTROSKI_COVERAGE_CORE:
+            caps.append(("B", "coverage_low_cap_B"))
+        elif float(coverage) >= 0.85 and op_stable_b:
+            caps.append(("B+", "summary_only_high_coverage_cap_Bplus"))
+        else:
+            caps.append(("B", "summary_only_cap_B"))
+
+    fchg = pd.to_numeric(pd.Series([row.get("forward_np_change")]), errors="coerce").iloc[0]
+    if pd.notna(fchg):
+        if float(fchg) <= -0.50:
+            caps.append(("C", "forward_np_decline_50_cap_C"))
+        elif float(fchg) <= -0.30:
+            caps.append(("B", "forward_np_decline_30_cap_B"))
+
+    eq_flag = str(row.get("earnings_quality_flag") or "").strip().lower()
+    if eq_flag == "watch":
+        caps.append(("B", "earnings_quality_watch_cap_B"))
+
+    gov_flag = str(row.get("governance_flag") or "").strip().lower()
+    if gov_flag == "severe":
+        caps.append(("C", "governance_severe_cap_C"))
+    elif gov_flag == "watch":
+        caps.append(("B", "governance_watch_cap_B"))
+
+    acct_flag = str(row.get("accounting_flag") or "").strip().lower()
+    if acct_flag == "watch":
+        caps.append(("B", "accounting_watch_cap_B"))
+
+    if not caps:
         return raw, ""
-    if pd.notna(critical) and float(critical) >= 1:
-        return _cap_grade_value(raw, "C"), "critical_missing_cap_C"
-    if pd.isna(coverage) or float(coverage) < MIN_PIOTROSKI_COVERAGE_CORE:
-        return _cap_grade_value(raw, "C"), "coverage_low_cap_C"
-    if float(coverage) >= 0.85 and op_stable_b:
-        return _cap_grade_value(raw, "B+"), "summary_only_high_coverage_cap_Bplus"
-    return _cap_grade_value(raw, "B"), "summary_only_cap_B"
+    strictest = min(caps, key=lambda x: _GRADE_ORDER.get(x[0], 0))
+    reasons = ",".join(reason for _, reason in caps)
+    return _cap_grade_value(raw, strictest[0]), reasons
 
 def _val_score_from_ps_vs_sector(x: Optional[float]) -> float:
     if x is None or not np.isfinite(x): return 0.0
@@ -6180,6 +6735,14 @@ def _quality_score_from_piotroski(x: Optional[float]) -> float:
     if x >= 5: return 7.0
     if x >= 4: return 4.0
     return 0.0
+
+def _score_from_pct(pct: Any, max_score: float, fallback: float = 0.0) -> float:
+    try:
+        if pct is None or not np.isfinite(float(pct)):
+            return float(fallback)
+        return float(max(0.0, min(max_score, float(pct) * float(max_score))))
+    except (TypeError, ValueError):
+        return float(fallback)
 
 def _growth_score_from_sales_cagr(x: Optional[float]) -> float:
     if x is None or not np.isfinite(x):
@@ -6268,7 +6831,9 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         "momentum_6m_1m", "momentum_6m_3m", "momentum_3m_1m", "return_12m_1m", "safety_criteria_score",
         "max_drawdown", "sales_cagr", "adv_jpy_20d", "adv_jpy_60d", "sector_ps_benchmark",
         "imputed_field_count", "critical_missing_count", "statement_staleness_days", "piotroski_coverage_ratio",
-        "volatility", "avg_volatility", "current_price", "price",
+        "volatility", "avg_volatility", "current_price", "price", "entry_score_raw", "forward_np_change",
+        "accrual_ratio", "np_to_ordinary", "op_margin_z", "earnings_quality_gap", "normalized_per",
+        "shareholder_return_score", "dividend_payout_ratio", "dividend_policy_credibility", "buyback_consistency",
     ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -6308,6 +6873,8 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df["return_12m_1m_pct_in_sector"] = _sector_pct_rank("return_12m_1m", higher_is_better=True)
     df["per_pct_in_sector"] = _sector_pct_rank("per", higher_is_better=False)   # 低 PER が高 percentile
     df["ps_pct_in_sector"] = _sector_pct_rank("ps", higher_is_better=False)     # 低 PS が高 percentile
+    df["sales_cagr_pct_in_sector"] = _sector_pct_rank("sales_cagr", higher_is_better=True)
+    df["earnings_quality_gap_pct_in_sector"] = _sector_pct_rank("earnings_quality_gap", higher_is_better=False)
     df["ma200_timing_pct_in_sector"] = _sector_pct_rank("ma200_timing_score", higher_is_better=True) if "ma200_timing_score" in df.columns else pd.Series(np.nan, index=df.index)
 
     # 多軸 percentile を合成した「セクター内総合 percentile」 0-1
@@ -6326,16 +6893,28 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         df["sector_neutral_score"] = np.nan
 
     df["valuation_ps"] = df["ps_vs_sector"].apply(_val_score_from_ps_vs_sector)
-    df["valuation_score"] = df["valuation_ps"]                     # PEGは参考指標のためスコアに含めない（0-10）
+    df["valuation_score"] = df["valuation_ps"].clip(lower=0, upper=10) * 0.8
 
-    df["quality_piotroski"] = df["piot"].apply(_quality_score_from_piotroski)
-    df["quality_op_income"] = np.where(df.get("op_income_stable", False) == True, 8.0, 0.0)
-    df["quality_growth"] = df["sales_cagr"].apply(_growth_score_from_sales_cagr)
-    df["financial_score"] = df["quality_piotroski"] + df["quality_op_income"] + df["quality_growth"]  # 0-30
+    piot_fallback = df["piot"].apply(_quality_score_from_piotroski) * (12.0 / 14.0)
+    df["quality_piotroski"] = [
+        _score_from_pct(p, 12.0, fb)
+        for p, fb in zip(df["piot_pct_in_sector"], piot_fallback)
+    ]
+    if "op_income_downside_score" in df.columns:
+        df["quality_op_income"] = pd.to_numeric(df["op_income_downside_score"], errors="coerce").fillna(0.0).clip(lower=0, upper=8)
+    else:
+        df["quality_op_income"] = np.where(df.get("op_income_stable", False) == True, 6.0, 0.0)
+    growth_fallback = df["sales_cagr"].apply(_growth_score_from_sales_cagr)
+    df["quality_growth"] = [
+        _score_from_pct(p, 10.0, fb)
+        for p, fb in zip(df["sales_cagr_pct_in_sector"], growth_fallback)
+    ]
+    eq_gap_penalty = pd.to_numeric(df.get("earnings_quality_gap", pd.Series(np.nan, index=df.index)), errors="coerce").fillna(0.0).clip(lower=0, upper=0.7) * 6.0
+    df["financial_score"] = (df["quality_piotroski"] + df["quality_op_income"] + df["quality_growth"] - eq_gap_penalty).clip(lower=0, upper=30)
 
-    df["resilience_safety_criteria"] = df["safety_criteria_score"].fillna(0.0).clip(lower=0, upper=100) * (12.0 / 100.0)
-    df["resilience_drawdown"] = df["max_drawdown"].apply(_resilience_score_from_drawdown)
-    df["resilience_score"] = df["resilience_safety_criteria"] + df["resilience_drawdown"]  # 0-20
+    df["resilience_safety_criteria"] = df["safety_criteria_score"].fillna(0.0).clip(lower=0, upper=100) * (15.0 / 100.0)
+    df["resilience_drawdown"] = df["max_drawdown"].apply(_resilience_score_from_drawdown) * (10.0 / 8.0)
+    df["resilience_score"] = (df["resilience_safety_criteria"] + df["resilience_drawdown"]).clip(lower=0, upper=25)
 
     df["technical_score"] = [
         _momentum_score_from_returns(r21, r63, r126, m61, m63, m31, False)
@@ -6343,7 +6922,8 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
             df["return_21d"], df["return_63d"], df["return_126d"],
             df["momentum_6m_1m"], df["momentum_6m_3m"], df["momentum_3m_1m"],
         )
-    ]  # 0-22（200日線単純ペナルティは廃止）
+    ]
+    df["technical_score"] = pd.to_numeric(df["technical_score"], errors="coerce").fillna(0.0).clip(lower=0, upper=22) * 0.65  # スイングではタイミング比重を抑える
 
     safety_base = df["safety"].fillna(0.0).clip(lower=0, upper=25.0)
     adv_bonus = np.where(df["adv_jpy_20d"] >= 1_000_000_000, 2.0, np.where(df["adv_jpy_20d"] >= 500_000_000, 1.0, 0.0))
@@ -6395,7 +6975,7 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     )
     df["total_score"] = df["total_score"].clip(lower=0, upper=100)
     df["grade_raw"] = df["total_score"].apply(_grade_from_score)
-    capped = df.apply(_summary_only_grade_cap, axis=1)
+    capped = df.apply(_apply_grade_caps, axis=1)
     df["grade"] = [x[0] for x in capped]
     df["grade_capped_reason"] = [x[1] for x in capped]
     df["pio_disp"] = df["piot"].fillna(0).astype(int).astype(str) + "/9"
@@ -6415,12 +6995,13 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
             lane == "watch_fundamental_core",
             lane == "weak_reclaim_watch",
             lane == "extended_above_ma200",
+            lane == "forward_downgrade_watch",
             lane == "data_review",
             dr_light_other,
             lane == "cyclical_value_trap",
             lane.isin(["satellite_valuation", "satellite_ps_only"]),
         ],
-        [10, 20, 30, 40, 45, 50, 60, 65, 70, 80],
+        [10, 20, 30, 40, 45, 50, 58, 60, 65, 70, 80],
         default=200 + df["candidate_lane_sort"].fillna(50).astype(int),
     ).astype(int)
 
@@ -6888,7 +7469,7 @@ def main() -> int:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase",
-                        choices=["collect","collect_all","analyze","single","interactive"],
+                        choices=["collect","collect_all","analyze","single","interactive","fields-audit"],
                         default="interactive")
     parser.add_argument("--code")
     parser.add_argument("--budget", type=int, default=DEFAULT_COLLECT_BUDGET)
@@ -6946,6 +7527,11 @@ def main() -> int:
                 f"📦 収集: tried={s['tried']} ok={s['ok']} fail={s['fail']} | {detail}",
                 f"[収集] tried={s['tried']} ok={s['ok']} fail={s['fail']} | {detail}",
             )
+            return 130 if graceful_shutdown.shutdown else 0
+
+        if args.phase == "fields-audit":
+            fp = audit_fins_summary_fields(session, budget=args.budget, outdir=outdir)
+            _cli_print(f"✅ fins/summary フィールド監査出力: {fp}", f"[OK] fins/summary フィールド監査出力: {fp}")
             return 130 if graceful_shutdown.shutdown else 0
 
         if args.phase == "single":
@@ -7013,9 +7599,13 @@ def main() -> int:
             flat = pd.DataFrame([_flatten_result(r) for r in results])
             master = outdir / "screening_offline.csv"
             flat.to_csv(master, index=False, encoding="utf-8-sig")
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            snapshot = outdir / f"screening_offline_{ts}.csv"
+            flat.to_csv(snapshot, index=False, encoding="utf-8-sig")
 
             outputs = generate_reports_from_master_csv(master, outdir, topn=max(10, args.top))
             _cli_print(f"✅ オフライン分析出力: {master}", f"[OK] オフライン分析出力: {master}")
+            _cli_print(f"✅ スナップショット出力: {snapshot}", f"[OK] スナップショット出力: {snapshot}")
             _cli_print(f"✅ 出力先: {outdir}", f"[OK] 出力先: {outdir}")
             print("=== 生成物 ===")
             for p in outputs:

@@ -11,7 +11,7 @@ J-Quants APIを使用した投資銘柄スクリーニングシステム
 - **データ収集**: J-Quants APIから1日380銘柄ずつ価格データと財務データを取得
 - **凍結キャッシュ**: 取得したデータをローカルに保存し、オフライン分析を可能に
 - **投資分析**: Piotroski F-Score、バリュエーション指標、安全性スコアなどを計算
-- **テーマ別スクリーニング**: aging_dx_alphaプロファイルによる高齢化×DXテーマ銘柄の選別
+- **スイング向けスクリーニング**: 21〜126営業日保有を前提に、財務品質・安全性・バリュエーションを重視
 
 ## セットアップ
 
@@ -42,7 +42,7 @@ PASSWORD=your_password
 
 ```bash
 # インタラクティブモード
-python real_data_screening.py
+python JQuamtsScreeningBot.py
 
 # または、ランナーを使用
 python runner.py
@@ -51,24 +51,23 @@ python runner.py
 ### コマンドラインオプション
 
 ```bash
-# データ収集（1日380銘柄）
-python real_data_screening.py --phase collect --budget 380
+# データ収集
+python JQuamtsScreeningBot.py --phase collect --budget 800
 
 # 分析実行
-python real_data_screening.py --phase analyze --top 20
+python JQuamtsScreeningBot.py --phase analyze --top 20
 
-# aging_dx_alphaプロファイルで分析
-python runner.py --phase analyze --profile aging_dx_alpha --top 20
+# fins/summary の生フィールド監査
+python JQuamtsScreeningBot.py --phase fields-audit --budget 50
 ```
 
 ## ファイル構成
 
-- `real_data_screening.py`: メインスクリーニングスクリプト
 - `runner.py`: 便利なランナースクリプト
 - `JQuamtsScreeningBot.py`: J-Quants V2 オフライン一括スクリーニング（`output/reports/`）
-- `docs/スクリーニング仕様マニュアル.md`: **Bot / real_data_screening の仕様・MA200レーン詳細**
+- `docs/スクリーニング仕様マニュアル.md`: Bot の仕様・MA200レーン詳細
 - `config/theme_tags.yaml`: テーマタグ定義
-- `.jquants_cache/`: データキャッシュディレクトリ
+- `.jquants_cache_v2/`: データキャッシュディレクトリ
 - `output/`: 分析結果出力ディレクトリ
 
 ## ライセンス

@@ -3,7 +3,7 @@
 backtest_ic.py — シンプル forward-return / IC バックテスト
 
 目的:
-- JQuamtsScreeningBot.py / real_data_screening.py が出力する
+- JQuamtsScreeningBot.py が出力する
   `screening_offline_*.csv` (スナップショット) を入力に、各銘柄の
   凍結価格キャッシュ (.jquants_cache_v2/frozen/prices/<code>.csv)
   と突き合わせて forward 21/63/126 営業日リターンを計算する。
