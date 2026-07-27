@@ -6612,8 +6612,7 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
 
     if not ranked_core.empty:
         p1 = outdir / "top_recommended_core.csv"
-        _rc_sort = ["rec_priority", "rec_secondary", "total_score"]
-        _rc_sort = [c for c in _rc_sort if c in ranked_core.columns]
+        _rc_sort = _recommendation_sort_cols(ranked_core)
         ranked_core.sort_values(by=_rc_sort, ascending=[True] + [False] * (len(_rc_sort) - 1)).head(topn).to_csv(
             p1, index=False, encoding="utf-8-sig",
         )
@@ -6638,8 +6637,7 @@ def write_reports(flat: pd.DataFrame, outdir: Path, topn: int = 10, timestamp: O
 
     if not ranked_sat.empty:
         p6 = outdir / "top_recommended_satellite.csv"
-        _rs_sort = ["rec_priority", "rec_secondary", "total_score"]
-        _rs_sort = [c for c in _rs_sort if c in ranked_sat.columns]
+        _rs_sort = _recommendation_sort_cols(ranked_sat)
         ranked_sat.sort_values(by=_rs_sort, ascending=[True] + [False] * (len(_rs_sort) - 1)).head(topn).to_csv(
             p6, index=False, encoding="utf-8-sig",
         )
@@ -6659,7 +6657,7 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
             core[c] = pd.to_numeric(core[c], errors="coerce")
 
     ranked_md = _build_ranked(core)
-    _md_sort = [c for c in ["rec_priority", "rec_secondary", "total_score"] if c in ranked_md.columns]
+    _md_sort = _recommendation_sort_cols(ranked_md)
     if len(_md_sort) >= 2:
         rec = ranked_md.sort_values(by=_md_sort, ascending=[True] + [False] * (len(_md_sort) - 1)).head(topn)
     else:
@@ -6672,9 +6670,9 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
     lines.append("**注:** financial_data_mode が summary_only の銘柄は財務詳細なしの暫定評価で、grade_capped_reason に応じてグレード上限を適用します。")
     lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
     lines.append(
-        "**注:** `legacy_total` は従来の総合スコア（バリュエーション・財務・安全性等の合成）です。"
-        "`entry_timing_score` は買いタイミング評価であり、銘柄品質そのものではありません。"
-        "最終判断は candidate_lane、fundamental_edge、data_review_reason を併用します。"
+        "**注:** 推奨順は `rec_priority`（レーン・局面ティア）を最優先し、ティア内は "
+        "`recommendation_score`（fundamental_edge 60% + entry_timing 40%、減益/利益品質/会計・ガバナンスフラグで加減点）です。"
+        "`legacy_total` は旧総合スコア、`entry_timing_score` は買いタイミング評価です。"
     )
     lines.append("")
     if timestamp:
@@ -6713,8 +6711,10 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
             fchg_s = f"{fchg_s} ({'翌期' if fsrc.startswith('fy_next') else '進行期'})"
         srq = r.get("shareholder_return_score")
         srq_s = f"{float(srq):.1f}" if srq is not None and pd.notna(srq) else "N/A"
+        rsc = r.get("recommendation_score")
+        rsc_s = f"{float(rsc):.1f}" if rsc is not None and pd.notna(rsc) else "N/A"
         lines.append(
-            f"- **{r['code']} {r['name']}** | lane `{lane}` | legacy_total {r['total_score']:.1f} | "
+            f"- **{r['code']} {r['name']}** | lane `{lane}` | rec_score {rsc_s} | legacy_total {r['total_score']:.1f} | "
             f"fundamental_edge {fe_s} | entry_timing_score {es_s} (raw {es_raw_s}) | 財務 {r['financial_score']:.1f} | 株主還元Q {srq_s} | 仕手 {r['spec_score']} | "
             f"PER {r['per']} | PS {r['ps']} | refPEG {peg_str} | forward_np {fchg_s} | data_mode `{fdm}` | grade_cap `{cap}` | data_review `{dr_r}` | 時価総額 {mc_str} | 出来高(30d) {vol_str}"
         )
@@ -6911,6 +6911,53 @@ def _data_quality_penalty(imputed_field_count: Optional[float], critical_missing
             penalty += 3.0
     return min(penalty, 12.0)
 
+def compute_recommendation_score(df: pd.DataFrame) -> pd.Series:
+    """
+    同一 rec_priority ティア内の推奨順。
+    品質(fundamental_edge)を主軸、買いタイミング(entry)を副軸にし、
+    軽い減益・利益品質・会計フラグで減点する。
+    （-30%以下の減益はレーン forward_downgrade_watch で既に分離済み）
+    """
+    fed = pd.to_numeric(df.get("fundamental_edge_score"), errors="coerce").fillna(0.0)
+    ent = pd.to_numeric(df.get("entry_score"), errors="coerce").fillna(0.0)
+    score = 0.60 * fed + 0.40 * ent
+
+    fchg = pd.to_numeric(df.get("forward_np_change"), errors="coerce")
+    mild = fchg.notna()
+    score = score - np.where(mild & (fchg <= -0.20), 12.0, 0.0)
+    score = score - np.where(mild & (fchg > -0.20) & (fchg <= -0.10), 6.0, 0.0)
+    score = score - np.where(mild & (fchg > -0.10) & (fchg < 0.0), 2.0, 0.0)
+    score = score - np.where(fchg.isna(), 3.0, 0.0)
+
+    eq = df.get("earnings_quality_flag", pd.Series("", index=df.index)).astype(str).str.lower()
+    score = score - np.where(eq == "watch", 8.0, 0.0)
+
+    acc = df.get("accounting_flag", pd.Series("", index=df.index)).astype(str).str.lower()
+    score = score - np.where(acc == "watch", 10.0, 0.0)
+    score = score - np.where(acc == "severe", 25.0, 0.0)
+
+    gov = df.get("governance_flag", pd.Series("", index=df.index)).astype(str).str.lower()
+    score = score - np.where(gov == "watch", 8.0, 0.0)
+    score = score - np.where(gov == "severe", 25.0, 0.0)
+
+    srq = pd.to_numeric(df.get("shareholder_return_score"), errors="coerce")
+    score = score + np.where(srq.notna() & (srq >= 70.0), 3.0, 0.0)
+    return pd.Series(score, index=df.index, dtype=float)
+
+
+_REC_SORT_COLS = [
+    "rec_priority",
+    "rec_secondary",
+    "fundamental_edge_score",
+    "entry_score",
+    "total_score",
+]
+
+
+def _recommendation_sort_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in _REC_SORT_COLS if c in df.columns]
+
+
 def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
     df = flat.copy()
     if "reference_peg" not in df.columns and "peg" in df.columns:
@@ -7103,9 +7150,11 @@ def _build_ranked(flat: pd.DataFrame) -> pd.DataFrame:
         default=200 + df["candidate_lane_sort"].fillna(50).astype(int),
     ).astype(int)
 
-    ent = pd.to_numeric(df["entry_score"], errors="coerce")
+    df["recommendation_score"] = compute_recommendation_score(df)
+    # ティア内は recommendation_score（品質60%+タイミング40%±品質フラグ）。
+    # watch_fundamental_core は買いタイミングよりファンダ優先のため FE をそのまま使う。
+    df["rec_secondary"] = df["recommendation_score"]
     fed = pd.to_numeric(df["fundamental_edge_score"], errors="coerce")
-    df["rec_secondary"] = ent
     df.loc[df["rec_priority"] == 40, "rec_secondary"] = fed.loc[df["rec_priority"] == 40]
 
     # --- ポジションサイジング・推奨ストップ・利確の試算 ---
@@ -7164,9 +7213,9 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
 
     ranked = _build_ranked(core)
 
-    _sort_cols2 = [c for c in ["rec_priority", "rec_secondary", "total_score"] if c in ranked.columns]
+    _sort_cols2 = _recommendation_sort_cols(ranked)
     if len(_sort_cols2) < 2:
-        _sort_cols2 = [c for c in ["candidate_lane_sort", "entry_score", "fundamental_edge_score", "total_score"] if c in ranked.columns]
+        _sort_cols2 = [c for c in ["candidate_lane_sort", "recommendation_score", "fundamental_edge_score", "entry_score", "total_score"] if c in ranked.columns]
     ranked = ranked.sort_values(
         by=_sort_cols2,
         ascending=[True] + [False] * (len(_sort_cols2) - 1),
@@ -7203,8 +7252,9 @@ def write_investment_advice_report(flat: pd.DataFrame, outdir: Path,
     lines.append("**注:** PS-only satellite は PER 欠損だが PS と基礎品質で残した候補です。PEG/reference_peg は参考列のみでスコア未使用。fallback_primary_type は軽微ペナルティ対象です。")
     lines.append(
         "**注:** 推奨順は rec_priority（例: ma200_reclaim_core→bottom→data_review_light+reclaim→watch…）を最優先し、"
-        "次に entry_timing_score（タイミング）または watch の fundamental_edge を参照します。"
-        "`legacy_total` は旧総合スコア、`entry_timing_score` は買いタイミング評価です（品質そのものではありません）。"
+        "ティア内は recommendation_score（fundamental_edge 60% + entry_timing 40%、減益/品質フラグ加減点）。"
+        "watch_fundamental_core のみ fundamental_edge を二次キーにします。"
+        "`legacy_total` は旧総合スコア、`entry_timing_score` は買いタイミング評価です。"
         "`bottom_reversal_core` は200日線下の逆張り候補です。"
     )
     lines.append("")
