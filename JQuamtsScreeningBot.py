@@ -53,6 +53,7 @@ import copy
 import signal
 import logging
 import datetime
+import calendar
 import configparser
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -386,6 +387,7 @@ def apply_v2_fins_summary_field_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
     alias("NextForecastEarningsPerShare", "NextForecastEarningsPerShare", "NextForecastEPS", "NextFcstEPS", "NxFEPS")
     alias("DividendPerShare", "DividendPerShare", "AnnualDividendPerShare", "ResultDividendPerShare", "DPS", "DivAnn", "DivFY")
     alias("ForecastDividendPerShare", "ForecastDividendPerShare", "ForecastDPS", "FcstDPS", "ForecastAnnualDividendPerShare", "FDivAnn", "FDivFY")
+    alias("NextForecastDividendPerShare", "NextForecastDividendPerShare", "NextForecastDPS", "NextFcstDPS", "NxFDivAnn", "NxFDivFY")
     alias("RetrospectiveRestatement", "RetrospectiveRestatement", "RetrospectiveRestatementFlag", "RestatementFlag", "RetroRst")
     alias("AccountingRevisionFlag", "AccountingRevisionFlag", "AccountingChangesFlag", "CorrectionFlag", "ChgAcEst", "ChgByASRev", "ChgNoASRev")
     for _cfo_alt in ("CFO", "Cfo", "cfo"):
@@ -2932,7 +2934,10 @@ def build_financial_history_from_statements(
             "next_forecast_net_income": _pick_numeric_field(stmt, ["NextForecastNetIncome", "NextForecastProfit"]),
             "next_forecast_eps": _pick_numeric_field(stmt, ["NextForecastEarningsPerShare", "NextForecastEPS"]),
             "dividend_per_share": _pick_numeric_field(stmt, ["DividendPerShare", "AnnualDividendPerShare", "ResultDividendPerShare"]),
-            "forecast_dividend_per_share": _pick_numeric_field(stmt, ["ForecastDividendPerShare", "ForecastDPS"]),
+            # 通期(FY)行は当期予想DPS欄が空で、翌期予想が NextForecast 側に入る
+            "forecast_dividend_per_share": _pick_numeric_field(
+                stmt, ["ForecastDividendPerShare", "ForecastDPS", "NextForecastDividendPerShare", "NextForecastDPS"]
+            ),
             "retrospective_restatement": stmt.get("RetrospectiveRestatement"),
             "accounting_revision_flag": stmt.get("AccountingRevisionFlag"),
         }
@@ -2969,6 +2974,22 @@ def build_financial_history_from_statements(
             break
     return history, statement_basis_used
 
+def _add_months(base: Optional[datetime.date], months: int) -> Optional[datetime.date]:
+    if base is None:
+        return None
+    total = (base.year * 12 + (base.month - 1)) + months
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
+
+
+def _month_delta(start: Optional[datetime.date], end: Optional[datetime.date]) -> Optional[int]:
+    if start is None or end is None:
+        return None
+    return (end.year - start.year) * 12 + (end.month - start.month)
+
+
 def resolve_forward_guidance(
     stmts: List[dict],
     as_of_date: Optional[datetime.date] = None,
@@ -2987,6 +3008,9 @@ def resolve_forward_guidance(
         "forward_guidance_source": None,
         "forward_guidance_disclosed": None,
         "forward_guidance_target_fy_end": None,
+        "forward_guidance_base_fy_end": None,
+        "forward_guidance_horizon_months": None,
+        "forward_guidance_warning": None,
     }
     if not stmts:
         return out
@@ -3026,7 +3050,7 @@ def resolve_forward_guidance(
             net_income = _pick_numeric_field(rec, ["NextForecastNetIncome", "NextForecastProfit"])
             eps = _pick_numeric_field(rec, ["NextForecastEarningsPerShare", "NextForecastEPS"])
             source = "fy_next_guidance"
-            target_fy_end = None
+            target_fy_end = _add_months(period_end, 12) if period_end else None
         else:
             # 既に本決算が出た年度の四半期予想は使わない
             if latest_actual_fy_end is not None and fy_end is not None and fy_end <= latest_actual_fy_end:
@@ -3034,15 +3058,41 @@ def resolve_forward_guidance(
             net_income = _pick_numeric_field(rec, ["ForecastNetIncome", "ForecastProfit"])
             eps = _pick_numeric_field(rec, ["ForecastEarningsPerShare", "ForecastEPS"])
             source = "quarter_current_guidance"
-            target_fy_end = fy_end.isoformat() if fy_end else None
+            target_fy_end = fy_end
         if net_income is None and eps is None:
             continue
+
+        # 予想の対象期は「直近通期実績の期末 + 12ヶ月」であるべき。
+        # 決算期変更や開示の取り違えでずれると分母と分子の期間長が食い違う。
+        horizon_months = None
+        warning = None
+        if target_fy_end is not None and latest_actual_fy_end is not None:
+            horizon_months = _month_delta(latest_actual_fy_end, target_fy_end)
+            if horizon_months < 6 or horizon_months > 18:
+                warning = f"forward_period_mismatch_{horizon_months}m"
+            elif horizon_months not in (11, 12, 13):
+                warning = f"forward_period_irregular_{horizon_months}m"
+        elif target_fy_end is None:
+            warning = "forward_period_unknown"
+
+        if warning is not None and warning.startswith("forward_period_mismatch"):
+            # 期間が噛み合わないものは予想として採用しない
+            out["forward_guidance_warning"] = warning
+            out["forward_guidance_source"] = source
+            out["forward_guidance_target_fy_end"] = target_fy_end.isoformat() if target_fy_end else None
+            out["forward_guidance_base_fy_end"] = latest_actual_fy_end.isoformat() if latest_actual_fy_end else None
+            out["forward_guidance_horizon_months"] = horizon_months
+            return out
+
         disclosed = _statement_disclosed_date(rec)
         out["forecast_net_income"] = net_income
         out["forecast_eps"] = eps
         out["forward_guidance_source"] = source
         out["forward_guidance_disclosed"] = disclosed.isoformat() if disclosed else None
-        out["forward_guidance_target_fy_end"] = target_fy_end
+        out["forward_guidance_target_fy_end"] = target_fy_end.isoformat() if target_fy_end else None
+        out["forward_guidance_base_fy_end"] = latest_actual_fy_end.isoformat() if latest_actual_fy_end else None
+        out["forward_guidance_horizon_months"] = horizon_months
+        out["forward_guidance_warning"] = warning
         return out
     return out
 
@@ -4111,6 +4161,89 @@ def compute_earnings_quality_metrics(
     }
 
 
+SPLIT_DETECT_UP_RATIO = float(os.getenv("SPLIT_DETECT_UP_RATIO", "1.4"))
+SPLIT_DETECT_DOWN_RATIO = float(os.getenv("SPLIT_DETECT_DOWN_RATIO", "0.72"))
+
+
+def build_split_adjustment_factors(history: List[dict]) -> List[float]:
+    """
+    history（新しい順の年次レコード）の発行済株式数の急変から分割・併合を推定し、
+    「最新期の株数基準」に各期を換算する係数を返す。
+
+    J-Quants の summary には調整済み株数が入らないため、隣接年で株数が
+    1.4倍超（分割）/ 0.72倍未満（併合）に動いた箇所を境目とみなす。
+    自社株買い・第三者割当程度の変動は閾値内に収まるので影響しない。
+    係数は「その期の値 × factor = 最新期基準」となるよう定義する。
+    """
+    n = len(history or [])
+    factors = [1.0] * n
+    if n < 2:
+        return factors
+    cumulative = 1.0
+    for i in range(n - 1):
+        try:
+            cur = history[i].get("shares_outstanding")
+            prev = history[i + 1].get("shares_outstanding")
+            ratio = float(cur) / float(prev) if cur and prev and float(prev) > 0 else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = None
+        if ratio is not None and (ratio > SPLIT_DETECT_UP_RATIO or ratio < SPLIT_DETECT_DOWN_RATIO):
+            cumulative *= ratio
+        factors[i + 1] = cumulative
+    return factors
+
+
+def _raw_series(history: List[dict], key: str) -> List[Optional[float]]:
+    out: List[Optional[float]] = []
+    for rec in history or []:
+        try:
+            raw = rec.get(key)
+            out.append(float(raw) if raw is not None and np.isfinite(float(raw)) else None)
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
+def _series_roughness(values: List[Optional[float]]) -> float:
+    """隣接期の対数変化の総和。分割調整が正しいほど小さくなる。"""
+    total = 0.0
+    pairs = [(a, b) for a, b in zip(values, values[1:]) if a and b and a > 0 and b > 0]
+    for cur, prev in pairs:
+        total += abs(math.log(cur / prev))
+    return total if pairs else float("inf")
+
+
+def split_adjusted_series(history: List[dict], key: str, *, per_share: bool) -> List[Optional[float]]:
+    """
+    分割調整済みの時系列を最新期基準で返す。
+    per_share=True の指標（DPS/EPS）は株数が増えた分だけ割り、
+    per_share=False（株数そのもの）は掛けて揃える。
+
+    株数は期末時点なので、分割の基準日が期末と重なると DPS 側の切り替わりが
+    1期ずれる。どちらの境界が正しいかは開示から一意に決まらないため、
+    per_share では系列が滑らかになる方の境界を採用する。
+    """
+    factors = build_split_adjustment_factors(history)
+    raw = _raw_series(history, key)
+
+    def apply(fs: List[float]) -> List[Optional[float]]:
+        result: List[Optional[float]] = []
+        for value, factor in zip(raw, fs):
+            if value is None or not factor:
+                result.append(None)
+                continue
+            result.append(value / factor if per_share else value * factor)
+        return result
+
+    if not per_share or len(factors) < 2 or all(f == factors[0] for f in factors):
+        return apply(factors)
+
+    shifted = factors[1:] + [factors[-1]]
+    aligned_values = apply(factors)
+    shifted_values = apply(shifted)
+    return shifted_values if _series_roughness(shifted_values) < _series_roughness(aligned_values) else aligned_values
+
+
 def compute_shareholder_return_quality(history: List[dict]) -> dict[str, Any]:
     latest = (history or [{}])[0] if history else {}
     dps = _non_null(latest.get("forecast_dividend_per_share"), latest.get("dividend_per_share"))
@@ -4124,21 +4257,21 @@ def compute_shareholder_return_quality(history: List[dict]) -> dict[str, Any]:
     dividend_payout_ratio = None
     buyback_consistency = 0.0
     debt_funded_penalty = 0.0
+    window = (history or [])[:7]
+    # 株式分割・併合を最新期基準へ遡及調整しないと、DPS の見かけ減配や
+    # 株数増加（＝増資扱い）として誤判定される。
+    adj_dps = split_adjusted_series(window, "dividend_per_share", per_share=True)
+    adj_dps_fcst = split_adjusted_series(window, "forecast_dividend_per_share", per_share=True)
+    adj_shares = split_adjusted_series(window, "shares_outstanding", per_share=False)
     dps_values: list[float] = []
     share_values: list[float] = []
-    for rec in (history or [])[:7]:
-        try:
-            dv = _non_null(rec.get("dividend_per_share"), rec.get("forecast_dividend_per_share"))
-            if dv is not None and np.isfinite(float(dv)):
-                dps_values.append(float(dv))
-        except (TypeError, ValueError):
-            pass
-        try:
-            sv = rec.get("shares_outstanding")
-            if sv is not None and np.isfinite(float(sv)) and float(sv) > 0:
-                share_values.append(float(sv))
-        except (TypeError, ValueError):
-            pass
+    for dv, dv_fcst in zip(adj_dps, adj_dps_fcst):
+        picked = _non_null(dv, dv_fcst)
+        if picked is not None:
+            dps_values.append(float(picked))
+    for sv in adj_shares:
+        if sv is not None and sv > 0:
+            share_values.append(float(sv))
 
     try:
         if dps is not None and shares is not None and cfo is not None and float(cfo) > 0:
@@ -4150,9 +4283,10 @@ def compute_shareholder_return_quality(history: List[dict]) -> dict[str, Any]:
             dividend_payout_ratio = (float(dps) * float(shares)) / float(npv)
     except (TypeError, ValueError, ZeroDivisionError):
         pass
-    if len(share_values) >= 4:
+    if len(share_values) >= 3:
         try:
-            cagr = (share_values[0] / share_values[3]) ** (1 / 3) - 1.0
+            span = min(len(share_values) - 1, 3)
+            cagr = (share_values[0] / share_values[span]) ** (1 / span) - 1.0
             buyback_consistency = 1.0 if cagr < -0.01 else 0.5 if cagr < 0 else 0.0
         except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             buyback_consistency = 0.0
@@ -5150,8 +5284,15 @@ def analyze_single_stock_complete_v3(session: requests.Session,
                 raw_fin["current"].get("forecast_eps"),
             ),
         )
-        val["forward_guidance_source"] = forward_guidance.get("forward_guidance_source")
-        val["forward_guidance_disclosed"] = forward_guidance.get("forward_guidance_disclosed")
+        for _fg_key in (
+            "forward_guidance_source",
+            "forward_guidance_disclosed",
+            "forward_guidance_target_fy_end",
+            "forward_guidance_base_fy_end",
+            "forward_guidance_horizon_months",
+            "forward_guidance_warning",
+        ):
+            val[_fg_key] = forward_guidance.get(_fg_key)
         peg_quality = evaluate_peg_quality(val.get("reference_peg"), val.get("eps_growth_rate"))
         earnings_quality = compute_earnings_quality_metrics(
             financial_history,
@@ -5161,6 +5302,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
         if earnings_quality.get("earnings_quality_flag") == "watch":
             peg_quality["peg_trusted"] = False
             peg_quality["peg_warning"] = "earnings_quality_watch"
+        # 会社予想が取れない銘柄の PEG は実績 YoY だけが根拠になるため信頼扱いしない
+        if val.get("forward_np_change") is None and peg_quality.get("peg_trusted") is not False:
+            peg_quality["peg_trusted"] = False
+            peg_quality["peg_warning"] = "forward_guidance_missing"
         shareholder_return = compute_shareholder_return_quality(financial_history)
         accounting_flag = evaluate_accounting_flag(financial_history)
         governance_flag = evaluate_edinet_governance_flag(code)
@@ -5548,6 +5693,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "entry_score_raw": _entry_raw,
             "forward_np_change": val.get("forward_np_change"),
             "forward_guidance_source": val.get("forward_guidance_source"),
+            "forward_guidance_warning": val.get("forward_guidance_warning"),
             "earnings_quality_flag": earnings_quality.get("earnings_quality_flag"),
             "shareholder_return_score": shareholder_return.get("shareholder_return_score"),
             "accounting_flag": accounting_flag.get("accounting_flag"),
@@ -5620,6 +5766,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "forward_np_change": val.get("forward_np_change"),
             "forward_guidance_source": val.get("forward_guidance_source"),
             "forward_guidance_disclosed": val.get("forward_guidance_disclosed"),
+            "forward_guidance_target_fy_end": val.get("forward_guidance_target_fy_end"),
+            "forward_guidance_base_fy_end": val.get("forward_guidance_base_fy_end"),
+            "forward_guidance_horizon_months": val.get("forward_guidance_horizon_months"),
+            "forward_guidance_warning": val.get("forward_guidance_warning"),
             "earnings_quality": earnings_quality,
             "shareholder_return": shareholder_return,
             "accounting_flag": accounting_flag,
@@ -6359,6 +6509,10 @@ def _flatten_result(d: dict) -> dict:
         "forward_np_change": d.get("forward_np_change"),
         "forward_guidance_source": d.get("forward_guidance_source"),
         "forward_guidance_disclosed": d.get("forward_guidance_disclosed"),
+        "forward_guidance_target_fy_end": d.get("forward_guidance_target_fy_end"),
+        "forward_guidance_base_fy_end": d.get("forward_guidance_base_fy_end"),
+        "forward_guidance_horizon_months": d.get("forward_guidance_horizon_months"),
+        "forward_guidance_warning": d.get("forward_guidance_warning"),
         "earnings_quality_flag": (d.get("earnings_quality") or {}).get("earnings_quality_flag"),
         "earnings_quality_warnings": (d.get("earnings_quality") or {}).get("earnings_quality_warnings"),
         "accrual_ratio": (d.get("earnings_quality") or {}).get("accrual_ratio"),
@@ -6927,7 +7081,11 @@ def compute_recommendation_score(df: pd.DataFrame) -> pd.Series:
     score = score - np.where(mild & (fchg <= -0.20), 12.0, 0.0)
     score = score - np.where(mild & (fchg > -0.20) & (fchg <= -0.10), 6.0, 0.0)
     score = score - np.where(mild & (fchg > -0.10) & (fchg < 0.0), 2.0, 0.0)
-    score = score - np.where(fchg.isna(), 3.0, 0.0)
+    # 会社予想が無い銘柄は減益の有無を確認できないため、確認済み横ばいより下に置く
+    score = score - np.where(fchg.isna(), 6.0, 0.0)
+
+    fwarn = df.get("forward_guidance_warning", pd.Series("", index=df.index)).astype(str).str.lower()
+    score = score - np.where(fwarn.str.startswith("forward_period_mismatch"), 5.0, 0.0)
 
     eq = df.get("earnings_quality_flag", pd.Series("", index=df.index)).astype(str).str.lower()
     score = score - np.where(eq == "watch", 8.0, 0.0)
