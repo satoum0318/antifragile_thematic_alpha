@@ -2969,6 +2969,83 @@ def build_financial_history_from_statements(
             break
     return history, statement_basis_used
 
+def resolve_forward_guidance(
+    stmts: List[dict],
+    as_of_date: Optional[datetime.date] = None,
+) -> dict:
+    """
+    会社予想（当期進行中 or 翌期）を開示行から解決する。
+    通期(FY)行は当期予想欄が空で翌期予想欄に値が入るため、annual 行だけを見ると予想が全滅する。
+    比較基準は常に「直近の通期実績」なので、
+      - FY 行  -> 翌期予想 (NextForecast*)
+      - 四半期行 -> 進行期の通期予想 (Forecast*)
+    のどちらを採っても forward_np_change の分母は共通で使える。
+    """
+    out = {
+        "forecast_net_income": None,
+        "forecast_eps": None,
+        "forward_guidance_source": None,
+        "forward_guidance_disclosed": None,
+        "forward_guidance_target_fy_end": None,
+    }
+    if not stmts:
+        return out
+
+    rows: List[dict] = []
+    for stmt in stmts:
+        if not isinstance(stmt, dict):
+            continue
+        disclosed = _statement_disclosed_date(stmt)
+        if as_of_date is not None and disclosed is not None and disclosed > as_of_date:
+            continue
+        rows.append(stmt)
+    if not rows:
+        return out
+
+    rows.sort(
+        key=lambda r: (
+            _statement_period_end_date(r) or datetime.date.min,
+            _statement_disclosed_date(r) or datetime.date.min,
+        )
+    )
+    annual_ends = [
+        _statement_period_end_date(r)
+        for r in rows
+        if _statement_period_type(r) == "annual"
+    ]
+    annual_ends = [d for d in annual_ends if d is not None]
+    latest_actual_fy_end = max(annual_ends) if annual_ends else None
+
+    for rec in reversed(rows):
+        period_type = _statement_period_type(rec)
+        fy_end = _parse_optional_date(rec.get("CurrentFiscalYearEndDate")) or _statement_period_end_date(rec)
+        if period_type == "annual":
+            period_end = _statement_period_end_date(rec)
+            if latest_actual_fy_end is not None and period_end is not None and period_end < latest_actual_fy_end:
+                continue
+            net_income = _pick_numeric_field(rec, ["NextForecastNetIncome", "NextForecastProfit"])
+            eps = _pick_numeric_field(rec, ["NextForecastEarningsPerShare", "NextForecastEPS"])
+            source = "fy_next_guidance"
+            target_fy_end = None
+        else:
+            # 既に本決算が出た年度の四半期予想は使わない
+            if latest_actual_fy_end is not None and fy_end is not None and fy_end <= latest_actual_fy_end:
+                continue
+            net_income = _pick_numeric_field(rec, ["ForecastNetIncome", "ForecastProfit"])
+            eps = _pick_numeric_field(rec, ["ForecastEarningsPerShare", "ForecastEPS"])
+            source = "quarter_current_guidance"
+            target_fy_end = fy_end.isoformat() if fy_end else None
+        if net_income is None and eps is None:
+            continue
+        disclosed = _statement_disclosed_date(rec)
+        out["forecast_net_income"] = net_income
+        out["forecast_eps"] = eps
+        out["forward_guidance_source"] = source
+        out["forward_guidance_disclosed"] = disclosed.isoformat() if disclosed else None
+        out["forward_guidance_target_fy_end"] = target_fy_end
+        return out
+    return out
+
 def calculate_liquidity_metrics(
     close: pd.Series,
     volume: Optional[pd.Series],
@@ -4570,14 +4647,15 @@ def calculate_valuation_metrics_ps_peg(current_price: Optional[float],
             per_actual = float(current_price) / actual_eps
 
     try:
-        if forecast_eps is not None and np.isfinite(float(forecast_eps)):
-            forward_eps = float(forecast_eps)
-        elif (
+        # actual_eps と株数ベースを揃えるため、予想純利益がある場合はそちらから算出する
+        if (
             forecast_net_income is not None
             and shares_outstanding is not None
             and float(shares_outstanding) > 0
         ):
             forward_eps = float(forecast_net_income) / float(shares_outstanding)
+        elif forecast_eps is not None and np.isfinite(float(forecast_eps)):
+            forward_eps = float(forecast_eps)
     except (TypeError, ValueError, ZeroDivisionError):
         forward_eps = None
 
@@ -5052,6 +5130,10 @@ def analyze_single_stock_complete_v3(session: requests.Session,
 
         # 指標
         piot = calculate_piotroski_real(raw_fin)
+        forward_guidance = resolve_forward_guidance(
+            stmts if isinstance(stmts, list) else [],
+            as_of_date=latest_price_date,
+        )
         val = calculate_valuation_metrics_ps_peg(
             current_price=current_price,
             net_income_current=raw_fin["current"].get("net_income"),
@@ -5059,9 +5141,17 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             revenue_current=raw_fin["current"].get("revenue"),
             shares_outstanding=raw_fin["current"].get("shares_outstanding"),
             shares_outstanding_previous=raw_fin["previous"].get("shares_outstanding"),
-            forecast_net_income=raw_fin["current"].get("forecast_net_income"),
-            forecast_eps=raw_fin["current"].get("forecast_eps"),
+            forecast_net_income=_non_null(
+                forward_guidance.get("forecast_net_income"),
+                raw_fin["current"].get("forecast_net_income"),
+            ),
+            forecast_eps=_non_null(
+                forward_guidance.get("forecast_eps"),
+                raw_fin["current"].get("forecast_eps"),
+            ),
         )
+        val["forward_guidance_source"] = forward_guidance.get("forward_guidance_source")
+        val["forward_guidance_disclosed"] = forward_guidance.get("forward_guidance_disclosed")
         peg_quality = evaluate_peg_quality(val.get("reference_peg"), val.get("eps_growth_rate"))
         earnings_quality = compute_earnings_quality_metrics(
             financial_history,
@@ -5457,6 +5547,7 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "entry_score": entry_score,
             "entry_score_raw": _entry_raw,
             "forward_np_change": val.get("forward_np_change"),
+            "forward_guidance_source": val.get("forward_guidance_source"),
             "earnings_quality_flag": earnings_quality.get("earnings_quality_flag"),
             "shareholder_return_score": shareholder_return.get("shareholder_return_score"),
             "accounting_flag": accounting_flag.get("accounting_flag"),
@@ -5527,6 +5618,8 @@ def analyze_single_stock_complete_v3(session: requests.Session,
             "eps_used": val.get("eps_used"),
             "eps_basis": val.get("eps_basis"),
             "forward_np_change": val.get("forward_np_change"),
+            "forward_guidance_source": val.get("forward_guidance_source"),
+            "forward_guidance_disclosed": val.get("forward_guidance_disclosed"),
             "earnings_quality": earnings_quality,
             "shareholder_return": shareholder_return,
             "accounting_flag": accounting_flag,
@@ -6264,6 +6357,8 @@ def _flatten_result(d: dict) -> dict:
         "eps_used": d.get("eps_used"),
         "eps_basis": d.get("eps_basis"),
         "forward_np_change": d.get("forward_np_change"),
+        "forward_guidance_source": d.get("forward_guidance_source"),
+        "forward_guidance_disclosed": d.get("forward_guidance_disclosed"),
         "earnings_quality_flag": (d.get("earnings_quality") or {}).get("earnings_quality_flag"),
         "earnings_quality_warnings": (d.get("earnings_quality") or {}).get("earnings_quality_warnings"),
         "accrual_ratio": (d.get("earnings_quality") or {}).get("accrual_ratio"),
@@ -6613,6 +6708,9 @@ def write_markdown_report(flat: pd.DataFrame, outdir: Path, topn: int = 10, time
         cap = r.get("grade_capped_reason") or ""
         fchg = r.get("forward_np_change")
         fchg_s = f"{float(fchg)*100:.1f}%" if fchg is not None and pd.notna(fchg) else "N/A"
+        fsrc = r.get("forward_guidance_source")
+        if fchg_s != "N/A" and isinstance(fsrc, str) and fsrc:
+            fchg_s = f"{fchg_s} ({'翌期' if fsrc.startswith('fy_next') else '進行期'})"
         srq = r.get("shareholder_return_score")
         srq_s = f"{float(srq):.1f}" if srq is not None and pd.notna(srq) else "N/A"
         lines.append(
