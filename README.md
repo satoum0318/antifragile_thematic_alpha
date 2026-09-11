@@ -12,6 +12,7 @@ J-Quants APIを使用した投資銘柄スクリーニングシステム
 - **凍結キャッシュ**: 取得したデータをローカルに保存し、オフライン分析を可能に
 - **投資分析**: Piotroski F-Score、バリュエーション指標、安全性スコアなどを計算
 - **スイング向けスクリーニング**: 21〜126営業日保有を前提に、財務品質・安全性・バリュエーションを重視
+- **ロジック正本**: `JQ-STD-CORRECTED-1.0-rc1`（J-Quants Standard、追加アドオンなし）
 
 ## セットアップ
 
@@ -64,8 +65,10 @@ python JQuamtsScreeningBot.py --phase fields-audit --budget 50
 ## ファイル構成
 
 - `runner.py`: 便利なランナースクリプト
-- `JQuamtsScreeningBot.py`: J-Quants V2 オフライン一括スクリーニング（`output/reports/`）
-- `docs/スクリーニング仕様マニュアル.md`: Bot の仕様・MA200レーン詳細
+- `JQuamtsScreeningBot.py`: J-Quants V2 Standard オフライン一括スクリーニング
+- `docs/JQuants_Standard_Screening_Logic_Master.md`: **現行ロジック正本**（`JQ-STD-CORRECTED-1.0-rc1`）
+- `docs/スクリーニング仕様マニュアル.md`: 正本への案内
+- `docs/archive/スクリーニング仕様マニュアル_pre-jq-std-1.0-rc1.md`: 旧正本アーカイブ
 - `config/theme_tags.yaml`: テーマタグ定義
 - `.jquants_cache_v2/`: データキャッシュディレクトリ
 - `output/`: 分析結果出力ディレクトリ

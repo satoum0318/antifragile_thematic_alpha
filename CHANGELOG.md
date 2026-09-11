@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.9.0-rc1] - 2026-09-11
+
+### J-Quants Standard ロジック正本の交代（`JQ-STD-CORRECTED-1.0-rc1`）
+
+- **新正本**: `docs/JQuants_Standard_Screening_Logic_Master.md` をスクリーニングロジックの正本とする。
+- **旧正本**: `docs/スクリーニング仕様マニュアル.md` を `docs/archive/スクリーニング仕様マニュアル_pre-jq-std-1.0-rc1.md` へ退避。旧パスは案内のみ残す。
+- **実装**: `JQuamtsScreeningBot.py` を Standard プラン（追加アドオンなし）向けに再構成。`LOGIC_VERSION=JQ-STD-CORRECTED-1.0-rc1`。
+- 財務品質は summary の7項目で評価し、契約名だけの減点を廃止。金融4業種は一般事業会社モデルから分離。上昇余地・持続性は診断列として扱う。
+- 不一致がある場合は新正本を実装対象とし、差分はコードか正本のどちらを改訂したかを記録する。
+
+タグ: `v1.9.0-jq-std-corrected-rc1`
+
 ## [1.6.0] - 2026-04-28
 
 ### JQuamtsScreeningBot（MA200局面・candidate_lane・データレビュー）

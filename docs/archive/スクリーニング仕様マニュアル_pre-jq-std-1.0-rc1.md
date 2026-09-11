@@ -1,0 +1,200 @@
+# スクリーニング仕様マニュアル（アーカイブ）
+
+> **アーカイブ**（2026-09-11）。現行正本は `docs/JQuants_Standard_Screening_Logic_Master.md`（`JQ-STD-CORRECTED-1.0-rc1`）。本書は v1.8 系までの旧正本。
+
+# スクリーニング仕様マニュアル
+
+`JQuamtsScreeningBot.py` のスクリーニング仕様と、実行時の動作をまとめたマニュアルです。
+
+---
+
+## 1. 実行対象
+
+本リポジトリの現行スクリーニングは `JQuamtsScreeningBot.py` に一本化されています。
+
+| 観点 | **JQuamtsScreeningBot.py** |
+|------|----------------------------|
+| **用途** | J-Quants V2 の凍結キャッシュを使ったスイング向けオフライン分析 |
+| **分析モード** | キャッシュ済み全銘柄の一括分析 |
+| **出力先** | `output/reports/` |
+
+---
+
+## 2. 分析(analyze)フェーズの仕様
+
+- **前提（ロジック）**  
+  - EPS 成長率は当期・前期の**両方の株式数**が必要。  
+  - 決算系列が **annual でない**場合は売上 CAGR・営業利益安定は**計算しない**。  
+  - 認証 HTTP は現状 **レートリミッタ管理外**。PEG は参考列で総合スコアの直接入力には使わない。  
+  詳細は `JQuamtsScreeningBot.py` 先頭 docstring および `CHANGELOG.md` を参照。
+
+- **常に同じ処理**  
+  キャッシュが揃っている**全銘柄**を対象に `analyze_single_stock_complete_v3` で一括分析。
+- **プロファイル／テーマの概念なし**（`--profile` なし）。
+- **出力**  
+  - `screening_offline_{ts}.csv`（全銘柄のフラット結果。`candidate_lane`・`fundamental_edge_score`・`entry_score`・`data_review_*`・MA200 関連列などを含む）  
+  - `write_candidate_sets`：`core_candidates.csv` / `satellite_candidates.csv` 等  
+  - `write_ma200_lane_csvs`：`ma200_reclaim_core_candidates.csv`、`bottom_reversal_core_candidates.csv`、`data_review_candidates.csv` などレーン別CSV  
+  - `write_reports`：`top_recommended_core.csv` / `top_recommended_satellite.csv`（`rec_priority` → `recommendation_score` → FE → entry → `legacy_total` 順）、`top_safety_core.csv` 等  
+  - `write_markdown_report`：`report_core_top10.md`  
+  - `write_investment_advice_report`：`ranked_with_scores_core.csv`、`report_investment_advice_core.md`  
+
+→ **「全銘柄を同じ基準でスコア付けし、MA200・ファンダレーン付きでランキング＋レポートを出す」**仕様です。スコアとレーンの意味の違いは **§5** を参照してください。
+
+## 3. 実行例
+
+### JQuamtsScreeningBot.py
+
+```bash
+# 対話メニュー
+python JQuamtsScreeningBot.py
+
+# 収集（本日分）
+python JQuamtsScreeningBot.py --phase collect --budget 380
+
+# 全銘柄オフライン分析（トップ10など）
+python JQuamtsScreeningBot.py --phase analyze --top 10
+
+# 単銘柄分析
+python JQuamtsScreeningBot.py --phase single --code 8035
+
+# fins/summary 生フィールド監査
+python JQuamtsScreeningBot.py --phase fields-audit --budget 50
+```
+
+---
+
+## 4. JQuamtsScreeningBot.py スクリーニング詳細（MA200・レーン・データ品質）
+
+本節は `JQuamtsScreeningBot.py` の現行ロジック（CHANGELOG `[1.6.0]` 相当）の要約です。数値は **環境変数未設定時のデフォルト** です。上書き可能な定数はソース先頭の `os.getenv(...)` 定義を参照してください。
+
+### 4.1 三本柱のスコア（混同しない）
+
+| 名称（レポート表記） | 列・変数 | 意味 |
+|----------------------|----------|------|
+| **legacy_total** | `total_score` | 従来の合成投資スコア（バリュエーション・財務・レジリエンス・モメンタム・安全性 − 各種ペナルティ）。グレード（A+〜C）の根拠。 |
+| **fundamental_edge** | `fundamental_edge_score` | ファンダ・バリュー寄りの 0〜100。PS、セクター比、PEG信頼度、Piotroski、営業利益安定、成長・決算品質ペナルティ等。 |
+| **entry_timing_score** | `entry_score` | `compute_entry_score` の生スコアを **レーン別上限**で切った値。局面（MA200上抜け・大底候補など）のボーナス／ペナルティを含み、**買いタイミング評価**であり銘柄品質単体ではない。 |
+
+最終判断では **`candidate_lane`（推奨レーン）**・**`fundamental_edge_score`**・**`data_review_reason` / `data_review_level`** を併用する想定です。
+
+### 4.2 必須フィルタ（オフライン分析での「通過」前提）
+
+| 項目 | デフォルト | 環境変数例 |
+|------|------------|------------|
+| 30日平均成交量 | ≥ 50,000 | `MIN_AVG_VOLUME_30D` |
+| 20営業日約定代金 | ≥ 3億円 | `MIN_ADV_JPY_20D` |
+| 時価総額 | ≥ 500億円 | `MIN_MARKET_CAP_JPY` |
+| 防御的PS（コア候補） | PS ≤ 2.0 | `MAX_PS_DEFENSIVE` |
+| コアPER | PER ≤ 60（超はSatellite扱い） | `MAX_PER_CORE` |
+| 営業利益安定 | 直近年＋過去窓で安定判定 | `OP_INCOME_YEARS`、`EXCLUDE_OP_INCOME_DEFICIT` |
+| **営業利益「急落」許容** | 直近が過去中央値の **0.6倍以上** ならOK | **`OP_INCOME_DROP_FLOOR`（既定 0.3 ではなく 0.6）** |
+
+レポートの必須フィルタ節には **急落 floor** が明示されます。
+
+### 7.3 バリュエーション上の区分（`valuation_lane`）
+
+- **core_candidate**：流動性・時価・PS・営業利益安定などを満たす「本線」候補。  
+- **satellite_valuation / satellite_ps_only**：コア条件は満たさないがバリュエーション・PSのみ等で拾う衛星候補。  
+- **excluded**：上記いずれにも入らない。
+
+`filters` 内の `candidate_lane` は歴史的に valuation 側のラベルにも使われることがあるため、**エントリー推奨レーンは `entry_candidate_lane` / フラット後の `candidate_lane`（分析結果のメイン軸）**を参照してください。
+
+### 7.4 `candidate_lane`（エントリー推奨レーン）一覧
+
+`assign_entry_candidate_lane` による分類。先に **サイクル・バリュートラップ**、**Piotroski欠損レベル**、**データ要レビュー（medium/severe）**、**下降トレンドゲート**が優先されます。
+
+| レーン | 概要 |
+|--------|------|
+| `ma200_reclaim_core` | `ma200_state == ma200_reclaim`、**reclaim_quality**（営業利益安定、PEG警告エッジ禁止、調整Piotroski≥6、カバレッジ≥`MIN_PIOTROSKI_COVERAGE_CORE`、**生Piotroski>3**）、`fundamental_edge >= RECLAIM_CORE_MIN_FUNDAMENTAL`（既定70）、データレビュー issue なし。 |
+| `data_review_light` | reclaim で上記に近いが **`has_issues` かつ level のみ light**、または後段で軽微 issue のみ。`ma200_reclaim` かつ light の組み合わせはレポート上 **推奨順が繰り上がる**（`rec_priority`）。上限 **80**（`LANE_CAP_DATA_REVIEW_LIGHT`）。 |
+| `weak_reclaim_watch` | reclaim かつ quality 満たすが `fundamental_edge` が **既定 60〜69**（`WEAK_RECLAIM_MIN_FUNDAMENTAL`〜`WEAK_RECLAIM_MAX_FUNDAMENTAL`）で **`RECLAIM_CORE_MIN_FUNDAMENTAL`（70）未満**。 |
+| `bottom_reversal_core` | `below_ma200_basing`、 downtrend でない、**`fundamental_edge >= 75`**（`MIN_FUNDAMENTAL_EDGE_FOR_BOTTOM_BUY`）、営業利益安定、`bottom_quality`（reclaim_quality に加え調整Piot≥**6.5**、**21日リターン>0**、**直近10日以内に60日底更新なし** `recent_60d_low_update == False`）。 |
+| `extended_above_ma200` | 200日線上で伸長局面、ファンダ・Piot条件付き。 |
+| `watch_fundamental_core` | ファンダ一定以上だが買いタイミングゲート不成立など。推奨順では **`fundamental_edge` 降順**（このレーンのみ `rec_secondary`=FE）。 |
+| `data_review` | 調整Piotroski **< 4**、または medium/severe のデータ品質、または **生Piotroski ≤ 3**。lane が `data_review` のとき `entry_timing_score` は level に応じ **70（medium）/ 55（severe）** 上限。 |
+| `cyclical_value_trap` | 極端なPEG警告やEPSスパイクと営業利益悪化の組み合わせ等。 |
+| `satellite_valuation` | 衛星候補としてのレーン表示。 |
+| `excluded` | 上記に該当せず、または下降トレンド拒否。 |
+
+**reclaim_quality でのPEG警告禁止（例）**：`extremely_low_possible_oneoff`、`eps_growth_too_high_oneoff_risk`（＋極端lowのサイクル示唆はトラップ側）。
+
+### 7.5 Piotroski まわりの追加ルール
+
+- **生スコア ≤ 3**：原則 **`data_review`**（コア系レーン不可）。  
+- **調整スコア < 5.0**：`fundamental_edge_score` に **−15**。  
+- **調整スコア < 4.0**：レーン **`data_review`** への落下を優先。  
+- **低PS・割安だけが効く場合**：実体スコアが弱いとき追加ペナルティ（低PEG信頼と組み合わせ）あり。  
+
+### 7.6 データレビュー（`compute_data_review_meta`）
+
+返却・CSV・Markdown に **`data_review_reason`**（カンマ区切り）と **`data_review_level`**（`light` / `medium` / `severe`）を出力。
+
+**理由コードの例**：`statement_basis_fallback`、`critical_missing_too_many`、`piotroski_coverage_low`、`summary_only_financials`、`sector_unknown`、`piotroski_too_low`、`stale_statement`（ほか `piotroski_raw_weak` 等）。
+
+- **light**：同一銘柄の lane を `data_review_light` に寄せ、**entry 上限 80**。  
+- **medium / severe**：`data_review`、severe 時は **entry 上限 55**（既定）。
+
+### 7.7 セクター正規化
+
+- J-Quants の **`Sector33Name`** が取れる場合は正規化の入力として優先。  
+- `normalize_sector()` で「小売業→小売」「食料品→食品」「輸送用機器→自動車」など **33業種相当を社内キー**へ寄せ、`ps_vs_sector` ベンチマークの **「その他」偏りを抑える**。  
+- `DynamicSectorAverages.SECTOR_MEDIANS` / `default_sector_average` は上記キーに対応。
+
+### 7.8 レポート出力の並び順（Core 推奨）
+
+`_build_ranked` で **`rec_priority`**（ティア）と **`rec_secondary`**（ティア内の推奨キー）を付与。
+
+- 既定の `rec_secondary` は **`recommendation_score`**  
+  `0.60 * fundamental_edge + 0.40 * entry_score`  
+  ＋ 軽い減益ペナルティ（-10%/-20%）、forward欠損（**-6**）、対象期ミスマッチ（-5）、利益品質・会計・ガバナンス watch/severe、株主還元Q≥70 のボーナス  
+- **`watch_fundamental_core` のみ** `rec_secondary = fundamental_edge`（買い時よりファンダ優先）  
+- 並び: `rec_priority` → `rec_secondary` → `fundamental_edge` → `entry_score` → `legacy_total`
+
+### 7.8.1 会社予想（forward guidance）の解決と検証
+
+`resolve_forward_guidance` が全開示行から進行中の会社予想を決めます。通期(FY)行は当期予想欄が空で翌期予想欄に値が入るため、annual 行だけを見ると予想が取れません。
+
+| 最新開示 | 採用する予想 | `forward_guidance_source` |
+|---------|-------------|---------------------------|
+| FY 行 | `NextForecast*`（翌期） | `fy_next_guidance` |
+| 四半期行 | `Forecast*`（進行期通期） | `quarter_current_guidance` |
+
+分母はどちらも「直近の通期実績」で共通です。既に本決算が出た年度の四半期予想は採用しません。
+
+**対象期の検証**：`forward_guidance_target_fy_end` が「ベース期末 + 12ヶ月」から外れていないか `forward_guidance_horizon_months` で確認し、6〜18ヶ月の範囲外なら `forward_guidance_warning = forward_period_mismatch_*` を立てて**予想を採用しません**（決算期変更や開示取り違えの防止）。11/12/13ヶ月以外は `forward_period_irregular_*` として警告のみ。
+
+**PEG の扱い**：会社予想が取れない銘柄は成長率の根拠が実績 YoY だけになるため、`peg_trusted = False` / `peg_warning = forward_guidance_missing` にします。
+
+### 7.8.2 株主還元スコアの株式分割調整
+
+`shareholder_return_score` は `dividend_per_share` の推移と発行済株式数の増減を使いますが、J-Quants summary の株数は**分割調整されていません**。
+
+`build_split_adjustment_factors` が隣接年の株数比を見て、**1.4倍超（分割）/ 0.72倍未満（併合）** を境目とみなし、最新期基準の換算係数を作ります。自社株買いや第三者割当程度の変動は閾値内に収まるので影響しません。
+
+- 未調整だと、分割で株数が増えた期を**増資**と誤認して `buyback_consistency` が 0 になる  
+- 分割前の名目 DPS が高く見えるため**減配**と誤認して `dividend_policy_credibility` が下がる  
+
+株数は期末時点の値なので、分割基準日が期末と重なると DPS 側の切り替わりが 1 期ずれます。どちらが正しいかは開示から一意に決まらないため、`split_adjusted_series` は per-share 系列について**隣接期の対数変化の総和が小さくなる方の境界**を採用します。
+
+予想 DPS も FY 行では `NxFDivAnn`（翌期）側に入るため、`forecast_dividend_per_share` の取得元に `NextForecastDividendPerShare` を含めています。
+
+**ティアの意図（低い `rec_priority` が先）**  
+1. `ma200_reclaim_core`  
+2. `bottom_reversal_core`  
+3. `data_review_light` かつ `ma200_state == ma200_reclaim`  
+4. `watch_fundamental_core`  
+5. `weak_reclaim_watch`  
+6. `extended_above_ma200`  
+7. その他 `data_review` / `cyclical_value_trap` / 衛星 等（詳細はソース `rec_priority` の `np.select`）  
+
+`report_core_top10.md` と `report_investment_advice_core.md` では **`rec_score` / `legacy_total` / `fundamental_edge` / `entry_timing_score`** 表記と、並びの注記を載せています。
+
+### 7.9 参考（環境変数・キャップ）
+
+`LANE_CAP_*` 系：`LANE_CAP_RECLAIM`、`LANE_CAP_BOTTOM`、`LANE_CAP_DATA_REVIEW`、`LANE_CAP_DATA_REVIEW_SEVERE`、`LANE_CAP_DATA_REVIEW_LIGHT` など。  
+MA200 関連：`MA200_CROSS_LOOKBACK_DAYS`、`RECENT_LOW_NO_UPDATE_DAYS`（60日底の「直近N日で更新なし」）等。
+
+---
+
+*最終更新: 2026年4月*
