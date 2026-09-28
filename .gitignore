@@ -42,12 +42,17 @@ api.ini
 # キャッシュ・データ
 .jquants_cache/
 .jquants_cache_v2/
+.jquants_cache_v2_standard/
 snapshots/
 output/
 output/reports/
+output_standard/
 *.csv
 *.json
 !config/*.yaml
+
+# 一時ログ
+_temp_*.txt
 
 # OS
 .DS_Store
