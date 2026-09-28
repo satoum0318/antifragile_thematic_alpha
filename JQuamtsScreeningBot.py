@@ -7,7 +7,7 @@ Analysis is offline. Collection uses only the allowlisted J-Quants V2 endpoints.
 Unknown financial/corporate-action inputs are NOT silently imputed.
 For J-Quants fins/summary, JPY is an explicit configurable operational default; strict mode can disable it.
 The original 7,967-line script is not imported and is not overwritten.
-CLI1 restores the legacy Japanese menu (1-7); 8=audit, 9=date update.
+CLI3 provides one-command all-symbol collection with automatic resume, bounded retries, and status display.
 The Standard screening rules and raw cache schema are unchanged.
 Python >= 3.10; dependencies: numpy, pandas, requests.
 """
@@ -28,6 +28,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -43,7 +44,7 @@ import pandas as pd
 import requests
 
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
-CODE_VERSION = '1.0.2-rc1-cli2'
+CODE_VERSION = '1.0.3-rc1-cli3-all'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -245,6 +246,7 @@ class Config:
     ASSUME_JQUANTS_SUMMARY_JPY: bool = True
     JQ_RPM: int = 60
     JQ_SUMMARY_RPM: int = 60
+    # Internal checkpoint size only. It is NOT a J-Quants daily/API limit and is not asked in the normal UI.
     JQ_DEFAULT_BUDGET: int = 800
     JQ_RPD: Optional[int] = None
     FINANCIAL_DETAILS_ENABLED: bool = False
@@ -317,7 +319,7 @@ class Config:
         if not 0 < self.MA200_BELOW_MIN_RATIO < 1 or not 0 < self.OP_INCOME_DROP_FLOOR <= 1:
             raise DataError('Invalid floor ratio')
         if self.JQ_DEFAULT_BUDGET < 1 or self.MIN_SECTOR_VALID_SAMPLES < 5:
-            raise DataError('Invalid budget/sector sample floor')
+            raise DataError('Invalid checkpoint/sector sample floor')
         for key in ('PRICE_TECH_WINDOW_CALENDAR_DAYS','ADJUSTMENT_HISTORY_YEARS',
                     'MA200_CROSS_LOOKBACK_DAYS','RECENT_LOW_LOOKBACK_DAYS',
                     'RECENT_LOW_NO_UPDATE_DAYS','BASING_LOOKBACK_LOW_DAYS'):
@@ -1843,18 +1845,99 @@ def fix_benchmarks(records: list[dict], cfg: Config, universe_id: str) -> dict:
     return stats
 
 # ---- Immutable, checksummed cache and bounded API client ---------------------
+def _pid_is_running(pid: Any) -> Optional[bool]:
+    """Best-effort process existence check without adding a third-party dependency."""
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return False
+    if value == os.getpid():
+        return True
+    if os.name == 'nt':
+        try:
+            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            cp = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {value}', '/FO', 'CSV', '/NH'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                creationflags=flags,
+            )
+            return (b'","' + str(value).encode('ascii') + b'","') in (cp.stdout or b'')
+        except (OSError, subprocess.SubprocessError):
+            return None
+    try:
+        os.kill(value, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def inspect_process_lock(path: Path) -> dict:
+    out = {'path': str(path), 'exists': path.exists(), 'pid': None, 'created_at': None,
+           'alive': None, 'malformed': False}
+    if not out['exists']:
+        return out
+    try:
+        raw = json.loads(path.read_text('utf-8'))
+        out['pid'] = int(raw.get('pid')) if raw.get('pid') is not None else None
+        out['created_at'] = raw.get('created_at')
+        out['alive'] = _pid_is_running(out['pid'])
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        out['malformed'] = True
+    try:
+        out['age_seconds'] = max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        out['age_seconds'] = None
+    return out
+
+
 class ProcessLock:
     def __init__(self, root: Path, name: str):
-        self.path=root/(name+'.lock');self.fd=None
+        self.path = root / (name + '.lock')
+        self.fd = None
+
     def __enter__(self):
-        self.path.parent.mkdir(parents=True,exist_ok=True)
-        try:self.fd=os.open(self.path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-        except FileExistsError as e:
-            raise CollectionError(f'Another process or stale lock exists: {self.path}. Check the PID before removing it.') from e
-        os.write(self.fd,encoded({'pid':os.getpid(),'created_at':now_jst().isoformat()}))
-        return self
-    def __exit__(self,*exc):
-        if self.fd is not None:os.close(self.fd)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(self.fd, encoded({'pid': os.getpid(), 'created_at': now_jst().isoformat()}))
+                os.fsync(self.fd)
+                return self
+            except FileExistsError as exc:
+                info = inspect_process_lock(self.path)
+                if info.get('alive') is False:
+                    try:
+                        self.path.unlink()
+                        LOG.warning('[ロック復旧] 停止済みPID=%sのstale lockを自動削除しました: %s',
+                                    info.get('pid'), self.path)
+                        continue
+                    except FileNotFoundError:
+                        continue
+                    except OSError as remove_error:
+                        raise CollectionError(f'stale lockを削除できません: {self.path}: {remove_error}') from remove_error
+                if info.get('alive') is True:
+                    raise CollectionError(
+                        f'別の収集処理が実行中です: PID={info.get("pid")} '
+                        f'開始={info.get("created_at")} lock={self.path}'
+                    ) from exc
+                raise CollectionError(
+                    f'収集ロックを安全に判定できません: {self.path}。メニュー5で状態を確認してください'
+                ) from exc
+        raise CollectionError(f'収集ロックを取得できません: {self.path}')
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
         self.path.unlink(missing_ok=True)
 
 
@@ -1899,6 +1982,114 @@ class Store:
         if promote:
             if snap.get('status')=='incomplete':raise DataError('cannot_promote_incomplete')
             atomic_json(self.root/'latest_snapshot.json',{'snapshot_id':name})
+
+
+def _collection_failure_path(store: Store) -> Path:
+    return store.root / 'collection_failures.json'
+
+
+def _load_collection_failures(store: Store) -> dict:
+    path = _collection_failure_path(store)
+    if not path.exists():
+        return {'schema': 'jq-collection-failures-v1', 'failures': {}}
+    try:
+        raw = json.loads(path.read_text('utf-8'))
+        if raw.get('schema') != 'jq-collection-failures-v1' or not isinstance(raw.get('failures'), dict):
+            raise ValueError('invalid failure registry')
+        return raw
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {'schema': 'jq-collection-failures-v1', 'failures': {}}
+
+
+def _update_collection_failures(store: Store, snap: dict) -> None:
+    registry = _load_collection_failures(store)
+    failures = registry.setdefault('failures', {})
+    for code in snap.get('completed_codes', []):
+        failures.pop(code, None)
+    details = snap.get('terminal_failure_details') or {}
+    for code in snap.get('terminal_failed_codes', []):
+        detail = details.get(code) or {}
+        failures[code] = {
+            'attempts_in_run': detail.get('attempts'),
+            'reason': detail.get('reason'),
+            'last_attempt_at': detail.get('last_attempt_at') or now_jst().isoformat(),
+            'price_asof_date': snap.get('price_asof_date'),
+            'snapshot_id': snap.get('snapshot_id'),
+        }
+    registry['updated_at'] = now_jst().isoformat()
+    path = _collection_failure_path(store)
+    if failures:
+        atomic_json(path, registry)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _snapshot_stock_counts(store: Store, snap: dict) -> tuple[int, int]:
+    try:
+        master = master_records(bundle_rows(store, (snap.get('globals') or {}).get('master')))
+        codes = {m['code'] for m in master if m.get('instrument_type') == 'stock'}
+    except (DataError, KeyError, ValueError, TypeError):
+        codes = set()
+    if codes:
+        complete = sum(bool((snap.get('symbols') or {}).get(code, {}).get('complete')) for code in codes)
+        return len(codes), complete
+    symbols = snap.get('symbols') or {}
+    return len(symbols), sum(bool(item.get('complete')) for item in symbols.values())
+
+
+def collection_status(store: Store) -> dict:
+    out = {'snapshot_id': None, 'price_asof_date': None, 'total': 0, 'complete': 0,
+           'remaining': 0, 'resume_remaining': 0, 'terminal_failures': 0,
+           'lock': inspect_process_lock(store.root / 'collector.lock')}
+    try:
+        snap = store.snapshot()
+    except (DataError, OSError, ValueError, KeyError):
+        snap = {}
+    if snap:
+        total, complete = _snapshot_stock_counts(store, snap)
+        out.update(snapshot_id=snap.get('snapshot_id'), price_asof_date=snap.get('price_asof_date'),
+                   total=total, complete=complete, remaining=max(0, total-complete),
+                   snapshot_status=snap.get('status'))
+    resume_path = store.root / 'collection_resume.json'
+    if resume_path.exists():
+        try:
+            journal = json.loads(resume_path.read_text('utf-8'))
+            targets = journal.get('remaining_codes')
+            out['resume_remaining'] = len(targets) if isinstance(targets, list) else 0
+            out['resume_saved_at'] = journal.get('saved_at')
+            out['resume_asof'] = (journal.get('request') or {}).get('asof')
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            out['resume_error'] = 'collection_resume_invalid'
+    out['terminal_failures'] = len((_load_collection_failures(store).get('failures') or {}))
+    return out
+
+
+def print_collection_status(store: Store, compact: bool=False) -> dict:
+    status = collection_status(store)
+    if not status.get('snapshot_id'):
+        line = '[収集状況] まだ確定スナップショットがありません'
+    else:
+        total, complete = status['total'], status['complete']
+        pct = (100.0 * complete / total) if total else 0.0
+        line = (f'[収集状況] 完了={complete}/{total} ({pct:.1f}%) / 残={status["remaining"]} '
+                f'/ 基準日={status.get("price_asof_date") or "N/A"}')
+        if status.get('resume_remaining'):
+            line += f' / 再開待ち={status["resume_remaining"]}'
+        if status.get('terminal_failures'):
+            line += f' / 要確認失敗={status["terminal_failures"]}'
+    print(line, flush=True)
+    lock = status['lock']
+    if lock.get('exists'):
+        if lock.get('alive') is True:
+            lock_line = f'[ロック] 収集処理実行中 PID={lock.get("pid")} 開始={lock.get("created_at")}'
+        elif lock.get('alive') is False:
+            lock_line = f'[ロック] stale lock（次回収集時に自動削除） PID={lock.get("pid")}'
+        else:
+            lock_line = f'[ロック] 判定不能: {lock.get("path")}'
+        print(lock_line, flush=True)
+    elif not compact:
+        print('[ロック] なし', flush=True)
+    return status
 
 
 class RateLimiter:
@@ -2041,143 +2232,290 @@ def collect_globals(client: Client, asof: Optional[dt.date]=None) -> tuple[dict,
 
 def collect(client: Client, budget: int, force: bool=False, only_codes: Optional[list[str]]=None,
             refresh_days: Optional[int]=None, asof: Optional[dt.date]=None,
-            reset_pending: bool=False) -> dict:
-    """Collect one bounded batch; resume only from an explicit, parent-checked journal.
+            reset_pending: bool=False, max_retries: int=3) -> dict:
+    """Collect one internal checkpoint and persist progress for automatic resume.
 
-    A journal may reference an interrupted snapshot, but that snapshot is NEVER
-    promoted for analysis. Only completed per-symbol bundles are reused. A new
-    request with explicit codes or reset_pending starts a new target selection.
+    ``budget`` is only a checkpoint size. It is not an API limit or a daily limit.
+    The outer collect_all loop calls this function until every selected symbol is
+    complete or has exhausted the bounded retry count.
     """
-    if budget<1:raise DataError('budget must be positive')
-    store=client.store;previous=store.snapshot()
-    resume_path=store.root/'collection_resume.json'
-    resume=None;remaining=None;completed_codes=[];failed_codes=[]
-    request={'force':bool(force),'refresh_days':refresh_days,
-             'asof':asof.isoformat() if asof else None,'config_hash':digest(asdict(client.cfg)),
-             'only_codes':sorted({canonical_code(c) for c in only_codes}) if only_codes else None}
+    if budget < 1:
+        raise DataError('checkpoint size must be positive')
+    if max_retries < 1:
+        raise DataError('max_retries must be positive')
+    store = client.store
+    previous = store.snapshot()
+    # Normal continuation keeps the prior frozen market date so already-complete
+    # symbols and newly collected symbols remain comparable. A force/refresh run
+    # deliberately resolves a new date; daily advancement belongs to update().
+    previous_asof = date(previous.get('price_asof_date')) if previous else None
+    if asof is None and previous_asof is not None and not force and refresh_days is None:
+        asof = previous_asof
+    resume_path = store.root / 'collection_resume.json'
+    resume = None
+    remaining = None
+    completed_codes: list[str] = []
+    failed_codes: list[str] = []
+    retry_counts: dict[str, int] = {}
+    request = {
+        'force': bool(force),
+        'refresh_days': refresh_days,
+        'asof': asof.isoformat() if asof else None,
+        'config_hash': digest(asdict(client.cfg)),
+        'only_codes': sorted({canonical_code(c) for c in only_codes}) if only_codes else None,
+        'max_retries': int(max_retries),
+    }
     if reset_pending:
         resume_path.unlink(missing_ok=True)
         LOG.info('[再選択] 収集待ちリストを作り直します。既存キャッシュ・履歴は削除しません')
     elif resume_path.exists():
         try:
-            journal=json.loads(resume_path.read_text('utf-8'))
-            saved=journal.get('request',{})
-            compatible=(journal.get('schema')=='jq-collection-resume-v1'
-                and journal.get('latest_snapshot_id')==previous.get('snapshot_id')
-                and saved.get('config_hash')==request['config_hash']
-                and (only_codes is None or saved.get('only_codes')==request['only_codes'])
+            journal = json.loads(resume_path.read_text('utf-8'))
+            saved = journal.get('request', {})
+            saved_max_retries = int(saved.get('max_retries', max_retries))
+            compatible = (
+                journal.get('schema') == 'jq-collection-resume-v1'
+                and journal.get('latest_snapshot_id') == previous.get('snapshot_id')
+                and saved.get('config_hash') == request['config_hash']
+                and (only_codes is None or saved.get('only_codes') == request['only_codes'])
                 and (not force or saved.get('force') is True)
-                and (refresh_days is None or saved.get('refresh_days')==refresh_days)
-                and (asof is None or saved.get('asof')==asof.isoformat()))
-            targets=journal.get('remaining_codes')
-            if compatible and isinstance(targets,list) and targets:
-                resume=store.snapshot(journal['snapshot_id'])
-                remaining=list(dict.fromkeys(canonical_code(c) for c in targets))
-                request=saved.copy();force=bool(saved.get('force'))
-                refresh_days=saved.get('refresh_days');asof=date(saved.get('asof'))
-                LOG.info('[再開] 保存済みの収集待ちリストを使用します: 残り%s銘柄',len(remaining))
+                and (refresh_days is None or saved.get('refresh_days') == refresh_days)
+                and (saved.get('asof') in (None, asof.isoformat() if asof else None))
+                and saved_max_retries == max_retries
+            )
+            targets = journal.get('remaining_codes')
+            if compatible and isinstance(targets, list) and targets:
+                resume = store.snapshot(journal['snapshot_id'])
+                remaining = list(dict.fromkeys(canonical_code(c) for c in targets))
+                request = saved.copy()
+                request['max_retries'] = max_retries
+                force = bool(saved.get('force'))
+                refresh_days = saved.get('refresh_days')
+                asof = date(saved.get('asof')) or asof
+                request['asof'] = asof.isoformat() if asof else None
+                retry_counts = {
+                    canonical_code(str(k)): max(0, int(v))
+                    for k, v in (journal.get('retry_counts') or {}).items()
+                }
+                LOG.info('[再開] 保存済みの収集待ちリストを使用します: 残り%s銘柄 / 基準日=%s',
+                         len(remaining), request.get('asof') or '未確定')
             else:
                 LOG.info('[収集] 再開情報は現在の指定・基準スナップショットと異なるため再選択します')
-        except (DataError,OSError,ValueError,TypeError,KeyError) as e:
-            LOG.warning('[収集] 再開情報を利用できないため、確定済みキャッシュから再選択します: %s',e)
-            resume=None;remaining=None
-    symbols=copy.deepcopy(previous.get('symbols',{}))
+        except (DataError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            LOG.warning('[収集] 再開情報を利用できないため、確定済みキャッシュから再選択します: %s', exc)
+            resume = None
+            remaining = None
+            retry_counts = {}
+
+    symbols = copy.deepcopy(previous.get('symbols', {}))
     if resume is not None:
         # An incomplete symbol must not replace a previously valid symbol.
-        for c,item in resume.get('symbols',{}).items():
-            if item.get('complete') is True:symbols[c]=copy.deepcopy(item)
-    snap={'schema':CACHE_SCHEMA,'snapshot_id':new_id('s_'),'status':'incomplete',
-          'created_at':now_jst().isoformat(),'globals':{},'symbols':symbols,
-          'errors':[],'logic_version':LOGIC_VERSION,'parent_snapshot_id':previous.get('snapshot_id'),
-          'collection_request':request,'resumed_from_snapshot_id':resume.get('snapshot_id') if resume else None}
-    completed=False;planned=None;attempted=[]
+        for code, item in resume.get('symbols', {}).items():
+            if item.get('complete') is True:
+                symbols[code] = copy.deepcopy(item)
+
+    snap = {
+        'schema': CACHE_SCHEMA,
+        'snapshot_id': new_id('s_'),
+        'status': 'incomplete',
+        'created_at': now_jst().isoformat(),
+        'globals': {},
+        'symbols': symbols,
+        'errors': [],
+        'logic_version': LOGIC_VERSION,
+        'parent_snapshot_id': previous.get('snapshot_id'),
+        'collection_request': request,
+        'resumed_from_snapshot_id': resume.get('snapshot_id') if resume else None,
+    }
+    completed = False
+    planned: Optional[list[str]] = None
+    attempted: list[str] = []
+    terminal_failure_details: dict[str, dict] = {}
     try:
-        snap['globals'],t=collect_globals(client,asof)
-        snap['price_asof_date']=t.isoformat()
-        master=master_records(bundle_rows(store,snap['globals']['master']))
-        all_stocks=[m for m in master if m['instrument_type']=='stock']
-        stocks=all_stocks
+        snap['globals'], t = collect_globals(client, asof)
+        # Pin the first resolved market date for every later checkpoint/restart.
+        if request.get('asof') is None:
+            request['asof'] = t.isoformat()
+        elif request.get('asof') != t.isoformat():
+            raise CollectionError(f'collection_asof_changed:{request.get("asof")}->{t.isoformat()}')
+        asof = t
+        snap['collection_request'] = copy.deepcopy(request)
+        snap['price_asof_date'] = t.isoformat()
+
+        master = master_records(bundle_rows(store, snap['globals']['master']))
+        all_stocks = [m for m in master if m['instrument_type'] == 'stock']
+        stocks = all_stocks
         if only_codes:
-            allowed={resolve_code(c,master) for c in only_codes};stocks=[m for m in stocks if m['code'] in allowed]
-        candidates=[]
+            allowed = {resolve_code(c, master) for c in only_codes}
+            stocks = [m for m in stocks if m['code'] in allowed]
+
+        candidates: list[dict] = []
         if remaining is not None:
-            by_code={m['code']:m for m in all_stocks}
-            candidates=[by_code[c] for c in remaining if c in by_code]
-            dropped=len(remaining)-len(candidates)
-            if dropped:LOG.warning('[再開] 現在の普通株マスタにない%s銘柄を対象から外しました',dropped)
+            by_code = {m['code']: m for m in all_stocks}
+            candidates = [by_code[c] for c in remaining if c in by_code]
+            dropped = len(remaining) - len(candidates)
+            if dropped:
+                LOG.warning('[再開] 現在の普通株マスタにない%s銘柄を対象から外しました', dropped)
         else:
             for m in stocks:
-                old=snap['symbols'].get(m['code'])
-                olddate=date((old or {}).get('checked_price_date'))
-                stale=refresh_days is not None and (olddate is None or (t-olddate).days>=refresh_days)
-                if force or stale or old is None or old.get('complete') is not True:candidates.append(m)
-        planned=[m['code'] for m in candidates]
-        count=min(len(candidates),budget)
-        mode='強制再収集' if force else f'{refresh_days}日以上古いものを再収集' if refresh_days is not None else '未取得・未完了のみ'
-        LOG.info('[収集開始] 対象=%s銘柄 / このバッチ=%s銘柄 / モード=%s',len(candidates),count,mode)
-        if not count:LOG.info('[収集] 今回の対象はありません')
-        started=time.monotonic()
-        start=add_months(t,-12*client.cfg.ADJUSTMENT_HISTORY_YEARS)-dt.timedelta(days=10)
-        for i,m in enumerate(candidates[:budget],1):
-            code,api=m['code'],m['api_code'];item={'complete':False,'checked_price_date':str(t)}
+                old = snap['symbols'].get(m['code'])
+                olddate = date((old or {}).get('checked_price_date'))
+                stale = refresh_days is not None and (olddate is None or (t-olddate).days >= refresh_days)
+                if force or stale or old is None or old.get('complete') is not True:
+                    candidates.append(m)
+
+        planned = [m['code'] for m in candidates]
+        count = min(len(candidates), budget)
+        mode = ('強制再収集' if force else
+                f'{refresh_days}日以上古いものを再収集' if refresh_days is not None else
+                '未取得・未完了のみ')
+        LOG.info('[収集開始] 残対象=%s銘柄 / 今回の内部チェックポイント=%s銘柄 / モード=%s / 基準日=%s',
+                 len(candidates), count, mode, t)
+        if not count:
+            LOG.info('[収集] 今回の対象はありません')
+
+        started = time.monotonic()
+        start_date = add_months(t, -12*client.cfg.ADJUSTMENT_HISTORY_YEARS) - dt.timedelta(days=10)
+        for i, m in enumerate(candidates[:budget], 1):
+            code, api = m['code'], m['api_code']
+            old_item = copy.deepcopy(snap['symbols'].get(code) or {})
+            item = {'complete': False, 'checked_price_date': str(t)}
             attempted.append(code)
-            LOG.info('[収集 %s/%s] %s %s（価格・財務・決算予定・需給）',i,count,code,m.get('name',''))
-            for kind,ep,p in [
-                ('prices','equities/bars/daily',{'code':api,'from':str(start),'to':str(t)}),
-                ('summary','fins/summary',{'code':api}),('earnings','fins/earnings-date',{'code':api})]:
-                blob=client.fetch(ep,p)
-                item[kind]=store.put(blob)
-                if kind!='earnings' and not blob['rows']:
-                    snap['errors'].append({'code':code,'reason':kind+'_empty_http200'})
-            for kind,ep,p in [
-                ('margin','markets/margin-interest',{'code':api,'from':str(t-dt.timedelta(days=90)),'to':str(t)}),
-                ('short','markets/short-sale-report',{'code':api,'disc_date_from':str(t-dt.timedelta(days=90)),'disc_date_to':str(t)})]:
-                if kind=='margin' and now_jst().date()>=dt.date(2026,9,28):
-                    item[kind]=store.put({'status':'schema_review_required','rows':[],'collected_at':now_jst().isoformat(),
-                        'reason':'2026-09-28 margin schema migration requires adapter audit'});continue
-                try:item[kind]=store.put(client.fetch(ep,p))
-                except AuthError as e:
-                    if '401' in str(e):raise
-                    item[kind]=store.put({'status':'permission_unavailable','rows':[],'collected_at':now_jst().isoformat()})
-                except CollectionError as e:
-                    item[kind]=store.put({'status':'collection_failed','rows':[],'reason':str(e),'collected_at':now_jst().isoformat()})
-            item['complete']=bool(bundle_rows(store,item['prices']) and bundle_rows(store,item['summary']))
-            item['collected_at']=now_jst().isoformat()
-            item['financial_checked_through']=item['collected_at']
-            item['earnings_checked_through']=item['collected_at']
-            snap['symbols'][code]=item
-            if item['complete']:completed_codes.append(code)
-            else:failed_codes.append(code)
-            if i==1 or i%20==0 or i==count:
+            LOG.info('[収集 %s/%s] %s %s（価格・財務・決算予定・需給）', i, count, code, m.get('name', ''))
+            required_errors: list[str] = []
+            try:
+                for kind, endpoint, params in [
+                    ('prices', 'equities/bars/daily', {'code': api, 'from': str(start_date), 'to': str(t)}),
+                    ('summary', 'fins/summary', {'code': api}),
+                    ('earnings', 'fins/earnings-date', {'code': api}),
+                ]:
+                    blob = client.fetch(endpoint, params)
+                    item[kind] = store.put(blob)
+                    if kind != 'earnings' and not blob['rows']:
+                        reason = kind + '_empty_http200'
+                        required_errors.append(reason)
+                        snap['errors'].append({'code': code, 'reason': reason})
+            except AuthError:
+                raise
+            except (CollectionError, DataError, OSError, ValueError, KeyError) as exc:
+                reason = f'required_collection_failed:{type(exc).__name__}:{exc}'
+                required_errors.append(reason)
+                snap['errors'].append({'code': code, 'reason': reason})
+
+            if not required_errors:
+                for kind, endpoint, params in [
+                    ('margin', 'markets/margin-interest', {'code': api, 'from': str(t-dt.timedelta(days=90)), 'to': str(t)}),
+                    ('short', 'markets/short-sale-report', {'code': api, 'disc_date_from': str(t-dt.timedelta(days=90)), 'disc_date_to': str(t)}),
+                ]:
+                    if kind == 'margin' and now_jst().date() >= dt.date(2026, 9, 28):
+                        item[kind] = store.put({'status': 'schema_review_required', 'rows': [],
+                            'collected_at': now_jst().isoformat(),
+                            'reason': '2026-09-28 margin schema migration requires adapter audit'})
+                        continue
+                    try:
+                        item[kind] = store.put(client.fetch(endpoint, params))
+                    except AuthError as exc:
+                        if '401' in str(exc):
+                            raise
+                        item[kind] = store.put({'status': 'permission_unavailable', 'rows': [],
+                                               'collected_at': now_jst().isoformat()})
+                    except CollectionError as exc:
+                        item[kind] = store.put({'status': 'collection_failed', 'rows': [],
+                                               'reason': str(exc), 'collected_at': now_jst().isoformat()})
+            else:
+                skipped = store.put({'status': 'skipped_required_data_incomplete', 'rows': [],
+                                     'collected_at': now_jst().isoformat()})
+                item['margin'] = skipped
+                item['short'] = skipped
+
+            item['complete'] = bool(bundle_rows(store, item.get('prices')) and bundle_rows(store, item.get('summary')))
+            item['collected_at'] = now_jst().isoformat()
+            if item['complete']:
+                item['financial_checked_through'] = item['collected_at']
+                item['earnings_checked_through'] = item['collected_at']
+                snap['symbols'][code] = item
+                completed_codes.append(code)
+                retry_counts.pop(code, None)
+            else:
+                attempts = retry_counts.get(code, 0) + 1
+                retry_counts[code] = attempts
+                reason = ';'.join(required_errors) if required_errors else 'required_bundle_incomplete'
+                item.update(collection_attempts=attempts, failure_reason=reason)
+                # A failed refresh never destroys an already valid frozen bundle.
+                if old_item.get('complete') is True:
+                    snap['symbols'][code] = old_item
+                    item['retained_previous_complete'] = True
+                else:
+                    snap['symbols'][code] = item
+                failed_codes.append(code)
+                if attempts >= max_retries:
+                    terminal_failure_details[code] = {
+                        'attempts': attempts,
+                        'reason': reason,
+                        'last_attempt_at': item['collected_at'],
+                    }
+
+            if i == 1 or i % 20 == 0 or i == count:
                 LOG.info('[進捗] %s/%s 完了 / 成功=%s 未完了=%s / 経過%.0f秒',
-                         i,count,len(completed_codes),len(failed_codes),time.monotonic()-started)
-        snap['pending_count']=sum(not snap['symbols'].get(m['code'],{}).get('complete',False) for m in all_stocks)
-        snap['attempted_count']=len(attempted)
-        snap['attempted_codes']=attempted
-        snap['pending_codes']=[m['code'] for m in candidates[budget:]]
-        snap['status']='partial_universe' if snap['pending_count'] or snap['errors'] else 'complete'
-        snap['information_cutoff']=now_jst().isoformat()
-        snap['created_at']=snap['information_cutoff'];completed=True
+                         i, count, len(completed_codes), len(failed_codes), time.monotonic()-started)
+
+        unattempted = [m['code'] for m in candidates[budget:]]
+        retryable_failed = [c for c in failed_codes if retry_counts.get(c, 0) < max_retries]
+        terminal_failed = [c for c in failed_codes if retry_counts.get(c, 0) >= max_retries]
+        pending_codes = list(dict.fromkeys(unattempted + retryable_failed))
+        snap['pending_count'] = sum(
+            not snap['symbols'].get(m['code'], {}).get('complete', False) for m in all_stocks
+        )
+        snap['attempted_count'] = len(attempted)
+        snap['attempted_codes'] = attempted
+        snap['completed_codes'] = completed_codes
+        snap['failed_codes'] = failed_codes
+        snap['retry_counts'] = retry_counts
+        snap['retryable_failed_codes'] = retryable_failed
+        snap['terminal_failed_codes'] = terminal_failed
+        snap['terminal_failure_details'] = terminal_failure_details
+        snap['unattempted_count'] = len(unattempted)
+        snap['pending_codes'] = pending_codes
+        snap['requested_pending_count'] = len(pending_codes)
+        snap['status'] = ('partial_universe' if snap['pending_count'] or pending_codes or terminal_failed
+                          or snap['errors'] else 'complete')
+        snap['information_cutoff'] = now_jst().isoformat()
+        snap['created_at'] = snap['information_cutoff']
+        completed = True
         return snap
     finally:
-        snap['batch_success_count']=len(completed_codes)
-        snap['batch_incomplete_count']=len(failed_codes)
+        snap['batch_success_count'] = len(completed_codes)
+        snap['batch_incomplete_count'] = len(failed_codes)
         if not completed:
-            snap['status']='incomplete';snap['failure_at']=now_jst().isoformat()
-            snap['attempted_codes']=attempted;snap['attempted_count']=len(attempted)
-        store.save_snapshot(snap,promote=completed)
+            snap['status'] = 'incomplete'
+            snap['failure_at'] = now_jst().isoformat()
+            snap['attempted_codes'] = attempted
+            snap['attempted_count'] = len(attempted)
+        store.save_snapshot(snap, promote=completed)
+        if completed:
+            _update_collection_failures(store, snap)
         # The journal is a collection-only pointer, never an analysis pointer.
         if planned is not None:
-            done=set(completed_codes)
-            todo=[c for c in planned if c not in done]
+            if completed:
+                todo = list(snap.get('pending_codes') or [])
+            else:
+                done = set(completed_codes)
+                todo = [c for c in planned if c not in done]
             if todo:
-                atomic_json(resume_path,{'schema':'jq-collection-resume-v1','snapshot_id':snap['snapshot_id'],
-                    'latest_snapshot_id':snap['snapshot_id'] if completed else previous.get('snapshot_id'),
-                    'request':request,'remaining_codes':todo,'saved_at':now_jst().isoformat()})
-            else:resume_path.unlink(missing_ok=True)
+                atomic_json(resume_path, {
+                    'schema': 'jq-collection-resume-v1',
+                    'snapshot_id': snap['snapshot_id'],
+                    'latest_snapshot_id': snap['snapshot_id'] if completed else previous.get('snapshot_id'),
+                    'request': request,
+                    'remaining_codes': todo,
+                    'retry_counts': retry_counts,
+                    'saved_at': now_jst().isoformat(),
+                })
+            else:
+                resume_path.unlink(missing_ok=True)
         if not completed:
             LOG.warning('[保存] 未完了スナップショット %s / 今回完了=%s銘柄。分析用の最新状態には反映していません',
-                        snap['snapshot_id'],len(completed_codes))
+                        snap['snapshot_id'], len(completed_codes))
 
 
 def merge_daily_rows(old: list[dict], new: list[dict], kind: str) -> list[dict]:
@@ -2574,7 +2912,7 @@ def analyze_store(store: Store, cfg: Config, output: Path, top: int=10,
                   snapshot_id: Optional[str]=None, asof: Optional[dt.date]=None,
                   cutoff: Optional[dt.datetime]=None) -> Path:
     snap=store.snapshot(snapshot_id)
-    if not snap:raise DataError('凍結スナップショットがありません。先に collect を実行してください')
+    if not snap:raise DataError('凍結スナップショットがありません。先にメニュー1または --phase collect_all を実行してください')
     LOG.info('[分析開始] スナップショット=%s / 収集済み=%s銘柄（API通信なし）',snap.get('snapshot_id'),sum(i.get('complete') is True for i in snap.get('symbols',{}).values()))
     records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff)
     with ProcessLock(output,'analysis'):
@@ -2716,183 +3054,294 @@ def update_sector_statistics(store: Store, cfg: Config, output: Path,
 
 
 def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
-    default_budget=cfg.JQ_DEFAULT_BUDGET if args.budget is None else args.budget
-    print(f'キャッシュ: {args.cache_dir.resolve()}',flush=True)
-    print(f'出力先: {args.output_dir.resolve()}',flush=True)
-    print('Ctrl+C / Ctrl+Z で終了。入力途中の q はメニューに戻ります。',flush=True)
+    print(f'キャッシュ: {args.cache_dir.resolve()}', flush=True)
+    print(f'出力先: {args.output_dir.resolve()}', flush=True)
+    print('全銘柄収集は件数入力なしで、完了または上限付き再試行終了まで自動継続します。', flush=True)
+    print('Ctrl+C / Ctrl+Z で安全に中断できます。次回はメニュー1で続きから再開します。', flush=True)
     while True:
-        print('\n=== メニュー ===',flush=True)
-        print('1) 収集（価格+財務を凍結保存）')
+        print('', flush=True)
+        print_collection_status(Store(args.cache_dir), compact=True)
+        print('\n=== メニュー ===', flush=True)
+        print('1) 全銘柄を収集・続きから再開（推奨）')
         print('2) オフライン一括分析（core/satellite/excluded 出力）')
-        print('3) 単銘柄分析（キャッシュ使用）')
-        print('4) セクター平均を更新（キャッシュから計算）')
-        print('5) 全銘柄ゆっくり収集（自動待機・再開可）')
-        print('6) 鮮度で取り直し収集（例: 7日より古いものだけ）')
-        print('7) 全銘柄“強制”再収集（pending初期化＋当日再取得）')
+        print('3) 単銘柄の採点済み結果を表示')
+        print('4) 日付単位で差分更新（収集済み銘柄）')
+        print('5) 収集状況・ロック状態を詳しく表示')
+        print('6) 鮮度を指定して全銘柄を再収集')
+        print('7) 全銘柄を強制再収集（確認あり）')
         print('8) キャッシュ・生フィールド監査（通信なし）')
-        print('9) 日付単位で差分更新（収集済み銘柄）')
-        print('q) 終了',flush=True)
-        choice=_interactive_input('選択: ').lower()
-        if choice=='q':
-            print('[終了] 終了しました',flush=True);return 0
-        mapping={'1':'collect','2':'analyze','3':'single','4':'sector-update',
-                 '5':'collect_all','6':'collect_all','7':'collect_all','8':'cache-audit','9':'update'}
+        print('9) セクター統計を再計算（通信なし）')
+        print('q) 終了', flush=True)
+        choice = _interactive_input('選択: ').lower()
+        if choice == 'q':
+            print('[終了] 終了しました', flush=True)
+            return 0
+        if choice == '5':
+            print_collection_status(Store(args.cache_dir), compact=False)
+            continue
+        mapping = {
+            '1': 'collect_all', '2': 'analyze', '3': 'single', '4': 'update',
+            '6': 'collect_all', '7': 'collect_all', '8': 'cache-audit', '9': 'sector-update',
+        }
         if choice not in mapping:
-            print('無効な選択です。1〜9 または q を入力してください。',flush=True);continue
-        nxt=copy.copy(args);nxt.phase=mapping[choice];nxt._menu_child=True
+            print('無効な選択です。1〜9 または q を入力してください。', flush=True)
+            continue
+        nxt = copy.copy(args)
+        nxt.phase = mapping[choice]
+        nxt._menu_child = True
         try:
-            if choice in {'1','5','6','7'}:
-                # Each menu operation has the legacy meaning, not flags left over
-                # from a different operation selected in this same process.
-                nxt.force_refresh=False;nxt.force_full=False;nxt.force=False
-                nxt.reset_pending=False;nxt.refresh_days=None
-                nxt.code=None;nxt.codes=None
-                if choice=='6':
-                    nxt.refresh_days=_input_integer('何日より古ければ取り直すか（日数。例: 7）: ',7,0)
-                    nxt.reset_pending=True
-                if choice=='7':nxt.force_full=True;nxt.reset_pending=True
-                prompt=(f'本日収集する銘柄数（推奨既定{default_budget}、Enter で既定）: ' if choice=='1'
-                        else f'1バッチあたりの最大収集銘柄数（既定{default_budget}、Enter で既定）: ')
-                nxt.budget=_input_integer(prompt,default_budget)
-                if choice in {'5','6','7'}:
-                    print('V2では銘柄数は1バッチの上限です。JQ_RPD未設定なら同じ日も続行します。',flush=True)
-            elif choice=='3':
-                nxt.code=_interactive_input('銘柄コード（4文字・英字可）: ')
-                if nxt.code.lower()=='q':raise MenuCancelled()
+            if choice in {'1', '6', '7'}:
+                # Normal UI always runs to completion; --checkpoint-size remains an advanced CLI option.
+                nxt.force_refresh = False
+                nxt.force_full = False
+                nxt.force = False
+                nxt.reset_pending = False
+                nxt.refresh_days = None
+                nxt.code = None
+                nxt.codes = None
+                nxt.once = False
+                nxt.max_batches = None
+                if choice == '6':
+                    nxt.refresh_days = _input_integer(
+                        '何日以上古い銘柄を再取得しますか（例: 7、qで戻る）: ', 7, 0
+                    )
+                    nxt.reset_pending = True
+                elif choice == '7':
+                    confirm = _interactive_input(
+                        '全普通株を再取得します。既存履歴は残ります。続行するには FORCE と入力: '
+                    )
+                    if confirm.upper() != 'FORCE':
+                        print('強制再収集を取り消しました。', flush=True)
+                        continue
+                    nxt.force_full = True
+                    nxt.reset_pending = True
+                print('[開始] 分間レート制御を守りながら、対象がなくなるまで自動継続します。', flush=True)
+            elif choice == '3':
+                nxt.code = _interactive_input('銘柄コード（4文字・英字可、qで戻る）: ')
+                if nxt.code.lower() == 'q':
+                    raise MenuCancelled()
                 canonical_code(nxt.code)
-                if not nxt.run_id and not (nxt.output_dir/'latest_run.json').exists():
-                    print('採点済み結果がありません。先にメニュー2で一括分析してください。',flush=True);continue
-            if choice in {'2','4','8'} and not Store(nxt.cache_dir).snapshot(nxt.snapshot_id):
-                print('キャッシュ不足。先にメニュー1または5で収集を実行してください。',flush=True);continue
-            if choice=='9' and not Store(nxt.cache_dir).snapshot():
-                print('差分更新の元データがありません。先にメニュー1または5で収集してください。',flush=True);continue
-            result=dispatch(nxt,cfg)
-            if result==130:raise KeyboardInterrupt()
-            if result==1:print('[確認] 処理中に問題がありました。直前のログを確認してください。',flush=True)
+                if not nxt.run_id and not (nxt.output_dir / 'latest_run.json').exists():
+                    print('採点済み結果がありません。先にメニュー2で一括分析してください。', flush=True)
+                    continue
+            if choice in {'2', '8', '9'} and not Store(nxt.cache_dir).snapshot(nxt.snapshot_id):
+                print('キャッシュ不足。先にメニュー1で収集してください。', flush=True)
+                continue
+            if choice == '4' and not Store(nxt.cache_dir).snapshot():
+                print('差分更新の元データがありません。先にメニュー1で収集してください。', flush=True)
+                continue
+            result = dispatch(nxt, cfg)
+            if result == 130:
+                raise KeyboardInterrupt()
+            if result == 1:
+                print('[確認] 処理中に問題がありました。直前のログを確認してください。', flush=True)
         except MenuCancelled:
-            print('メニューに戻りました。',flush=True)
-        except (CollectionError,DataError,OSError,ValueError,KeyError) as e:
-            LOG.error('%s',e)
+            print('メニューに戻りました。', flush=True)
+        except (CollectionError, DataError, OSError, ValueError, KeyError) as exc:
+            LOG.error('%s', exc)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p=argparse.ArgumentParser(description='J-Quants V2 Standard スクリーナー（旧版互換メニュー・発注なし）')
-    p.add_argument('--phase',choices=['collect','collect_all','update','analyze','single','interactive','fields-audit','cache-audit','sector-update'],default='interactive',help='引数なしで日本語の対話メニュー')
+    p = argparse.ArgumentParser(description='J-Quants V2 Standard スクリーナー（全銘柄自動収集・発注なし）')
+    p.add_argument('--phase', choices=[
+        'collect', 'collect_all', 'update', 'analyze', 'single', 'interactive',
+        'fields-audit', 'cache-audit', 'sector-update', 'status'
+    ], default='interactive', help='引数なしで日本語の対話メニュー')
     default_config = Path(__file__).resolve().parent / 'config.json'
-    p.add_argument('--config',type=Path,default=(default_config if default_config.is_file() else None),
-                   help='JSON設定。未指定時はスクリプトと同じ場所の config.json を自動読込（なければ既定値＋環境変数）')
-    p.add_argument('--cache-dir',type=Path,default=Path('.jquants_cache_v2_standard'),help='Standard版の凍結キャッシュ')
-    p.add_argument('--output-dir',type=Path,default=Path('output_standard'),help='分析結果の保存先')
-    p.add_argument('--api-ini',type=Path,default=Path(__file__).resolve().parent/'api.ini',help='V2 APIキーのiniファイル')
-    p.add_argument('--budget',type=int,help='1バッチあたりの最大収集銘柄数（未指定は設定値）')
-    p.add_argument('--top',type=int,default=10,help='上位出力件数（既定10）')
-    p.add_argument('--code',help='銘柄コード（英字可）');p.add_argument('--codes',help='収集する普通株コードをカンマ区切りで指定')
-    p.add_argument('--snapshot-id');p.add_argument('--run-id',help='single: 採点済みrun_idを指定')
-    p.add_argument('--asof',help='共通株価基準日 YYYY-MM-DD（対応する凍結マスタが必要）')
-    p.add_argument('--information-cutoff',help='情報締切日時 JST、例: 2026-09-11T08:00:00+09:00')
-    p.add_argument('--update-from',help='日付更新の開始日（最古の未確認期間を飛ばさないこと）')
-    p.add_argument('--force-refresh',action='store_true',help='収集対象を再取得')
-    p.add_argument('--force-full',action='store_true',help='全普通株を強制再収集')
-    p.add_argument('--force',action='store_true',help='--force-full と同じ')
-    p.add_argument('--reset-pending',action='store_true',help='再開リストだけを初期化。既存の生データ・履歴は残す')
-    p.add_argument('--refresh-days',type=int,help='この日数以上古い価格確認日の銘柄を再取得')
-    p.add_argument('--max-batches',type=int,help='collect_allの最大完了バッチ数')
-    p.add_argument('--once',action='store_true',help='1バッチだけで停止（--max-batches 1）')
-    p.add_argument('--version',action='version',version=CODE_VERSION+' / '+LOGIC_VERSION)
+    p.add_argument('--config', type=Path, default=(default_config if default_config.is_file() else None),
+                   help='JSON設定。未指定時はスクリプトと同じ場所の config.json を自動読込')
+    p.add_argument('--cache-dir', type=Path, default=Path('.jquants_cache_v2_standard'),
+                   help='Standard版の凍結キャッシュ')
+    p.add_argument('--output-dir', type=Path, default=Path('output_standard'),
+                   help='分析結果の保存先')
+    p.add_argument('--api-ini', type=Path, default=Path(__file__).resolve().parent/'api.ini',
+                   help='V2 APIキーのiniファイル')
+    p.add_argument('--checkpoint-size', '--budget', dest='budget', type=int,
+                   help='内部保存チェックポイント件数。API上限・日次上限ではない（通常は指定不要）')
+    p.add_argument('--max-retries', type=int, default=3,
+                   help='銘柄単位の必須データ取得失敗を再試行する上限（既定3）')
+    p.add_argument('--retry-delay', type=int, default=60,
+                   help='失敗銘柄だけの再試行へ入る前の待機秒数（既定60）')
+    p.add_argument('--top', type=int, default=10, help='上位出力件数（既定10）')
+    p.add_argument('--code', help='銘柄コード（英字可）')
+    p.add_argument('--codes', help='収集する普通株コードをカンマ区切りで指定')
+    p.add_argument('--snapshot-id')
+    p.add_argument('--run-id', help='single: 採点済みrun_idを指定')
+    p.add_argument('--asof', help='共通株価基準日 YYYY-MM-DD。collect_allは初回確定日を自動固定')
+    p.add_argument('--information-cutoff', help='情報締切日時 JST、例: 2026-09-11T08:00:00+09:00')
+    p.add_argument('--update-from', help='日付更新の開始日（最古の未確認期間を飛ばさないこと）')
+    p.add_argument('--force-refresh', action='store_true', help='収集対象を再取得')
+    p.add_argument('--force-full', action='store_true', help='全普通株を強制再収集')
+    p.add_argument('--force', action='store_true', help='--force-full と同じ')
+    p.add_argument('--reset-pending', action='store_true',
+                   help='再開リストだけを初期化。既存の生データ・履歴は残す')
+    p.add_argument('--refresh-days', type=int, help='この日数以上古い価格確認日の銘柄を再取得')
+    p.add_argument('--max-batches', type=int,
+                   help='高度な運用向け。collect_allの最大内部チェックポイント数')
+    p.add_argument('--once', action='store_true', help='内部チェックポイント1回だけで停止')
+    p.add_argument('--version', action='version', version=CODE_VERSION+' / '+LOGIC_VERSION)
     return p
 
 
 
 def dispatch(args: argparse.Namespace, cfg: Config) -> int:
-    store=Store(args.cache_dir);phase=args.phase
-    budget=cfg.JQ_DEFAULT_BUDGET if args.budget is None else args.budget
-    if budget<1 or args.top<1 or (args.max_batches is not None and args.max_batches<1):raise DataError('budget/top/max-batches must be positive')
-    if args.refresh_days is not None and args.refresh_days<0:raise DataError('refresh-days must be nonnegative')
-    asof=date(args.asof) if args.asof else None
-    cutoff=timestamp(args.information_cutoff) if args.information_cutoff else None
-    if args.asof and asof is None:raise DataError('invalid --asof')
-    if args.information_cutoff and cutoff is None:raise DataError('invalid --information-cutoff')
-    if not getattr(args,'_menu_child',False):
-        LOG.info('plan=standard logic=%s code=%s cache=%s config_hash=%s',LOGIC_VERSION,CODE_VERSION,CACHE_SCHEMA,digest(asdict(cfg))[:12])
-    if phase=='interactive':return run_interactive(args,cfg)
-    if phase=='analyze':
-        path=analyze_store(store,cfg,args.output_dir,args.top,args.snapshot_id,asof,cutoff)
-        print('[出力] '+str(path),flush=True)
-        meta=json.loads((path/'run_manifest.json').read_text('utf-8'))
-        summary=json.loads((path/'filter_summary.json').read_text('utf-8'))
-        gates=summary.get('gate_counts',{})
-        core_count=int((gates.get('core_candidate') or {}).get('true',0) or 0)
-        print('[集計] 収集済み={}/{} / core={} / eligible={}'.format(
-            meta.get('complete_symbol_count',0),meta.get('ordinary_master_count',0),
-            core_count,summary.get('eligible_count',0)),flush=True)
-        reasons=summary.get('reason_counts') or {}
-        if reasons:
-            top_reasons=sorted(reasons.items(),key=lambda kv:(-int(kv[1]),str(kv[0])))[:8]
-            print('[主要ゲート] '+', '.join(f'{k}={v}' for k,v in top_reasons),flush=True)
-        if meta['run_status']=='diagnostic_only':
-            LOG.warning('[診断のみ] 入力条件が不足しています。run_manifest.jsonのglobal_issuesを確認してください')
-        elif meta['run_status']=='partial_universe':
-            LOG.info('[部分母集団] 未収集または個別入力不足を含みます。メニュー5で収集を継続できます')
-        return 2 if meta['run_status']=='diagnostic_only' else 0
-    if phase=='single':
-        if not args.code:raise DataError('--code is required')
-        r=single_from_run(args.code,args.output_dir,args.run_id)
-        print(json.dumps({k:r.get(k) for k in ('run_id','code','name','candidate_lane','eligible_new_entry','fundamental_edge_score','recommendation_score','gate_reasons')},ensure_ascii=False,indent=2),flush=True)
+    store = Store(args.cache_dir)
+    phase = args.phase
+    checkpoint_size = cfg.JQ_DEFAULT_BUDGET if args.budget is None else args.budget
+    if (checkpoint_size < 1 or args.top < 1 or args.max_retries < 1 or args.retry_delay < 0
+            or (args.max_batches is not None and args.max_batches < 1)):
+        raise DataError('checkpoint/top/retry/max-batches values are invalid')
+    if args.refresh_days is not None and args.refresh_days < 0:
+        raise DataError('refresh-days must be nonnegative')
+    asof = date(args.asof) if args.asof else None
+    cutoff = timestamp(args.information_cutoff) if args.information_cutoff else None
+    if args.asof and asof is None:
+        raise DataError('invalid --asof')
+    if args.information_cutoff and cutoff is None:
+        raise DataError('invalid --information-cutoff')
+    if not getattr(args, '_menu_child', False):
+        LOG.info('plan=standard logic=%s code=%s cache=%s config_hash=%s',
+                 LOGIC_VERSION, CODE_VERSION, CACHE_SCHEMA, digest(asdict(cfg))[:12])
+    if phase == 'interactive':
+        return run_interactive(args, cfg)
+    if phase == 'status':
+        print_collection_status(store, compact=False)
         return 0
-    if phase=='cache-audit':
-        print('[監査出力] '+str(audit_snapshot(store,args.output_dir,args.snapshot_id)),flush=True);return 0
-    if phase=='sector-update':
-        print('[セクター出力] '+str(update_sector_statistics(store,cfg,args.output_dir,args.snapshot_id,asof,cutoff)),flush=True);return 0
+    if phase == 'analyze':
+        path = analyze_store(store, cfg, args.output_dir, args.top, args.snapshot_id, asof, cutoff)
+        print('[出力] ' + str(path), flush=True)
+        meta = json.loads((path/'run_manifest.json').read_text('utf-8'))
+        summary = json.loads((path/'filter_summary.json').read_text('utf-8'))
+        gates = summary.get('gate_counts', {})
+        core_count = int((gates.get('core_candidate') or {}).get('true', 0) or 0)
+        print('[集計] 収集済み={}/{} / core={} / eligible={}'.format(
+            meta.get('complete_symbol_count', 0), meta.get('ordinary_master_count', 0),
+            core_count, summary.get('eligible_count', 0)), flush=True)
+        reasons = summary.get('reason_counts') or {}
+        if reasons:
+            top_reasons = sorted(reasons.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:8]
+            print('[主要ゲート] ' + ', '.join(f'{k}={v}' for k, v in top_reasons), flush=True)
+        if meta['run_status'] == 'diagnostic_only':
+            LOG.warning('[診断のみ] 入力条件が不足しています。run_manifest.jsonのglobal_issuesを確認してください')
+        elif meta['run_status'] == 'partial_universe':
+            LOG.info('[部分母集団] 未収集または個別入力不足を含みます。メニュー1で収集を継続できます')
+        return 2 if meta['run_status'] == 'diagnostic_only' else 0
+    if phase == 'single':
+        if not args.code:
+            raise DataError('--code is required')
+        result = single_from_run(args.code, args.output_dir, args.run_id)
+        print(json.dumps({k: result.get(k) for k in (
+            'run_id', 'code', 'name', 'candidate_lane', 'eligible_new_entry',
+            'fundamental_edge_score', 'recommendation_score', 'gate_reasons'
+        )}, ensure_ascii=False, indent=2), flush=True)
+        return 0
+    if phase == 'cache-audit':
+        print('[監査出力] ' + str(audit_snapshot(store, args.output_dir, args.snapshot_id)), flush=True)
+        return 0
+    if phase == 'sector-update':
+        print('[セクター出力] ' + str(update_sector_statistics(
+            store, cfg, args.output_dir, args.snapshot_id, asof, cutoff
+        )), flush=True)
+        return 0
+
     # Credential lookup is reachable ONLY in explicit collection phases.
     LOG.info('[収集] APIキー・保存先を確認しています。Ctrl+Cで中断できます')
-    key=api_key_from_env_or_ini(args.api_ini)
+    key = api_key_from_env_or_ini(args.api_ini)
     store.ensure()
-    with ProcessLock(store.root,'collector'):
-        client=Client(key,cfg,store)
+    with ProcessLock(store.root, 'collector'):
+        client = Client(key, cfg, store)
         try:
-            if phase=='update':
-                uf=date(args.update_from) if args.update_from else None
-                if args.update_from and uf is None:raise DataError('invalid --update-from')
+            if phase == 'update':
+                update_from = date(args.update_from) if args.update_from else None
+                if args.update_from and update_from is None:
+                    raise DataError('invalid --update-from')
                 LOG.info('[日付更新] 保存済み銘柄を日付単位で更新します')
-                snap=update_daily(client,uf);print('snapshot_id='+snap['snapshot_id'],flush=True);return 0
-            codes=args.codes.split(',') if args.codes else [args.code] if args.code else None
-            force=args.force_refresh or args.force_full or args.force
-            if phase=='collect_all':
-                first=True;batches=0;remaining=None;reset=args.reset_pending;refresh_days=args.refresh_days
-                limit=1 if args.once else args.max_batches
+                snap = update_daily(client, update_from)
+                print('snapshot_id=' + snap['snapshot_id'], flush=True)
+                print_collection_status(store, compact=False)
+                return 0
+
+            codes = args.codes.split(',') if args.codes else [args.code] if args.code else None
+            force = args.force_refresh or args.force_full or args.force
+            if phase == 'collect_all':
+                first = True
+                batches = 0
+                remaining: Optional[list[str]] = None
+                reset = args.reset_pending
+                refresh_days = args.refresh_days
+                limit = 1 if args.once else args.max_batches
+                job_started = time.monotonic()
+                snap: dict = {}
                 while first or remaining:
                     try:
-                        snap=collect(client,budget,force,remaining if remaining is not None else codes,refresh_days,asof,reset_pending=reset)
-                    except CollectionError as e:
-                        reset=False
-                        if cfg.JQ_RPD is not None and 'daily_self_quota_reached' in str(e):
-                            wait_until_next_day();continue
+                        # Keep only_codes stable. The resume journal supplies its own remaining queue.
+                        snap = collect(
+                            client, checkpoint_size, force, codes, refresh_days, asof,
+                            reset_pending=reset, max_retries=args.max_retries,
+                        )
+                    except CollectionError as exc:
+                        reset = False
+                        if cfg.JQ_RPD is not None and 'daily_self_quota_reached' in str(exc):
+                            wait_until_next_day()
+                            continue
                         raise
-                    reset=False;batches+=1;first=False
-                    remaining=snap.get('pending_codes',[])
-                    # A normal menu 1/5 may resume a previously forced job.
-                    request=snap.get('collection_request',{})
-                    force=bool(request.get('force',force))
-                    refresh_days=request.get('refresh_days',refresh_days)
-                    asof=date(request.get('asof')) if request.get('asof') else asof
-                    LOG.info('[バッチ %s 完了] tried=%s 成功=%s 未完了=%s 次バッチ対象=%s snapshot=%s',
-                        batches,snap.get('attempted_count',0),snap.get('batch_success_count',0),
-                        snap.get('batch_incomplete_count',0),len(remaining),snap['snapshot_id'])
+                    reset = False
+                    batches += 1
+                    first = False
+                    remaining = list(snap.get('pending_codes') or [])
+                    request = snap.get('collection_request') or {}
+                    force = bool(request.get('force', force))
+                    refresh_days = request.get('refresh_days', refresh_days)
+                    asof = date(request.get('asof')) or date(snap.get('price_asof_date')) or asof
+                    total, complete = _snapshot_stock_counts(store, snap)
+                    pct = 100.0*complete/total if total else 0.0
+                    LOG.info(
+                        '[チェックポイント %s] tried=%s 成功=%s 未完了=%s / 全体=%s/%s (%.1f%%) '
+                        '/ 次=%s / 要確認失敗=%s / 経過=%.0f秒 / snapshot=%s',
+                        batches, snap.get('attempted_count', 0), snap.get('batch_success_count', 0),
+                        snap.get('batch_incomplete_count', 0), complete, total, pct, len(remaining),
+                        len(snap.get('terminal_failed_codes') or []), time.monotonic()-job_started,
+                        snap.get('snapshot_id'),
+                    )
                     if snap.get('errors'):
-                        LOG.warning('[停止] データ未取得があります。無限再試行を避けて停止します。再開リストは保存済みです');return 1
-                    if limit is not None and batches>=limit:
-                        LOG.info('[停止] 指定バッチ数に到達しました。続きはメニュー5で再開できます');break
-                    if not remaining:break
-                    LOG.info('[継続] 次の収集バッチへ進みます（Ctrl+Cで中断）')
-                LOG.info('[収集終了] 未完了の新規収集銘柄数=%s',snap.get('pending_count',0))
+                        LOG.warning('[継続] 今回のデータ未取得=%s件。未取得銘柄は後尾へ回し、最大%s回まで再試行します',
+                                    len(snap['errors']), args.max_retries)
+                    if limit is not None and batches >= limit:
+                        LOG.info('[停止] 指定チェックポイント数に到達しました。次回も同じコマンドで再開できます')
+                        break
+                    if not remaining:
+                        break
+                    if snap.get('unattempted_count', 0) == 0 and snap.get('retryable_failed_codes'):
+                        LOG.info('[再試行待機] 失敗銘柄のみ残っています。%s秒待機後に再試行します', args.retry_delay)
+                        end_wait = time.monotonic() + args.retry_delay
+                        while time.monotonic() < end_wait:
+                            time.sleep(min(1.0, max(0.0, end_wait-time.monotonic())))
+                    else:
+                        LOG.info('[継続] 次の内部チェックポイントへ進みます（Ctrl+Cで中断可）')
+
+                terminal = list(snap.get('terminal_failed_codes') or [])
+                if terminal:
+                    LOG.warning('[収集完了・要確認] %s銘柄は最大再試行回数に到達しました。%sを確認してください',
+                                len(terminal), _collection_failure_path(store))
+                else:
+                    LOG.info('[全銘柄収集完了] 対象キューは空になりました')
+                print_collection_status(store, compact=False)
                 return 0
-            snap=collect(client,budget,force,codes,args.refresh_days,asof,reset_pending=args.reset_pending)
-            LOG.info('[収集終了] tried=%s 成功=%s 未完了=%s snapshot=%s status=%s',snap.get('attempted_count',0),
-                     snap.get('batch_success_count',0),snap.get('batch_incomplete_count',0),snap['snapshot_id'],snap['status'])
-            if phase=='fields-audit':print('[監査出力] '+str(audit_snapshot(store,args.output_dir,snap['snapshot_id'])),flush=True)
+
+            snap = collect(
+                client, checkpoint_size, force, codes, args.refresh_days, asof,
+                reset_pending=args.reset_pending, max_retries=args.max_retries,
+            )
+            LOG.info('[収集終了] tried=%s 成功=%s 未完了=%s snapshot=%s status=%s',
+                     snap.get('attempted_count', 0), snap.get('batch_success_count', 0),
+                     snap.get('batch_incomplete_count', 0), snap['snapshot_id'], snap['status'])
+            if phase == 'fields-audit':
+                print('[監査出力] ' + str(audit_snapshot(store, args.output_dir, snap['snapshot_id'])), flush=True)
+            print_collection_status(store, compact=False)
             return 1 if snap.get('errors') else 0
-        finally:client.close()
+        finally:
+            client.close()
 
 
 
