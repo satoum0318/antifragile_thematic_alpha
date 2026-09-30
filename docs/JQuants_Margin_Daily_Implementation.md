@@ -24,6 +24,32 @@
 
 Python 3.10以上、`numpy pandas requests` を使用します。通常snapshotがある既存キャッシュを指定してください。信用残更新は価格や財務データを用意する機能ではありません。
 
+### 新Botの起動とランキング最大10件の出力
+
+PowerShellでリポジトリ直下から起動します。実際のファイル名は `JQuamtsScreeningBot.py` です。
+
+```powershell
+Set-Location C:\project\antifragile_thematic_alpha
+python -B .\JQuamtsScreeningBot.py --version
+python -B .\JQuamtsScreeningBot.py --top 10
+```
+
+版表示は `1.1.0-rc1-margin-daily / JQ-STD-CORRECTED-1.0-rc1` です。起動後は次のメニューを使います。
+
+- **4：日付単位で差分更新** — 保存済み銘柄の価格・財務等を更新。価格基準日が古い場合は、まず更新が成功したことを確認します。
+- **2：オフライン一括分析** — 保存済みデータで採点し、条件を満たす候補を最大10件出力。
+- **10：信用残だけを更新、11：信用残の診断** — 日次信用残を別途確認。価格基準日やランキングを更新する操作ではありません。
+
+初回で通常の収集履歴がない場合は、先にメニュー1で収集します。未取得や打切り失敗が残る場合、その状態は解消済みと扱いません。
+
+ランキングは `output_standard/reports/latest/top_recommended_core.csv`、説明は同じ場所の `report_core_top10.md` です。`eligible_new_entry=true` の候補だけを対象とし、10件に満たない場合は該当件数だけを出します。確認用の `run_manifest.json` に価格基準日・情報締切・実行状態、`filter_summary.json` に適格件数・除外理由があります。
+
+直接コマンドで実行する場合は、`--phase update` で日付更新後、`--phase analyze --top 10` で分析します。更新はAPI通信を行い、分析は通信しません。`runner.py` の既定は20件なので、ランナーでも10件を希望する場合は `python runner.py --phase analyze --top 10` と明示します。
+
+今回の第1段階で日次信用残は採点へ接続していません。82件のテストは処理と既存採点の不変性を検証したもので、投資収益や順位の予測精度を検証したものではありません。現在の候補として読む際は、価格基準日・母集団の収集状況を確認してください。
+
+### 信用残だけの更新・診断
+
 ```powershell
 # コード版を確認
 python -B .\JQuamtsScreeningBot.py --version
