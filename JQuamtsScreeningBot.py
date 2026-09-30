@@ -47,7 +47,7 @@ from jq_margin import adapt_margin_bundle, margin_diagnostic as _margin_diagnost
 import jq_margin_workflow
 
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
-CODE_VERSION = '1.1.0-rc1-margin-daily'
+CODE_VERSION = '1.1.0-rc2-margin-daily'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'

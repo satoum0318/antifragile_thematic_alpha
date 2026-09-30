@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 
 from jq_margin import adapt_margin_bundle, margin_diagnostic
@@ -18,6 +20,56 @@ from jq_margin import adapt_margin_bundle, margin_diagnostic
 
 MARGIN_SNAPSHOT_SCHEMA = "jq-margin-snapshot-v1"
 MARGIN_RESUME_SCHEMA = "jq-margin-resume-v1"
+
+
+class MarginProgress:
+    """Terminal liveness only; never touches requests, cache, or retry state."""
+
+    def __init__(self, logger, interval=30.0, clock=time.monotonic):
+        if interval <= 0:
+            raise ValueError("heartbeat interval must be positive")
+        self.logger, self.interval, self.clock = logger, interval, clock
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._started = None
+        self._state = dict(total=None, completed=0, pending=None, attempted=0,
+                           failed=0, code=None, phase="元データ・再開状態の確認")
+
+    def update(self, **fields):
+        with self._lock:
+            self._state.update(fields)
+
+    def report(self, label="進捗"):
+        with self._lock:
+            state = self._state.copy()
+        elapsed = max(0.0, self.clock() - self._started) if self._started is not None else 0.0
+        total = state["total"] if state["total"] is not None else "確認中"
+        pending = state["pending"] if state["pending"] is not None else "確認中"
+        self.logger.info(
+            '[信用残%s] 取得完了=%s/%s / 未処理=%s / 今回試行=%s 失敗=%s '
+            '/ 処理中=%s / %s / 今回経過=%.0f秒',
+            label, state["completed"], total, pending, state["attempted"], state["failed"],
+            state["code"] or "-", state["phase"], elapsed)
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval):
+            self.report("ハートビート")
+
+    def __enter__(self):
+        self._started = self.clock()
+        self.report("開始")
+        self._thread = threading.Thread(target=self._heartbeat, name="jquants-margin-progress", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        phase = "チェックポイント保存済み" if exc_type is None else "中断・エラーで終了（直前のログを確認）"
+        self.update(phase=phase, code=None)
+        self.report("終了")
 
 
 def _identifier(bot, value):
@@ -104,6 +156,13 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
     selected ordinary shares, irrespective of their screening complete flag.
     Interrupted and failed attempts remain visible in the diagnostic snapshot.
     """
+    with MarginProgress(bot.LOG) as progress:
+        return _margin_refresh_checkpoint(bot, client, source_snapshot_id, budget,
+                                          only_codes, max_retries, reset_pending, progress)
+
+
+def _margin_refresh_checkpoint(bot, client, source_snapshot_id, budget,
+                               only_codes, max_retries, reset_pending, progress):
     if budget < 1 or max_retries < 1:
         raise bot.DataError("margin_budget_and_retries_must_be_positive")
     store = client.store
@@ -133,6 +192,8 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
     if price_date > bot.now_jst().date():
         raise bot.DataError("margin_source_price_after_collection_date")
 
+    progress.update(phase="対象銘柄・過去観測の確認")
+
     if journal:
         previous = load_margin_snapshot(bot, store, journal["snapshot_id"])
         if previous.get("source_snapshot_id") != source_id:
@@ -151,6 +212,7 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
         selected = sorted(selected)
         if not selected:
             raise bot.DataError("margin_source_has_no_ordinary_shares")
+        progress.update(total=len(selected), pending=len(selected))
         targets = {m["code"]: copy.deepcopy(m) for m in master if m["code"] in selected}
         previous = load_margin_snapshot(bot, store)
         today = bot.now_jst().date()
@@ -185,6 +247,14 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
                     batch_incomplete_count=0, attempted_codes=[])
     queue = list(pending)
     terminal = list(snapshot.get("terminal_failed_codes", []))
+    progress_completed = sum(i.get("last_attempt_status") == "complete" for i in snapshot["symbols"].values())
+    progress.update(total=len(selected), completed=progress_completed, pending=len(queue),
+                    phase="診断用カレンダーの確認")
+    bot.LOG.info('[信用残取得範囲] %s ～ %s / 対象=%s銘柄 / 今回上限=%s銘柄 '
+                 '/ 元価格基準日=%s / source=%s',
+                 snapshot["window_from"], snapshot["window_to"], len(selected),
+                 min(budget, len(pending)), price_date, source_id)
+    progress.report()
     interrupted = False
     try:
         cal_ref = snapshot.get("calendar_ref")
@@ -193,6 +263,8 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
         end = max(bot.date(snapshot["window_to"]), bot.now_jst().date())
         if not _calendar_covers(bot, cal, start, end):
             try:
+                progress.update(phase="診断用カレンダー取得（API応答・レート待機を含む）")
+                progress.report()
                 cal = client.fetch("markets/calendar", {"from": str(start), "to": str(end)})
                 snapshot["calendar_ref"] = store.put(cal)
                 snapshot["calendar_status"] = "complete" if _calendar_covers(bot, cal, start, end) else "calendar_incomplete"
@@ -214,6 +286,8 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
             old = _read_optional_bundle(bot, store, old_ref) if old_ref else None
             item["previous_observation_ref"] = _nonempty_success_ref(bot, store, item)
             snapshot["attempted_codes"].append(code)
+            progress.update(code=api_code, phase="信用残取得（API応答・レート待機を含む）",
+                            attempted=len(snapshot["attempted_codes"]))
             abort = None
             try:
                 raw = client.fetch("markets/margin-interest", params)
@@ -252,6 +326,7 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
                 retry_counts.pop(code, None)
                 queue.remove(code)
                 snapshot["batch_success_count"] += 1
+                progress_completed += 1
             else:
                 snapshot["batch_incomplete_count"] += 1
                 snapshot["errors"].append({"code": code, "status": attempt_status,
@@ -262,6 +337,11 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
                     queue.remove(code)
                     if code not in terminal:
                         terminal.append(code)
+            progress.update(completed=progress_completed, pending=len(queue),
+                            failed=snapshot["batch_incomplete_count"], phase="銘柄の取得結果を保存済み")
+            if (len(snapshot["attempted_codes"]) == 1 or len(snapshot["attempted_codes"]) % 20 == 0
+                    or len(snapshot["attempted_codes"]) == min(budget, len(pending)) or abort is not None):
+                progress.report()
             if abort is not None:
                 raise abort
         snapshot["status"] = "partial" if queue or terminal or snapshot.get("calendar_status") != "complete" else "complete"
@@ -271,6 +351,7 @@ def margin_refresh(bot, client, source_snapshot_id=None, budget=800,
         snapshot["status"] = "incomplete"
         raise
     finally:
+        progress.update(phase="チェックポイント・再開情報の保存", code=None)
         observed = bot.now_jst().isoformat()
         snapshot.update(information_cutoff=observed, created_at=observed,
                         pending_codes=queue, pending_count=len(queue), requested_pending_count=len(queue),
@@ -366,7 +447,7 @@ def write_margin_run(bot, records, meta, output):
     stage.mkdir()
     leading = ["code", "name", "price_asof_date", "source_information_cutoff", "information_cutoff",
                "margin_diagnostic_status", "margin_reference_date", "margin_pub_date", "margin_observed_at",
-               "margin_ratio", "margin_ratio_state", "margin_short"]
+               "margin_ratio", "margin_ratio_state", "margin_long", "margin_short"]
     columns = leading + sorted({key for row in rows for key in row}-set(leading))
     lines = ["# 信用取引残高の診断", "",
              f"元snapshot: {manifest['source_snapshot_id']}",
@@ -377,19 +458,30 @@ def write_margin_run(bot, records, meta, output):
              "現在の信用観測を表示します。元順位・推奨点・新規買い可否は再計算していません。",
              "空欄・未取得・対象外・失敗は安全を意味しません。金額はAPI原値・単位未確認です。",
              "開発検証と実データによる運用確認は別です。この出力は運用監査完了を証明しません。", "",
-             "|コード|銘柄|状態|申込日|公表日|取得確認時刻|信用倍率|倍率状態・空欄理由|信用売残株数|価格日より後|5営業日変化・理由|20営業日変化・理由|前回観測日|",
-             "|---|---|---|---|---|---|---:|---|---:|---|---|---|---|"]
+             "信用買残・信用売残を併記します。残高の増減だけで買い・売りを判定しません。", "",
+             "## 信用買残・信用売残", "",
+             "|コード|銘柄|状態|申込日|公表日|取得確認時刻|信用買残株数|信用売残株数|信用倍率|倍率状態・空欄理由|価格日より後|前回観測日|",
+             "|---|---|---|---|---|---|---:|---:|---:|---|---|---|"]
     for row in rows:
         previous = row.get("margin_previous_observation") or {}
         reasons = row.get("margin_metric_reasons") or {}
-        def change_text(days):
-            key = f"margin_short_change_{days}bd_pct"
-            return bot.fmt(row.get(key))+"%" if row.get(key) is not None else reasons.get(key) or "N/A"
         values = [row.get("code"), row.get("name"), row.get("margin_diagnostic_status"),
                   row.get("margin_reference_date"), row.get("margin_pub_date"), row.get("margin_observed_at"),
+                  bot.fmt(row.get("margin_long")), bot.fmt(row.get("margin_short")),
                   bot.fmt(row.get("margin_ratio")), reasons.get("margin_ratio") or row.get("margin_ratio_state"),
-                  bot.fmt(row.get("margin_short")), row.get("margin_after_price_asof"), change_text(5), change_text(20),
-                  previous.get("margin_reference_date")]
+                  row.get("margin_after_price_asof"), previous.get("margin_reference_date")]
+        lines.append("|"+"|".join(bot.md_escape(v) for v in values)+"|")
+    lines += ["", "## 買残・売残の変化", "",
+              "営業日系列・公表時点・企業行動の確認がそろわない場合は、数値の代わりに未計算理由を表示します。", "",
+              "|コード|買残5営業日変化・理由|買残20営業日変化・理由|売残5営業日変化・理由|売残20営業日変化・理由|",
+              "|---|---|---|---|---|"]
+    for row in rows:
+        reasons = row.get("margin_metric_reasons") or {}
+        values = [row.get("code")]
+        for side, days in (("long", 5), ("long", 20), ("short", 5), ("short", 20)):
+            key = f"margin_{side}_change_{days}bd_pct"
+            value = row.get(key)
+            values.append(bot.fmt(value)+"%" if value is not None else reasons.get(key) or "N/A")
         lines.append("|"+"|".join(bot.md_escape(v) for v in values)+"|")
     try:
         bot.atomic_json(stage / "margin_diagnostics.json", rows)
