@@ -43,8 +43,11 @@ import numpy as np
 import pandas as pd
 import requests
 
+from jq_margin import adapt_margin_bundle, margin_diagnostic as _margin_diagnostic
+import jq_margin_workflow
+
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
-CODE_VERSION = '1.0.3-rc1-cli3-all'
+CODE_VERSION = '1.1.0-rc1-margin-daily'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -1139,23 +1142,18 @@ def risk_context(cfg: Config, code: str, cutoff: dt.datetime) -> dict:
             'risk_evidence':risks}
 
 
-def margin_diagnostic(bundle: dict, cutoff: dt.datetime) -> dict:
-    o={'margin_ratio':None,'margin_ratio_state':'unknown','margin_reference_date':None,
-       'margin_observed_at':bundle.get('collected_at'),'margin_status':bundle.get('status','not_collected')}
-    observed=timestamp(bundle.get('collected_at'))
-    # Use first observation as conservative availability when PubDate is absent.
-    usable=[]
-    for r in bundle.get('rows',[]):
-        pub=published_at(r,'PubDate','PubTime') or observed
-        if pub and pub<=cutoff and date(r.get('Date')) and date(r['Date'])<=cutoff.date():usable.append(r)
-    if not usable:return o
-    r=max(usable,key=lambda x:str(x['Date']))
-    lng,srt=number(r.get('LongVol')),number(r.get('ShrtVol'))
-    o.update(margin_reference_date=r['Date'],margin_long=lng,margin_short=srt)
-    if lng is None or srt is None or lng<0 or srt<0:return o
-    o['margin_ratio_state']='finite' if srt>0 else 'zero_short_balance' if lng>0 else 'both_zero'
-    o['margin_ratio']=lng/srt if srt>0 else None
-    return o
+def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code=None,
+                      price_asof_date=None, calendar_rows=None, price_rows=None) -> dict:
+    """Diagnostic only; shared with the independent offline margin analysis."""
+    options = dict(expected_code=expected_code, price_asof_date=price_asof_date,
+                   calendar_rows=calendar_rows, price_rows=price_rows)
+    try:
+        return _margin_diagnostic(bundle, cutoff, **options)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        # Optional diagnostic corruption must not enter screening gate issues.
+        result = _margin_diagnostic({'status': 'schema_unsupported', 'rows': []}, cutoff)
+        result['margin_diagnostic_reasons'] = ['invalid_margin_diagnostic_input:' + type(exc).__name__]
+        return result
 
 
 # ---- Fixed legacy reference component functions (S1; not new-entry gates) ----
@@ -2165,10 +2163,13 @@ class Client:
                     if response.status_code!=200:raise CollectionError(f'HTTP {response.status_code}:{endpoint}')
                     break
                 try:body=response.json()
-                except (ValueError,AttributeError) as e:raise CollectionError('invalid_json:'+endpoint) from e
+                except (ValueError,AttributeError) as e:
+                    pages.append({'invalid_json_response': getattr(response, 'text', None)})
+                    raise CollectionError('invalid_json:'+endpoint) from e
+                pages.append(body)  # Preserve even an unsupported response for schema review.
                 if not isinstance(body,dict) or not isinstance(body.get('data'),list) or any(not isinstance(r,dict) for r in body['data']):
                     raise CollectionError('unexpected_response_schema:'+endpoint)
-                pages.append(body);rows.extend(body['data'])
+                rows.extend(body['data'])
                 key=body.get('pagination_key')
                 if not key:
                     return {'endpoint':endpoint,'params':params,'rows':rows,'raw_pages':pages,
@@ -2176,10 +2177,11 @@ class Client:
                 if not isinstance(key,str) or key in seen:raise CollectionError('pagination_cycle:'+endpoint)
                 seen.add(key)
             raise CollectionError('pagination_limit_reached:'+endpoint)
-        except BaseException:
+        except BaseException as exc:
             # Raw pages already received are retained, but NEVER marked complete.
-            self.store.put({'endpoint':endpoint,'params':params,'rows':rows,'raw_pages':pages,
+            raw_ref = self.store.put({'endpoint':endpoint,'params':params,'rows':rows,'raw_pages':pages,
                             'status':'incomplete','started_at':started,'collected_at':now_jst().isoformat()})
+            exc.raw_cache_ref = raw_ref
             raise
     def close(self):self.session.close()
 
@@ -2407,13 +2409,18 @@ def collect(client: Client, budget: int, force: bool=False, only_codes: Optional
                     ('margin', 'markets/margin-interest', {'code': api, 'from': str(t-dt.timedelta(days=90)), 'to': str(t)}),
                     ('short', 'markets/short-sale-report', {'code': api, 'disc_date_from': str(t-dt.timedelta(days=90)), 'disc_date_to': str(t)}),
                 ]:
-                    if kind == 'margin' and now_jst().date() >= dt.date(2026, 9, 28):
-                        item[kind] = store.put({'status': 'schema_review_required', 'rows': [],
-                            'collected_at': now_jst().isoformat(),
-                            'reason': '2026-09-28 margin schema migration requires adapter audit'})
-                        continue
                     try:
-                        item[kind] = store.put(client.fetch(endpoint, params))
+                        bundle = client.fetch(endpoint, params)
+                        if kind == 'margin':
+                            previous_margin = None
+                            if old_item.get('margin'):
+                                try:
+                                    previous_margin = store.get(old_item['margin'])
+                                except (DataError, OSError, ValueError):
+                                    pass  # Missing evidence cannot become an earlier observation.
+                            bundle = adapt_margin_bundle(bundle, expected_code=api,
+                                                         previous_bundle=previous_margin)
+                        item[kind] = store.put(bundle)
                     except AuthError as exc:
                         if '401' in str(exc):
                             raise
@@ -2586,7 +2593,8 @@ def update_daily(client: Client, from_date: Optional[dt.date]=None) -> dict:
 # ---- Analysis pipeline: no Client, Session or credential lookup --------------
 def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex,
                    asof: dt.date, cutoff: dt.datetime, regime: dict, cfg: Config,
-                   next_trade: Optional[dt.date], global_issues: list[str]) -> tuple[dict,list[dict]]:
+                   next_trade: Optional[dt.date], global_issues: list[str],
+                   calendar_rows: Optional[list[dict]]=None) -> tuple[dict,list[dict]]:
     r={**m,**regime,'price_asof_date':str(asof),'information_cutoff':cutoff.isoformat(),
        'logic_version':LOGIC_VERSION,'code_version':CODE_VERSION,'financial_data_mode':'summary_only',
        'structural_limitations':['summary_only','gross_margin_not_in_model','current_ratio_not_in_model'],
@@ -2602,7 +2610,8 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
     if not item.get('complete'):
         r['common_issues'].append('symbol_collection_incomplete');return r,[]
     try:
-        frame=price_frame(bundle_rows(store,item.get('prices')),m['api_code'],sessions,asof)
+        raw_price_rows=bundle_rows(store,item.get('prices'))
+        frame=price_frame(raw_price_rows,m['api_code'],sessions,asof)
         r.update(technicals(frame,asof,cfg))
     except (DataError,KeyError,ValueError) as e:
         r['common_issues'].append(str(e));return r,[]
@@ -2681,7 +2690,13 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
         if not item.get('earnings'):raise DataError('earnings_not_collected')
         r.update(earnings_context(bundle_rows(store,item['earnings']),m['api_code'],cutoff,sessions,next_trade,cfg))
     except (DataError,KeyError,ValueError) as e:r['common_issues'].append(str(e))
-    r.update(margin_diagnostic(store.get(item['margin']) if item.get('margin') else {},cutoff))
+    try:
+        margin_bundle=store.get(item['margin']) if item.get('margin') else {}
+    except (DataError,OSError,ValueError):
+        margin_bundle={'status':'cache_invalid','rows':[]}
+    r.update(margin_diagnostic(margin_bundle,cutoff,expected_code=m['api_code'],
+                              price_asof_date=asof,calendar_rows=calendar_rows,
+                              price_rows=raw_price_rows))
     short=store.get(item['short']) if item.get('short') else {}
     visible_shorts=[x for x in short.get('rows',[]) if published_at(x) is not None and published_at(x)<=cutoff]
     r.update(short_report_status=short.get('status','not_collected'),short_report_event_count=len(visible_shorts),
@@ -2728,7 +2743,8 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
     for idx,m in enumerate(master,1):
         if m['instrument_type']!='stock':continue
         item=snap.get('symbols',{}).get(m['code'],{})
-        try:r,hist=analyze_symbol(m,item,store,sessions,t,information,regime,cfg,next_trade,global_issues)
+        try:r,hist=analyze_symbol(m,item,store,sessions,t,information,regime,cfg,next_trade,global_issues,
+                                calendar_rows=calrows)
         except DataError as e:
             r={**m,**regime,'common_issues':[str(e)],'financial_issues':[],'light_issues':[],
                'benchmark_input_valid':False,'annual_comparable':False,'critical_missing_count':0,
@@ -3071,6 +3087,8 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
         print('7) 全銘柄を強制再収集（確認あり）')
         print('8) キャッシュ・生フィールド監査（通信なし）')
         print('9) セクター統計を再計算（通信なし）')
+        print('10) 信用残だけを更新・続きから再開（価格基準日を保持）')
+        print('11) 信用残の診断を出力（通信なし）')
         print('q) 終了', flush=True)
         choice = _interactive_input('選択: ').lower()
         if choice == 'q':
@@ -3082,15 +3100,16 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
         mapping = {
             '1': 'collect_all', '2': 'analyze', '3': 'single', '4': 'update',
             '6': 'collect_all', '7': 'collect_all', '8': 'cache-audit', '9': 'sector-update',
+            '10': 'margin_refresh', '11': 'margin_analyze',
         }
         if choice not in mapping:
-            print('無効な選択です。1〜9 または q を入力してください。', flush=True)
+            print('無効な選択です。1〜11 または q を入力してください。', flush=True)
             continue
         nxt = copy.copy(args)
         nxt.phase = mapping[choice]
         nxt._menu_child = True
         try:
-            if choice in {'1', '6', '7'}:
+            if choice in {'1', '6', '7', '10'}:
                 # Normal UI always runs to completion; --checkpoint-size remains an advanced CLI option.
                 nxt.force_refresh = False
                 nxt.force_full = False
@@ -3101,6 +3120,10 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
                 nxt.codes = None
                 nxt.once = False
                 nxt.max_batches = None
+                if choice == '10':
+                    nxt.asof = None
+                    nxt.information_cutoff = None
+                    nxt.update_from = None
                 if choice == '6':
                     nxt.refresh_days = _input_integer(
                         '何日以上古い銘柄を再取得しますか（例: 7、qで戻る）: ', 7, 0
@@ -3124,6 +3147,9 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
                 if not nxt.run_id and not (nxt.output_dir / 'latest_run.json').exists():
                     print('採点済み結果がありません。先にメニュー2で一括分析してください。', flush=True)
                     continue
+            elif choice == '11':
+                nxt.asof = None
+                nxt.snapshot_id = None
             if choice in {'2', '8', '9'} and not Store(nxt.cache_dir).snapshot(nxt.snapshot_id):
                 print('キャッシュ不足。先にメニュー1で収集してください。', flush=True)
                 continue
@@ -3146,7 +3172,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='J-Quants V2 Standard スクリーナー（全銘柄自動収集・発注なし）')
     p.add_argument('--phase', choices=[
         'collect', 'collect_all', 'update', 'analyze', 'single', 'interactive',
-        'fields-audit', 'cache-audit', 'sector-update', 'status'
+        'fields-audit', 'cache-audit', 'sector-update', 'status',
+        'margin_refresh', 'margin_analyze'
     ], default='interactive', help='引数なしで日本語の対話メニュー')
     default_config = Path(__file__).resolve().parent / 'config.json'
     p.add_argument('--config', type=Path, default=(default_config if default_config.is_file() else None),
@@ -3166,7 +3193,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--top', type=int, default=10, help='上位出力件数（既定10）')
     p.add_argument('--code', help='銘柄コード（英字可）')
     p.add_argument('--codes', help='収集する普通株コードをカンマ区切りで指定')
-    p.add_argument('--snapshot-id')
+    p.add_argument('--snapshot-id', help='通常スナップショット。margin_refreshでは固定する取得元')
+    p.add_argument('--margin-snapshot-id', help='margin_analyze: 信用残専用スナップショット（既定は最新の試行）')
     p.add_argument('--run-id', help='single: 採点済みrun_idを指定')
     p.add_argument('--asof', help='共通株価基準日 YYYY-MM-DD。collect_allは初回確定日を自動固定')
     p.add_argument('--information-cutoff', help='情報締切日時 JST、例: 2026-09-11T08:00:00+09:00')
@@ -3178,7 +3206,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help='再開リストだけを初期化。既存の生データ・履歴は残す')
     p.add_argument('--refresh-days', type=int, help='この日数以上古い価格確認日の銘柄を再取得')
     p.add_argument('--max-batches', type=int,
-                   help='高度な運用向け。collect_allの最大内部チェックポイント数')
+                   help='高度な運用向け。collect_all / margin_refreshの最大内部チェックポイント数')
     p.add_argument('--once', action='store_true', help='内部チェックポイント1回だけで停止')
     p.add_argument('--version', action='version', version=CODE_VERSION+' / '+LOGIC_VERSION)
     return p
@@ -3207,6 +3235,16 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
         return run_interactive(args, cfg)
     if phase == 'status':
         print_collection_status(store, compact=False)
+        return 0
+    if phase == 'margin_analyze':
+        if args.snapshot_id or args.asof:
+            raise DataError('margin_analyze uses --margin-snapshot-id and the saved source price date')
+        with ProcessLock(args.output_dir, 'margin-analyze'):
+            records, meta = jq_margin_workflow.margin_analyze(
+                sys.modules[__name__], store, args.margin_snapshot_id, cutoff)
+            path = jq_margin_workflow.write_margin_run(sys.modules[__name__], records, meta, args.output_dir)
+        print('[信用診断出力] ' + str(path), flush=True)
+        print(f'[信用診断] {len(records)}銘柄。取得元の価格基準日・採点結果は保持しています。', flush=True)
         return 0
     if phase == 'analyze':
         path = analyze_store(store, cfg, args.output_dir, args.top, args.snapshot_id, asof, cutoff)
@@ -3245,6 +3283,10 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
         )), flush=True)
         return 0
 
+    if phase == 'margin_refresh' and (
+            args.asof or args.information_cutoff or args.update_from or args.refresh_days is not None
+            or args.force_refresh or args.force_full or args.force or args.margin_snapshot_id):
+        raise DataError('margin_refresh uses today-fixed 90 days; use --snapshot-id/--codes/--reset-pending')
     # Credential lookup is reachable ONLY in explicit collection phases.
     LOG.info('[収集] APIキー・保存先を確認しています。Ctrl+Cで中断できます')
     key = api_key_from_env_or_ini(args.api_ini)
@@ -3252,6 +3294,31 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
     with ProcessLock(store.root, 'collector'):
         client = Client(key, cfg, store)
         try:
+            if phase == 'margin_refresh':
+                codes = args.codes.split(',') if args.codes else [args.code] if args.code else None
+                reset = args.reset_pending
+                batches = 0
+                limit = 1 if args.once else args.max_batches
+                while True:
+                    snap = jq_margin_workflow.margin_refresh(
+                        sys.modules[__name__], client, source_snapshot_id=args.snapshot_id,
+                        budget=checkpoint_size, only_codes=codes,
+                        max_retries=args.max_retries, reset_pending=reset)
+                    reset = False
+                    batches += 1
+                    pending = list(snap.get('pending_codes') or [])
+                    terminal = list(snap.get('terminal_failed_codes') or [])
+                    LOG.info('[信用残チェックポイント %s] 成功=%s 未完了=%s 次=%s 要確認失敗=%s snapshot=%s',
+                             batches, snap.get('batch_success_count', 0), snap.get('batch_incomplete_count', 0),
+                             len(pending), len(terminal), snap['snapshot_id'])
+                    if not pending or (limit is not None and batches >= limit):
+                        print('margin_snapshot_id=' + snap['snapshot_id'], flush=True)
+                        return 2 if pending or terminal or snap.get('status') != 'complete' else 0
+                    if not snap.get('unattempted_count', 0):
+                        LOG.info('[信用残再試行] %s秒後に続行します（Ctrl+Cで中断可）', args.retry_delay)
+                        end_wait = time.monotonic() + args.retry_delay
+                        while time.monotonic() < end_wait:
+                            time.sleep(min(1.0, max(0.0, end_wait-time.monotonic())))
             if phase == 'update':
                 update_from = date(args.update_from) if args.update_from else None
                 if args.update_from and update_from is None:

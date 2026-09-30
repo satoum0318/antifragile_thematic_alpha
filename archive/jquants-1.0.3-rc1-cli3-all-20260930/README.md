@@ -64,4 +64,4 @@ Gitは無視対象のAPIキー、設定、キャッシュ、分析結果を復�
 
 ## 実装仕様の確認状況
 
-ユーザー指定の `Edited_JQuants_Margin_Daily_Migrarion_Plan.md` は、アーカイブ作成時点では所在未確認です。既存の `docs/JQuants_Margin_Daily_Migration_Plan.md` を編集済み仕様の代わりに採用していません。指定ファイルを確認してから、開発ブランチ上で変更範囲・新コード版・検証項目を確定します。
+アーカイブ作成時は指定計画の所在未確認でした。その後、ユーザーの添付原文と指定パスを確認し、[採用計画](../../doc/archive/JQuants_Margin_Daily_Migration_Plan.md)を保存しました。第1段階の実装は開発ブランチでコード版 `1.1.0-rc1-margin-daily` として進めています。[実装・操作手順](../../docs/JQuants_Margin_Daily_Implementation.md)に開発版の検証範囲を記載します。このディレクトリのBot本体は変更していません。

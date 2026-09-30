@@ -9,12 +9,13 @@
 *.gitignore text eol=lf charset=utf-8
 *.gitattributes text eol=lf charset=utf-8
 
+# Preserve the user-supplied archived plan byte for byte, including line endings.
+doc/archive/JQuants_Margin_Daily_Migration_Plan.md -text -whitespace
+
 # バイナリファイル
 *.csv binary
 *.xlsx binary
 *.xls binary
-
-
 
 
 
