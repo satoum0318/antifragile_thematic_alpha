@@ -327,9 +327,11 @@ def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str |
            "margin_bridge_start_date": None, "margin_bridge_end_date": None,
            "margin_bridge_business_days": None, "margin_bridge_calendar_days": None}
     metrics = [*FIELD_NAMES.values(), "margin_ratio", "margin_general_short_pct", "margin_value_ratio",
-               "margin_short_to_volume_20bd", "margin_application_age_bd", "margin_publication_age_days",
+               "margin_short_to_volume_20bd", "margin_long_to_volume_20bd",
+               "margin_application_age_bd", "margin_publication_age_days",
                "margin_bridge_long_change_pct", "margin_bridge_short_change_pct"]
     metrics += [f"margin_{side}_change_{n}bd_pct" for side in ("long", "short") for n in (1, 5, 20)]
+    metrics += [f"margin_{side}_change_{n}bd_vol" for side in ("long", "short") for n in (1, 5, 20)]
     for key in metrics:
         out[key] = None
         states[key], reasons[key] = "unavailable", "no_usable_row"
@@ -475,6 +477,10 @@ def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str |
             baseline = _number(selected[window[0]]["normalized_row"].get(field)) if not problem else None
             reason = problem or ("zero_baseline" if baseline == 0 else None)
             set_metric(key, 100 * (_number(row[field]) / baseline - 1) if not reason else None, reason)
+            # Share changes use exactly the same eligibility as percentage
+            # changes, including the zero-baseline guard, for paired evidence.
+            set_metric(f"margin_{side}_change_{n}bd_vol",
+                       _number(row[field]) - baseline if not reason else None, reason)
 
     bridge_daily = selected.get(DAILY_START)
     weekly = [d for d, v in selected.items() if d < DAILY_START and v["frequency"] == "weekly"]
@@ -505,6 +511,7 @@ def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str |
 
     turnover_problem = "volume_history_insufficient"
     turnover_value = None
+    long_turnover_value = None
     if len(known_sessions) >= 20:
         window = _sessions(days, known_sessions[-20], day)
         turnover_problem = "calendar_unverified" if window is None else _corporate_action_reason(window, prices)
@@ -516,5 +523,7 @@ def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str |
                 turnover_problem = "zero_volume_denominator"
             else:
                 turnover_value = srt / (sum(volumes) / len(volumes))
+                long_turnover_value = lng / (sum(volumes) / len(volumes))
     set_metric("margin_short_to_volume_20bd", turnover_value, turnover_problem)
+    set_metric("margin_long_to_volume_20bd", long_turnover_value, turnover_problem)
     return out

@@ -2,8 +2,10 @@
 
 J-Quants APIを使用した投資銘柄スクリーニングシステム
 
-開発版コード：`1.1.0-rc2-margin-daily`。信用残の日次取得・診断と、買残・売残双方のレポート表示に対応しています。
-採点ロジックは `JQ-STD-CORRECTED-1.0-rc1` を維持しています。
+開発版コード：`1.2.0-rc1-universe-ab`。A「割安・財務良好・成長」とB「高成長・信用売残」の登録検討候補を別々に出力します。
+登録候補ロジックは `JQ-UNIVERSE-AB-1.0-rc1`。旧 `JQ-STD-CORRECTED-1.0-rc1` の順位も比較用に保存します。
+[A・Bの条件・初期値・操作](docs/JQuants_Universe_AB_Implementation.md) /
+[直前のrc2版へ復元](archive/jquants-1.1.0-rc2-before-ab-20260930/README.md) /
 [信用残の操作・実装範囲](docs/JQuants_Margin_Daily_Implementation.md) /
 [採用計画の原文](doc/archive/JQuants_Margin_Daily_Migration_Plan.md) /
 [旧版への復元](archive/jquants-1.0.3-rc1-cli3-all-20260930/README.md)。
@@ -15,11 +17,11 @@ J-Quants APIを使用した投資銘柄スクリーニングシステム
 ## 主な機能
 
 - **データ収集**: レート制限を守り、チェックポイント保存と再開に対応
-- **信用残の診断**: 信用残だけの更新と通信なしの診断。価格基準日・採点・新規買い可否を保持
+- **信用残の診断**: 買残・売残・変化を時点監査。B候補では有効な売残の積み上がりを確認。メニュー10・11単独では再採点しない
 - **凍結キャッシュ**: 取得したデータをローカルに保存し、オフライン分析を可能に
 - **投資分析**: Standard財務品質7項目（原著Piotroski F-Scoreとは別）、バリュエーション指標、安全性参考点などを計算
-- **新規候補スクリーニング**: 財務品質・バリュエーション・MA200局面を評価。保有期間・売却・自動発注は未実装
-- **ロジック正本**: `JQ-STD-CORRECTED-1.0-rc1`（J-Quants Standard、追加アドオンなし）
+- **登録候補スクリーニング**: 成長根拠を確認し、上昇継続・条件待ちを含めてA・B別に比較。資金配分と銘柄登録は本人が管理
+- **旧方式比較**: 従来のFE・新規候補条件・旧Topを保持。注文・決済・外部売買Botの変更なし
 
 ## セットアップ
 
@@ -64,7 +66,10 @@ python runner.py
 python JQuamtsScreeningBot.py --phase collect --budget 800
 
 # 分析実行
-python JQuamtsScreeningBot.py --phase analyze --top 20
+python JQuamtsScreeningBot.py --phase analyze --top 10
+
+# 保存済み信用残の最新試行を明示してA・B分析（通信なし、価格・財務の締切は保持）
+python JQuamtsScreeningBot.py --phase analyze --margin-snapshot-id latest --top 10
 
 # 保存済み通常snapshotを元に、信用残だけを更新（実API通信あり）
 python JQuamtsScreeningBot.py --phase margin_refresh
@@ -80,7 +85,9 @@ python JQuamtsScreeningBot.py --phase fields-audit --budget 50
 
 - `runner.py`: 便利なランナースクリプト
 - `JQuamtsScreeningBot.py`: J-Quants V2 Standard オフライン一括スクリーニング
-- `docs/JQuants_Standard_Screening_Logic_Master.md`: **現行ロジック正本**（`JQ-STD-CORRECTED-1.0-rc1`）
+- `jq_universe.py` / `jq_universe_report.py`: A・Bの登録候補判定と根拠レポート
+- `docs/JQuants_Universe_AB_Implementation.md`: **A・B登録候補の現行仕様**（`JQ-UNIVERSE-AB-1.0-rc1`）
+- `docs/JQuants_Standard_Screening_Logic_Master.md`: **旧方式比較・基礎データ計算の正本**（`JQ-STD-CORRECTED-1.0-rc1`）
 - `docs/スクリーニング仕様マニュアル.md`: 正本への案内
 - `docs/archive/スクリーニング仕様マニュアル_pre-jq-std-1.0-rc1.md`: 旧正本アーカイブ
 - `config/theme_tags.yaml`: テーマタグ定義
@@ -90,7 +97,6 @@ python JQuamtsScreeningBot.py --phase fields-audit --budget 50
 ## ライセンス
 
 このプロジェクトは個人利用を目的としています。
-
 
 
 

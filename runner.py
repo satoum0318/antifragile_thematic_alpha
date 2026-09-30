@@ -24,7 +24,7 @@ if sys.platform == "win32":
 import JQuamtsScreeningBot as bot
 
 DEFAULT_PHASE = "analyze"
-DEFAULT_TOP = 20
+DEFAULT_TOP = 10
 DEFAULT_BUDGET = None  # Let the bot's active config select its checkpoint size.
 
 
@@ -43,7 +43,7 @@ def _build_bot_argv(args: argparse.Namespace) -> List[str]:
             argv.append("--reset-pending")
     if args.code:
         argv += ["--code", args.code]
-    for name in ("snapshot_id", "margin_snapshot_id", "cache_dir", "output_dir"):
+    for name in ("snapshot_id", "margin_snapshot_id", "cache_dir", "output_dir", "config", "asof", "information_cutoff"):
         value = getattr(args, name, None)
         if value is not None:
             argv += ["--" + name.replace("_", "-"), str(value)]
@@ -78,6 +78,9 @@ def main():
     parser.add_argument("--margin-snapshot-id")
     parser.add_argument("--cache-dir")
     parser.add_argument("--output-dir")
+    parser.add_argument("--config")
+    parser.add_argument("--asof")
+    parser.add_argument("--information-cutoff")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     return invoke_jquants_screening_bot(args)

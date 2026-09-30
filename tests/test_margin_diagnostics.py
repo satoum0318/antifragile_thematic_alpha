@@ -177,18 +177,42 @@ def test_five_and_twenty_sessions_require_six_and_twenty_one_daily_observations(
     assert diagnose(bundle(daily_rows("2026-10-23")))["margin_short_change_20bd_pct"] is None
 
 
+@pytest.mark.parametrize("end,n", [("2026-09-28", 1), ("2026-10-02", 5), ("2026-10-26", 20)])
+def test_absolute_and_percentage_changes_share_the_same_observation_window(end, n):
+    rows = daily_rows(end)
+    result = diagnose(bundle(rows))
+    for side, amount in (("long", 2 * n), ("short", n)):
+        absolute = f"margin_{side}_change_{n}bd_vol"
+        percentage = f"margin_{side}_change_{n}bd_pct"
+        assert result[absolute] == amount
+        assert result[percentage] == pytest.approx(float(n))
+        assert result["margin_metric_states"][absolute] == result["margin_metric_states"][percentage] == "available"
+        assert result["margin_metric_reasons"][absolute] == result["margin_metric_reasons"][percentage] is None
+    rows.pop(0)
+    incomplete = diagnose(bundle(rows))
+    for side in ("long", "short"):
+        absolute = f"margin_{side}_change_{n}bd_vol"
+        percentage = f"margin_{side}_change_{n}bd_pct"
+        assert incomplete[absolute] is incomplete[percentage] is None
+        assert incomplete["margin_metric_states"][absolute] == incomplete["margin_metric_states"][percentage] == "unavailable"
+        assert incomplete["margin_metric_reasons"][absolute] == incomplete["margin_metric_reasons"][percentage]
+
+
 def test_zero_baseline_and_issue_change_disable_change_without_forward_fill():
     rows = daily_rows("2026-10-02")
     rows[0] = row(short=0)
     result = diagnose(bundle(rows))
     assert result["margin_short_change_5bd_pct"] is None
     assert result["margin_metric_reasons"]["margin_short_change_5bd_pct"] == "zero_baseline"
+    assert result["margin_short_change_5bd_vol"] is None
+    assert result["margin_metric_reasons"]["margin_short_change_5bd_vol"] == "zero_baseline"
     rows = daily_rows("2026-10-02")
     rows[2]["IssType"] = "1"
     assert diagnose(bundle(rows))["margin_metric_reasons"]["margin_short_change_5bd_pct"] == "issue_type_changed"
     rows = daily_rows("2026-10-02")
     rows[-1]["ShrtVol"] = rows[-1]["ShrtNegVol"] = 0
     assert diagnose(bundle(rows))["margin_short_change_5bd_pct"] == -100
+    assert diagnose(bundle(rows))["margin_short_change_5bd_vol"] == -100
 
 
 def test_weekly_bridge_records_actual_two_session_interval_not_one_daily_step():
@@ -211,6 +235,10 @@ def test_corporate_actions_and_unknown_factors_invalidate_share_changes(change, 
     result = diagnose(bundle(daily_rows("2026-10-02")), price_rows=raw_prices)
     assert result["margin_short_change_5bd_pct"] is None
     assert result["margin_metric_reasons"]["margin_short_change_5bd_pct"] == reason
+    assert result["margin_short_change_5bd_vol"] is None
+    assert result["margin_metric_reasons"]["margin_short_change_5bd_vol"] == reason
+    assert result["margin_long_to_volume_20bd"] is None
+    assert result["margin_metric_reasons"]["margin_long_to_volume_20bd"] == reason
     assert result["margin_ratio"] == 2
 
 
@@ -221,17 +249,45 @@ def test_old_price_asof_prevents_using_future_cached_prices_and_volume():
     assert result["margin_short_change_20bd_pct"] is None
     assert result["margin_metric_reasons"]["margin_short_change_20bd_pct"] == "corporate_action_unverified"
     assert result["margin_short_to_volume_20bd"] is None
+    assert result["margin_long_to_volume_20bd"] is None
+    assert result["margin_long_change_20bd_vol"] is None
 
 
 def test_turnover_uses_same_date_twenty_raw_volume_sessions_and_no_adjustment():
     result = diagnose(bundle(daily_rows()))
     assert result["margin_short_to_volume_20bd"] == pytest.approx(0.12)
+    assert result["margin_long_to_volume_20bd"] == pytest.approx(0.24)
     zero_prices = prices()
     for item in zero_prices:
         item["Vo"] = 0
     result = diagnose(bundle(daily_rows()), price_rows=zero_prices)
     assert result["margin_short_to_volume_20bd"] is None
     assert result["margin_metric_reasons"]["margin_short_to_volume_20bd"] == "zero_volume_denominator"
+    assert result["margin_long_to_volume_20bd"] is None
+    assert result["margin_metric_reasons"]["margin_long_to_volume_20bd"] == "zero_volume_denominator"
+
+
+def test_positive_long_turnover_remains_available_when_short_balance_is_zero():
+    result = diagnose(bundle([row("2026-10-26", long=2500, short=0)]))
+    assert result["margin_ratio_state"] == "zero_short_balance"
+    assert result["margin_ratio"] is None
+    assert result["margin_long_to_volume_20bd"] == pytest.approx(2.5)
+    assert result["margin_short_to_volume_20bd"] == 0
+    assert result["margin_metric_states"]["margin_long_to_volume_20bd"] == "available"
+    assert result["margin_metric_reasons"]["margin_long_to_volume_20bd"] is None
+
+
+@pytest.mark.parametrize("volume,reason", [(None, "volume_history_insufficient"),
+                                           (-1, "volume_history_insufficient")])
+def test_missing_or_invalid_volume_disables_both_sides_of_turnover(volume, reason):
+    raw_prices = prices()
+    next(r for r in raw_prices if r["Date"] == "2026-10-23")["Vo"] = volume
+    result = diagnose(bundle(daily_rows()), price_rows=raw_prices)
+    for side in ("long", "short"):
+        key = f"margin_{side}_to_volume_20bd"
+        assert result[key] is None
+        assert result["margin_metric_states"][key] == "unavailable"
+        assert result["margin_metric_reasons"][key] == reason
 
 
 def test_calendar_hole_cannot_be_treated_as_holiday():

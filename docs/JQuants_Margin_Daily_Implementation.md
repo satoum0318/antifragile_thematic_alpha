@@ -1,5 +1,7 @@
 # 信用残日次対応 第1段階の実装・操作手順
 
+本書はrc2時点の操作と、その後の合意形成を記録したものです。新しいA・B登録候補の実装・初期閾値・操作・直前版への復元は [A・B初期実装仕様](JQuants_Universe_AB_Implementation.md) を参照してください。下記の「未決」「計画のみ」は策定時点の記録で、新版で具体化した値は同仕様に明記しています。
+
 2026-09-30 JST。コード版 `1.1.0-rc2-margin-daily`、ロジック版 `JQ-STD-CORRECTED-1.0-rc1`。
 開発ブランチ：`feat/jquants-margin-daily-20260930`。
 コード版タグ：`code-v1.1.0-rc2-margin-daily`。初期実装の `code-v1.1.0-rc1-margin-daily` も保存しています。

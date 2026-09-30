@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""J-Quants Standard equity screener — JQ-STD-CORRECTED-1.0-rc1.
+"""J-Quants Standard equity screener with independent A/B universe candidates.
 
-Read README.md and IMPLEMENTATION_NOTES.md before operating.
+Read README.md and docs/JQuants_Universe_AB_Implementation.md before operating.
 No brokerage connection or order submission exists in this program.
 Analysis is offline. Collection uses only the allowlisted J-Quants V2 endpoints.
 Unknown financial/corporate-action inputs are NOT silently imputed.
 For J-Quants fins/summary, JPY is an explicit configurable operational default; strict mode can disable it.
 The original 7,967-line script is not imported and is not overwritten.
 CLI3 provides one-command all-symbol collection with automatic resume, bounded retries, and status display.
-The Standard screening rules and raw cache schema are unchanged.
+The legacy Standard ranking and raw cache schema remain available for comparison.
 Python >= 3.10; dependencies: numpy, pandas, requests.
 """
 from __future__ import annotations
@@ -45,9 +45,12 @@ import requests
 
 from jq_margin import adapt_margin_bundle, margin_diagnostic as _margin_diagnostic
 import jq_margin_workflow
+import jq_universe
+import jq_universe_report
 
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
-CODE_VERSION = '1.1.0-rc2-margin-daily'
+REGISTRATION_LOGIC_VERSION = jq_universe.UNIVERSE_LOGIC_VERSION
+CODE_VERSION = '1.2.0-rc1-universe-ab'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -287,6 +290,8 @@ class Config:
     EARNINGS_RECENT_WINDOW_DAYS: int = 30
     UPSIDE_MODE: str = 'diagnostic'
     PERSISTENCE_MODE: str = 'diagnostic'
+    # Independent registration ranking; omitted values use versioned RC defaults.
+    REGISTRATION_RULES: Optional[dict] = None
     # Audit attestations: never filled automatically. See config.example.json.
     currency_rules: Optional[list] = None
     currency_overrides: Optional[dict] = None
@@ -296,6 +301,10 @@ class Config:
     scenarios: Optional[dict] = None
 
     def validate(self) -> None:
+        try:
+            jq_universe.UniverseConfig.from_mapping(self.REGISTRATION_RULES)
+        except (TypeError, ValueError) as exc:
+            raise DataError('Invalid REGISTRATION_RULES: '+str(exc)) from exc
         if self.JQ_PLAN != 'standard':
             raise DataError('This build is Standard-only')
         if any((self.FINANCIAL_DETAILS_ENABLED, self.EDINET_GOVERNANCE_ENABLED,
@@ -2710,8 +2719,108 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
     return r,hist
 
 
+def registration_price_context(sessions: pd.DatetimeIndex, asof: dt.date,
+                               cutoff: dt.datetime, calendar_rows: list[dict]) -> dict:
+    """Age against the frozen cutoff, never the clock at replay time."""
+    known = [s.date() for s in sessions]
+    ready = [d for d in known if dt.datetime.combine(d, dt.time(18), JST) <= cutoff]
+    calendar_dates = {date(r.get('Date')) for r in calendar_rows}
+    covered = bool(known and asof in known and max(known) >= cutoff.date()
+                   and all(asof+dt.timedelta(days=n) in calendar_dates
+                           for n in range((cutoff.date()-asof).days+1)))
+    reference = max(ready) if ready and covered else None
+    age = sum(asof < d <= reference for d in known) if reference and asof <= reference else None
+    return {'registration_price_age_bd':age,
+            'registration_price_reference_date':str(reference) if reference else None,
+            'registration_price_age_basis':'frozen_cutoff_18h_daily_publication_boundary'}
+
+
+def attach_registration(records: list[dict], store: Store, snap: dict, cfg: Config,
+                        sessions: pd.DatetimeIndex, calendar_rows: list[dict],
+                        asof: dt.date, cutoff: dt.datetime,
+                        margin_snapshot_id: Optional[str]=None) -> dict:
+    """Attach independent A/B results without modifying legacy inputs or scores."""
+    rules = jq_universe.UniverseConfig.from_mapping(cfg.REGISTRATION_RULES)
+    selected = None
+    if margin_snapshot_id is not None:
+        selected = jq_margin_workflow.load_margin_snapshot(
+            sys.modules[__name__], store, None if margin_snapshot_id == 'latest' else margin_snapshot_id)
+        if not selected:
+            raise DataError('registration_margin_snapshot_required')
+        if (not isinstance(selected.get('symbols'), dict) or not isinstance(selected.get('targets'), dict)
+                or not isinstance(selected.get('selected_codes'), list)
+                or timestamp(selected.get('information_cutoff')) is None):
+            raise DataError('registration_margin_snapshot_invalid')
+    context = registration_price_context(sessions, asof, cutoff, calendar_rows)
+    mode = 'explicit_margin_snapshot' if selected is not None else 'normal_snapshot'
+    for row in records:
+        code = row['code']
+        item = snap.get('symbols', {}).get(code, {})
+        if selected is None:
+            diagnosis = copy.deepcopy({k:v for k,v in row.items() if k.startswith('margin_')})
+            reference = item.get('margin')
+            attempt = diagnosis.get('margin_status', 'not_collected')
+        else:
+            target = selected['targets'].get(code, {})
+            selected_item = selected['symbols'].get(code, {})
+            if not isinstance(target,dict) or not isinstance(selected_item,dict):
+                raise DataError('registration_margin_symbol_invalid:'+code)
+            reference = selected_item.get('margin_ref')
+            attempt = selected_item.get('last_attempt_status', 'not_collected')
+            blob = jq_margin_workflow._read_optional_bundle(sys.modules[__name__], store, reference)
+            if code not in selected['selected_codes']:
+                blob = {'status':'not_selected','rows':[]}
+            elif target.get('api_code') != row.get('api_code'):
+                blob = {'status':'code_mismatch','rows':[]}
+            elif (timestamp(blob.get('collected_at')) is not None
+                  and timestamp(blob['collected_at']) > timestamp(selected['information_cutoff'])):
+                blob = {'status':'observation_after_snapshot_verification','rows':[]}
+            prices = jq_margin_workflow._read_optional_bundle(sys.modules[__name__], store, item.get('prices'))
+            diagnosis = margin_diagnostic(blob, cutoff, expected_code=row.get('api_code'),
+                price_asof_date=asof, calendar_rows=calendar_rows,
+                price_rows=prices.get('rows', []) if prices.get('status') == 'complete' else [])
+        # Explicit credit is evaluated against THIS run's price/cutoff. It does
+        # not replace the regular margin_* fields or the normal snapshot.
+        row.update(context)
+        row.update(registration_margin_diagnostic=diagnosis,
+                   registration_margin_input_mode=mode,
+                   registration_margin_snapshot_id=selected.get('snapshot_id') if selected else None,
+                   registration_margin_bundle_ref=reference,
+                   registration_margin_last_attempt_status=attempt)
+        evaluation_input = {**row, **diagnosis}
+        row.update(jq_universe.evaluate(evaluation_input, rules))
+        row['registration_logic_version'] = REGISTRATION_LOGIC_VERSION
+        row['legacy_logic_version'] = LOGIC_VERSION
+        # Flat CSV evidence always comes from the explicit evaluation source.
+        for key in ('margin_long','margin_short','margin_ratio','margin_reference_date','margin_pub_date',
+                    'margin_available_at','margin_application_age_bd','margin_diagnostic_status',
+                    'margin_long_to_volume_20bd','margin_short_to_volume_20bd',
+                    'margin_long_change_5bd_pct','margin_long_change_20bd_pct',
+                    'margin_short_change_5bd_pct','margin_short_change_20bd_pct'):
+            row['registration_'+key] = diagnosis.get(key)
+    for route in ('a','b'):
+        candidates = sorted((r for r in records if r.get('registration_'+route+'_eligible') is True),
+                            key=lambda r:jq_universe.rank_key(r,route))
+        for row in records:
+            row['registration_'+route+'_rank'] = None
+        for position,row in enumerate(candidates,1):
+            row['registration_'+route+'_rank'] = position
+    return {**context, 'registration_logic_version':REGISTRATION_LOGIC_VERSION,
+            'legacy_logic_version':LOGIC_VERSION, 'registration_rules':asdict(rules),
+            'registration_rules_hash':digest(asdict(rules)),
+            'registration_margin_input_mode':mode,
+            'registration_margin_snapshot_id':selected.get('snapshot_id') if selected else None,
+            'registration_margin_snapshot_hash':digest(selected) if selected else None,
+            'registration_margin_source_snapshot_id':selected.get('source_snapshot_id') if selected else snap.get('snapshot_id'),
+            'registration_margin_snapshot_cutoff':selected.get('information_cutoff') if selected else snap.get('information_cutoff'),
+            'registration_counts':jq_universe_report.summarize(records),
+            'registration_validation':'rc_initial_rules_not_performance_validated',
+            'allocation_management':'user_only', 'orders_enabled':False}
+
+
 def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date]=None,
-                   cutoff: Optional[dt.datetime]=None) -> tuple[list[dict],dict,dict]:
+                   cutoff: Optional[dt.datetime]=None,
+                   margin_snapshot_id: Optional[str]=None) -> tuple[list[dict],dict,dict]:
     cfg.validate()
     t=asof or date(snap.get('price_asof_date'))
     information=cutoff or timestamp(snap.get('information_cutoff'))
@@ -2770,6 +2879,7 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
         if stop is not None and r['price']>stop and r.get('scenario_price_base') is not None:
             r['reward_to_risk_reference']=(r['scenario_price_base']-r['price'])/(r['price']-stop)
     legacy_reference_scores(records,cfg)
+    registration_meta=attach_registration(records,store,snap,cfg,sessions,calrows,t,information,margin_snapshot_id)
     records.sort(key=rank_key)
     complete_count=sum(snap.get('symbols',{}).get(r['code'],{}).get('complete',False) for r in records)
     status='diagnostic_only' if global_issues else 'partial_universe' if complete_count<len(records) or any(r.get('common_issues') for r in records) else 'complete'
@@ -2780,7 +2890,8 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
           'eligible_count':sum(r['eligible_new_entry'] for r in records),'percentile_universe_id':universe_id,
           'pit_quality':'archived_input_snapshot_not_guaranteed_historical_vintage',
           'non_stock_master_rows':[m for m in master if m['instrument_type']!='stock'],
-          'config':asdict(cfg),'config_hash':digest(asdict(cfg)),'input_hash':digest(snap)}
+          'config':asdict(cfg),'config_hash':digest(asdict(cfg)),'input_hash':digest(snap),
+          **registration_meta}
     return clean(records),clean(benchmarks),clean(meta)
 
 # ---- Reports: filter only, never re-score ------------------------------------
@@ -2865,6 +2976,9 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
     meta['generated_at']=now_jst().isoformat()
     source=Path(__file__)
     meta['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
+    meta['source_sha256_by_file']={name:hashlib.sha256((source.parent/name).read_bytes()).hexdigest()
+        for name in ('JQuamtsScreeningBot.py','jq_margin.py','jq_margin_workflow.py',
+                     'jq_universe.py','jq_universe_report.py')}
     for r in rows:r['run_id']=run_id;r.setdefault('logic_version',LOGIC_VERSION);r.setdefault('code_version',CODE_VERSION)
     meta['result_hash_excluding_run_id']=digest([{k:v for k,v in r.items() if k!='run_id'} for r in rows])
     history=output/'history';history.mkdir(parents=True,exist_ok=True)
@@ -2883,6 +2997,8 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
         'satellite_valuation_candidates.csv':[r for r in rows if r.get('candidate_lane')=='satellite_valuation'],
         'satellite_ps_only_candidates.csv':[r for r in rows if r.get('candidate_lane')=='satellite_ps_only'],
     }
+    groups.update(jq_universe_report.groups(rows,top))
+    groups['legacy_top_recommended_core.csv']=groups['top_recommended_core.csv']
     for lane in SOFT_BASES:
         groups.setdefault(lane+'_candidates.csv',[r for r in rows if r.get('candidate_lane')==lane])
     groups['non_stock_excluded.csv']=meta.get('non_stock_master_rows',[])
@@ -2895,10 +3011,13 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
         summary={'run_id':run_id,'eligible_count':sum(r.get('eligible_new_entry') is True for r in rows),
                  'lane_counts':dict(Counter(r.get('candidate_lane') for r in rows)),
                  'gate_counts':counts,'reason_counts':dict(Counter(x for r in rows for x in r.get('gate_reasons',[])))}
+        summary['registration']=jq_universe_report.summarize(rows)
         atomic_json(stage/'filter_summary.json',summary)
         report=markdown_report(rows,meta,top).encode('utf-8')
         atomic_bytes(stage/'report_core_top10.md',report)
         atomic_bytes(stage/'report_investment_advice_core.md',report)
+        atomic_bytes(stage/'report_registration_top10.md',
+                     jq_universe_report.markdown_report(rows,meta,top).encode('utf-8'))
         meta['outputs']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(stage.iterdir())}
         atomic_json(stage/'run_manifest.json',meta)
         os.replace(stage,final)
@@ -2926,14 +3045,19 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
 
 def analyze_store(store: Store, cfg: Config, output: Path, top: int=10,
                   snapshot_id: Optional[str]=None, asof: Optional[dt.date]=None,
-                  cutoff: Optional[dt.datetime]=None) -> Path:
+                  cutoff: Optional[dt.datetime]=None,
+                  margin_snapshot_id: Optional[str]=None) -> Path:
     snap=store.snapshot(snapshot_id)
     if not snap:raise DataError('凍結スナップショットがありません。先にメニュー1または --phase collect_all を実行してください')
     LOG.info('[分析開始] スナップショット=%s / 収集済み=%s銘柄（API通信なし）',snap.get('snapshot_id'),sum(i.get('complete') is True for i in snap.get('symbols',{}).values()))
-    records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff)
+    LOG.info('[登録候補] 信用入力=%s / 価格・財務の情報締切は元snapshotを保持',
+             margin_snapshot_id or '通常snapshot内の信用残')
+    records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff,margin_snapshot_id)
     with ProcessLock(output,'analysis'):
         path=write_run(records,stats,meta,output,top)
-    LOG.info('分析完了: eligible=%s status=%s -> %s',meta['eligible_count'],meta['run_status'],path)
+    LOG.info('分析完了: A=%s B=%s 旧方式=%s status=%s -> %s',
+             meta['registration_counts']['a']['eligible_count'],meta['registration_counts']['b']['eligible_count'],
+             meta['eligible_count'],meta['run_status'],path)
     return path
 
 
@@ -3079,7 +3203,7 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
         print_collection_status(Store(args.cache_dir), compact=True)
         print('\n=== メニュー ===', flush=True)
         print('1) 全銘柄を収集・続きから再開（推奨）')
-        print('2) オフライン一括分析（core/satellite/excluded 出力）')
+        print('2) オフライン一括分析（A・B登録候補／旧方式比較）')
         print('3) 単銘柄の採点済み結果を表示')
         print('4) 日付単位で差分更新（収集済み銘柄）')
         print('5) 収集状況・ロック状態を詳しく表示')
@@ -3089,6 +3213,7 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
         print('9) セクター統計を再計算（通信なし）')
         print('10) 信用残だけを更新・続きから再開（価格基準日を保持）')
         print('11) 信用残の診断を出力（通信なし）')
+        print('12) 取得した信用残を指定してA・B分析（通信なし）')
         print('q) 終了', flush=True)
         choice = _interactive_input('選択: ').lower()
         if choice == 'q':
@@ -3100,10 +3225,10 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
         mapping = {
             '1': 'collect_all', '2': 'analyze', '3': 'single', '4': 'update',
             '6': 'collect_all', '7': 'collect_all', '8': 'cache-audit', '9': 'sector-update',
-            '10': 'margin_refresh', '11': 'margin_analyze',
+            '10': 'margin_refresh', '11': 'margin_analyze', '12': 'analyze',
         }
         if choice not in mapping:
-            print('無効な選択です。1〜11 または q を入力してください。', flush=True)
+            print('無効な選択です。1〜12 または q を入力してください。', flush=True)
             continue
         nxt = copy.copy(args)
         nxt.phase = mapping[choice]
@@ -3150,7 +3275,16 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
             elif choice == '11':
                 nxt.asof = None
                 nxt.snapshot_id = None
-            if choice in {'2', '8', '9'} and not Store(nxt.cache_dir).snapshot(nxt.snapshot_id):
+            elif choice == '12':
+                latest_margin=jq_margin_workflow.load_margin_snapshot(sys.modules[__name__],Store(nxt.cache_dir))
+                if latest_margin:
+                    print('[保存済み信用] '+str(latest_margin.get('snapshot_id'))+
+                          ' / 信用情報締切='+str(latest_margin.get('information_cutoff')),flush=True)
+                print('通常snapshotの価格日・情報締切で照合します。未公表・価格日より新しい信用は候補判定に使いません。',flush=True)
+                selected=_interactive_input('信用snapshot ID（latestで上記の最新試行、qで戻る）: ')
+                if not selected or selected.lower()=='q':raise MenuCancelled()
+                nxt.margin_snapshot_id=selected
+            if choice in {'2', '8', '9', '12'} and not Store(nxt.cache_dir).snapshot(nxt.snapshot_id):
                 print('キャッシュ不足。先にメニュー1で収集してください。', flush=True)
                 continue
             if choice == '4' and not Store(nxt.cache_dir).snapshot():
@@ -3194,7 +3328,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--code', help='銘柄コード（英字可）')
     p.add_argument('--codes', help='収集する普通株コードをカンマ区切りで指定')
     p.add_argument('--snapshot-id', help='通常スナップショット。margin_refreshでは固定する取得元')
-    p.add_argument('--margin-snapshot-id', help='margin_analyze: 信用残専用スナップショット（既定は最新の試行）')
+    p.add_argument('--margin-snapshot-id', help='analyze: 信用入力を明示選択（IDまたはlatest）。未指定は通常snapshot内。margin_analyzeは未指定で最新試行')
     p.add_argument('--run-id', help='single: 採点済みrun_idを指定')
     p.add_argument('--asof', help='共通株価基準日 YYYY-MM-DD。collect_allは初回確定日を自動固定')
     p.add_argument('--information-cutoff', help='情報締切日時 JST、例: 2026-09-11T08:00:00+09:00')
@@ -3208,7 +3342,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max-batches', type=int,
                    help='高度な運用向け。collect_all / margin_refreshの最大内部チェックポイント数')
     p.add_argument('--once', action='store_true', help='内部チェックポイント1回だけで停止')
-    p.add_argument('--version', action='version', version=CODE_VERSION+' / '+LOGIC_VERSION)
+    p.add_argument('--version', action='version', version=CODE_VERSION+' / '+REGISTRATION_LOGIC_VERSION+' / legacy='+LOGIC_VERSION)
     return p
 
 
@@ -3229,8 +3363,8 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
     if args.information_cutoff and cutoff is None:
         raise DataError('invalid --information-cutoff')
     if not getattr(args, '_menu_child', False):
-        LOG.info('plan=standard logic=%s code=%s cache=%s config_hash=%s',
-                 LOGIC_VERSION, CODE_VERSION, CACHE_SCHEMA, digest(asdict(cfg))[:12])
+        LOG.info('plan=standard registration=%s legacy=%s code=%s cache=%s config_hash=%s',
+                 REGISTRATION_LOGIC_VERSION, LOGIC_VERSION, CODE_VERSION, CACHE_SCHEMA, digest(asdict(cfg))[:12])
     if phase == 'interactive':
         return run_interactive(args, cfg)
     if phase == 'status':
@@ -3247,12 +3381,17 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
         print(f'[信用診断] {len(records)}銘柄。取得元の価格基準日・採点結果は保持しています。', flush=True)
         return 0
     if phase == 'analyze':
-        path = analyze_store(store, cfg, args.output_dir, args.top, args.snapshot_id, asof, cutoff)
+        path = analyze_store(store, cfg, args.output_dir, args.top, args.snapshot_id, asof, cutoff,args.margin_snapshot_id)
         print('[出力] ' + str(path), flush=True)
         meta = json.loads((path/'run_manifest.json').read_text('utf-8'))
         summary = json.loads((path/'filter_summary.json').read_text('utf-8'))
         gates = summary.get('gate_counts', {})
         core_count = int((gates.get('core_candidate') or {}).get('true', 0) or 0)
+        registration=summary.get('registration',{})
+        print('[登録検討候補] A={} / B={} / 価格の経過営業日={} / 信用入力={}'.format(
+            registration.get('a',{}).get('eligible_count',0),registration.get('b',{}).get('eligible_count',0),
+            meta.get('registration_price_age_bd'),meta.get('registration_margin_snapshot_id') or '通常snapshot'),flush=True)
+        print('[A・Bレポート] '+str(path/'report_registration_top10.md'),flush=True)
         print('[集計] 収集済み={}/{} / core={} / eligible={}'.format(
             meta.get('complete_symbol_count', 0), meta.get('ordinary_master_count', 0),
             core_count, summary.get('eligible_count', 0)), flush=True)
@@ -3271,7 +3410,11 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
         result = single_from_run(args.code, args.output_dir, args.run_id)
         print(json.dumps({k: result.get(k) for k in (
             'run_id', 'code', 'name', 'candidate_lane', 'eligible_new_entry',
-            'fundamental_edge_score', 'recommendation_score', 'gate_reasons'
+            'fundamental_edge_score', 'recommendation_score', 'gate_reasons',
+            'registration_a_eligible','registration_a_rank','registration_a_score','registration_a_reasons',
+            'registration_b_eligible','registration_b_rank','registration_b_score','registration_b_reasons',
+            'registration_supply_state','registration_supply_reasons','registration_price_state',
+            'registration_growth_a_state','registration_growth_b_state','registration_price_age_bd'
         )}, ensure_ascii=False, indent=2), flush=True)
         return 0
     if phase == 'cache-audit':
