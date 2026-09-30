@@ -199,6 +199,20 @@ def markdown_report(records: list[dict], meta: dict, top: int = 10) -> str:
              f"A適格 {counts['a']['eligible_count']}件 / B適格 {counts['b']['eligible_count']}件 / 両枠適格 {counts['overlap_count']}件 / 保留のみ {counts['review_count']}件。上限まで候補を水増ししません。", ""]
     if meta.get("global_issues"):
         lines += ["入力全体の確認事項: " + _escape(_reasons(meta["global_issues"])), ""]
+    workflow = meta.get("screening_workflow") or {}
+    if meta.get("screening_scope"):
+        scope_counts = workflow.get("counts") or {}
+        lines += [
+            "対象: 一般投資家向け市場の普通株 / TOKYO PRO MARKETは対象外。",
+            "収集対象 {}件 / 取得済み {}件 / 未評価 {}件 / 市場による対象外 {}件。".format(
+                _escape(scope_counts.get("target_count")), _escape(scope_counts.get("complete_count")),
+                _escape(scope_counts.get("unavailable_count")), _escape(scope_counts.get("scope_excluded_count"))),
+            "信用取得: 完了 {}件 / 失敗 {}件 / 未処理 {}件。".format(
+                _escape(scope_counts.get("credit_completed_count")), _escape(scope_counts.get("credit_failed_count")),
+                _escape(scope_counts.get("credit_pending_count"))),
+            "財務全履歴の最終取得（対象内の最古）: " + _escape(workflow.get("oldest_last_full_financial_at")),
+            "未評価の理由は screening_unavailable.csv、市場による対象外は scope_excluded.csv を参照してください。", ""]
+    lines += ["信用取得の情報締切: " + _escape(meta.get("registration_margin_snapshot_cutoff")), ""]
     for lane, title in (("a", "A：割安で財務と成長根拠がある企業"),
                         ("b", "B：高成長と信用売残を確認するスイング候補")):
         candidates = selected[f"top_registration_{lane}.csv"]

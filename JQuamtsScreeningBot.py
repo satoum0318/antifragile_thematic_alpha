@@ -47,10 +47,12 @@ from jq_margin import adapt_margin_bundle, margin_diagnostic as _margin_diagnost
 import jq_margin_workflow
 import jq_universe
 import jq_universe_report
+import jq_screening_workflow
+import jq_screening_ui
 
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
 REGISTRATION_LOGIC_VERSION = jq_universe.UNIVERSE_LOGIC_VERSION
-CODE_VERSION = '1.2.0-rc1-universe-ab'
+CODE_VERSION = '1.3.0-rc1-guided-screening'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -2033,7 +2035,7 @@ def _update_collection_failures(store: Store, snap: dict) -> None:
 
 def _snapshot_stock_counts(store: Store, snap: dict) -> tuple[int, int]:
     try:
-        master = master_records(bundle_rows(store, (snap.get('globals') or {}).get('master')))
+        master = screening_master_records(bundle_rows(store, (snap.get('globals') or {}).get('master')), snap)
         codes = {m['code'] for m in master if m.get('instrument_type') == 'stock'}
     except (DataError, KeyError, ValueError, TypeError):
         codes = set()
@@ -2068,6 +2070,17 @@ def collection_status(store: Store) -> dict:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             out['resume_error'] = 'collection_resume_invalid'
     out['terminal_failures'] = len((_load_collection_failures(store).get('failures') or {}))
+    if snap.get('screening_scope'):
+        # The legacy registry is historical and can still contain TPM or since-
+        # recovered symbols. It must not be presented as this workflow's errors.
+        included=set(snap['screening_scope'].get('included_codes',[]))
+        out['legacy_terminal_failures']=out['terminal_failures']
+        out['terminal_failures']=sum(
+            snap.get('symbols',{}).get(c,{}).get('screening_availability')=='collection_failed'
+            for c in included)
+        out['legacy_resume_remaining']=out['resume_remaining']
+        out['resume_remaining']=0
+        out['scope_excluded']=len(snap['screening_scope'].get('excluded',[]))
     return out
 
 
@@ -2449,6 +2462,8 @@ def collect(client: Client, budget: int, force: bool=False, only_codes: Optional
             if item['complete']:
                 item['financial_checked_through'] = item['collected_at']
                 item['earnings_checked_through'] = item['collected_at']
+                item['last_full_price_at'] = item['collected_at']
+                item['last_full_financial_at'] = item['collected_at']
                 snap['symbols'][code] = item
                 completed_codes.append(code)
                 retry_counts.pop(code, None)
@@ -2545,42 +2560,74 @@ def merge_daily_rows(old: list[dict], new: list[dict], kind: str) -> list[dict]:
     return [merged[k] for k in sorted(merged)]
 
 
-def update_daily(client: Client, from_date: Optional[dt.date]=None) -> dict:
+def screening_master_records(rows: list[dict], snap: dict) -> list[dict]:
+    """Apply only the explicitly saved workflow scope; historical inputs keep their scope."""
+    records = master_records(rows)
+    scope = snap.get('screening_scope')
+    if scope is None:
+        return records
+    if not isinstance(scope, dict) or scope.get('kind') != 'retail_ordinary':
+        raise DataError('unsupported_screening_scope')
+    if not isinstance(scope.get('included_codes'), list):
+        raise DataError('screening_scope_missing_codes')
+    included = set(scope['included_codes'])
+    for row in records:
+        if row['instrument_type'] == 'stock' and (row['code'] not in included or row['Mkt'] == '0105'):
+            row.update(instrument_type='out_of_scope',
+                       master_reason='tokyo_pro_market' if row['Mkt'] == '0105' else 'outside_saved_scope')
+    return records
+
+
+def update_daily(client: Client, from_date: Optional[dt.date]=None, *,
+                 source_snapshot: Optional[dict]=None, global_context: Optional[tuple]=None,
+                 promote: bool=True, progress: Any=None) -> dict:
     """Refresh all previously initialized symbols via date requests, not API cursor.
 
-    The overlap begins at the oldest per-symbol verification date. Calendar days
-    are included for financial/earnings publication. Late corrections carrying
-    older disclosure dates require periodic full symbol refresh (documented).
+    Price, financial and earnings coverage have separate clocks. Recheck seven
+    calendar days for delayed publication; older corrections need full refresh.
+    A workflow can stage the result without moving the normal latest pointer.
     """
-    store=client.store;previous=store.snapshot()
+    store=client.store;previous=source_snapshot if source_snapshot is not None else store.snapshot()
     if not previous:raise CollectionError('First run collect; there is no initial history to update')
     snap=copy.deepcopy(previous);snap.update(snapshot_id=new_id('s_'),status='incomplete',errors=[],
                                            parent_snapshot_id=previous.get('snapshot_id'))
     completed=False
     try:
-        snap['globals'],t=collect_globals(client)
+        snap['globals'],t=global_context if global_context is not None else collect_globals(client)
         snap['price_asof_date']=str(t)
-        master=master_records(bundle_rows(store,snap['globals']['master']))
+        master=screening_master_records(bundle_rows(store,snap['globals']['master']),snap)
         allowed={m['api_code']:m['code'] for m in master if m['instrument_type']=='stock'}
         symbols={c:i for c,i in snap.get('symbols',{}).items() if i.get('complete') and c in set(allowed.values())}
-        if not symbols:raise CollectionError('No complete symbol histories')
-        oldest=min(date(i.get('financial_checked_through')) or date(previous['price_asof_date']) for i in symbols.values())
-        start=from_date or oldest
-        if start>oldest:raise CollectionError('update-from would skip unverified financial dates')
+        if not symbols and source_snapshot is None:raise CollectionError('No complete symbol histories')
+        fallback=date(previous.get('price_asof_date')) or t
+        coverage=[date(i.get(key)) or fallback for i in symbols.values()
+                  for key in ('checked_price_date','financial_checked_through','earnings_checked_through')]
+        oldest=min(coverage,default=fallback)
+        latest_start=oldest-dt.timedelta(days=6)
+        if from_date is not None and from_date>oldest:
+            raise CollectionError('update-from would skip unverified price, financial or earnings dates')
+        start=min(from_date,latest_start) if from_date is not None else latest_start
         end=now_jst().date()
         data={c:{k:bundle_rows(store,item.get(k)) for k in ('prices','summary','earnings')} for c,item in symbols.items()}
         sessions=trading_sessions(bundle_rows(store,snap['globals']['calendar']))
+        if t < fallback and symbols:raise CollectionError('update_price_date_would_move_backwards')
         d=start;raw_update_refs=[]
+        if progress is not None:
+            progress.update(phase='価格・財務の日付更新', total=(end-start).days+1, completed=0, code=None)
         while d<=end:
             endpoints=[('summary','fins/summary'),('earnings','fins/earnings-date')]
             if d<=t and pd.Timestamp(d) in sessions:endpoints.insert(0,('prices','equities/bars/daily'))
             for kind,ep in endpoints:
+                if progress is not None:progress.update(phase=f'価格・財務の日付更新 {d} / {kind}')
                 blob=client.fetch(ep,{'date':str(d)})
+                if blob.get('status')!='complete':raise CollectionError('daily_update_not_complete:'+ep)
                 raw_update_refs.append(store.put(blob))
                 for raw in blob['rows']:
                     c=allowed.get(str(raw.get('Code') or ''))
                     if c in data:data[c][kind]=merge_daily_rows(data[c][kind],[raw],kind)
-            LOG.info('日付更新 %s',d);d+=dt.timedelta(days=1)
+            LOG.info('日付更新 %s',d)
+            if progress is not None:progress.update(completed=(d-start).days+1)
+            d+=dt.timedelta(days=1)
         observed=now_jst().isoformat()
         for c,content in data.items():
             for kind,rows in content.items():
@@ -2589,14 +2636,27 @@ def update_daily(client: Client, from_date: Optional[dt.date]=None) -> dict:
                     'update_raw_refs':raw_update_refs})
             snap['symbols'][c].update(checked_price_date=str(t),collected_at=observed,
                                      financial_checked_through=observed,earnings_checked_through=observed)
+            # A successful HTTP response alone does not prove this symbol has
+            # the requested market day's row. Do not advance it into ranking.
+            dates={date(row.get('Date')) for row in content['prices']}
+            if t not in dates:
+                snap['symbols'][c].update(complete=False, failure_reason='latest_price_row_missing',
+                                          daily_update_status='price_unavailable',
+                                          checked_price_date=previous['symbols'][c].get('checked_price_date'))
+                snap['errors'].append({'code':c,'reason':'latest_price_row_missing'})
+            else:
+                snap['symbols'][c]['daily_update_status']='complete'
         snap['information_cutoff']=observed;snap['created_at']=observed
         n=sum(m['instrument_type']=='stock' for m in master)
-        snap['status']='complete' if len(symbols)==n else 'partial_universe'
-        snap['pending_count']=n-len(symbols);completed=True
+        complete_count=sum(snap.get('symbols',{}).get(c,{}).get('complete') is True for c in allowed.values())
+        snap['status']='complete' if complete_count==n else 'partial_universe'
+        snap['pending_count']=n-complete_count
+        snap['daily_update_window']={'from':str(start),'through':str(end),'overlap_calendar_days':7}
+        completed=True
         return snap
     finally:
         if not completed:snap['status']='incomplete';snap['failure_at']=now_jst().isoformat()
-        store.save_snapshot(snap,promote=completed)
+        store.save_snapshot(snap,promote=completed and promote)
 
 
 # ---- Analysis pipeline: no Client, Session or credential lookup --------------
@@ -2614,6 +2674,11 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
        'market_cap':None,'market_cap_ok':None,'op_income_stable':None,
        'ma200_state':'ma200_unknown','earnings_blackout':False,
        'data_review_level':'none','model_scope':m.get('model_scope','nonfinancial')}
+    r.update(collection_availability=item.get('screening_availability'),
+             collection_unavailable_reason=item.get('screening_unavailable_reason') or item.get('failure_reason'),
+             last_full_financial_at=item.get('last_full_financial_at'),
+             last_full_price_at=item.get('last_full_price_at'),
+             financial_checked_through=item.get('financial_checked_through'))
     r.update(risk_context(cfg,m['code'],cutoff))
     if m['instrument_type']!='stock':return r,[]
     if not item.get('complete'):
@@ -2843,7 +2908,7 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
     if next_trade is None:global_issues.append('next_trading_session_unknown')
     rawmaster=bundle_rows(store,globals.get('master'))
     if not rawmaster:global_issues.append('master_missing')
-    master=master_records(rawmaster)
+    master=screening_master_records(rawmaster,snap)
     if any(date(m.get('master_date'))!=t for m in master):global_issues.append('master_asof_mismatch')
     topix=bundle_rows(store,globals.get('topix'))
     regime=market_regime(topix,sessions,t)
@@ -2883,6 +2948,9 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
     records.sort(key=rank_key)
     complete_count=sum(snap.get('symbols',{}).get(r['code'],{}).get('complete',False) for r in records)
     status='diagnostic_only' if global_issues else 'partial_universe' if complete_count<len(records) or any(r.get('common_issues') for r in records) else 'complete'
+    workflow_counts=(snap.get('screening_workflow') or {}).get('counts') or {}
+    if status=='complete' and any(workflow_counts.get(k,0) for k in ('credit_failed_count','credit_pending_count')):
+        status='partial_universe'
     meta={'price_asof_date':str(t),'information_cutoff':information.isoformat(),'snapshot_id':snap.get('snapshot_id'),
           'logic_version':LOGIC_VERSION,'code_version':CODE_VERSION,'schema':CACHE_SCHEMA,
           'next_trade_date':str(next_trade) if next_trade else None,'run_status':status,
@@ -2890,6 +2958,8 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
           'eligible_count':sum(r['eligible_new_entry'] for r in records),'percentile_universe_id':universe_id,
           'pit_quality':'archived_input_snapshot_not_guaranteed_historical_vintage',
           'non_stock_master_rows':[m for m in master if m['instrument_type']!='stock'],
+          'screening_scope':snap.get('screening_scope'),
+          'screening_workflow':snap.get('screening_workflow'),
           'config':asdict(cfg),'config_hash':digest(asdict(cfg)),'input_hash':digest(snap),
           **registration_meta}
     return clean(records),clean(benchmarks),clean(meta)
@@ -2969,7 +3039,8 @@ def markdown_report(records: list[dict], meta: dict, top: int) -> str:
 
 
 def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
-              top: int=10, run_id: Optional[str]=None) -> Path:
+              top: int=10, run_id: Optional[str]=None,
+              publication_check: Optional[Callable[[],None]]=None) -> Path:
     run_id=run_id or new_id('r_')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+',run_id):raise DataError('invalid_run_id')
     rows=copy.deepcopy(records);meta=copy.deepcopy(meta);meta['run_id']=run_id
@@ -2978,7 +3049,7 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
     meta['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
     meta['source_sha256_by_file']={name:hashlib.sha256((source.parent/name).read_bytes()).hexdigest()
         for name in ('JQuamtsScreeningBot.py','jq_margin.py','jq_margin_workflow.py',
-                     'jq_universe.py','jq_universe_report.py')}
+                     'jq_universe.py','jq_universe_report.py','jq_screening_workflow.py','jq_screening_ui.py')}
     for r in rows:r['run_id']=run_id;r.setdefault('logic_version',LOGIC_VERSION);r.setdefault('code_version',CODE_VERSION)
     meta['result_hash_excluding_run_id']=digest([{k:v for k,v in r.items() if k!='run_id'} for r in rows])
     history=output/'history';history.mkdir(parents=True,exist_ok=True)
@@ -3002,8 +3073,12 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
     for lane in SOFT_BASES:
         groups.setdefault(lane+'_candidates.csv',[r for r in rows if r.get('candidate_lane')==lane])
     groups['non_stock_excluded.csv']=meta.get('non_stock_master_rows',[])
+    groups['scope_excluded.csv']=(meta.get('screening_scope') or {}).get('excluded',[])
+    groups['screening_unavailable.csv']=[r for r in rows if 'symbol_collection_incomplete' in r.get('common_issues',[])]
     try:
-        for name,data in groups.items():atomic_bytes(stage/name,csv_bytes(data,cols))
+        for name,data in groups.items():
+            output_cols=['code','api_code','name','Mkt','reason'] if name=='scope_excluded.csv' else cols
+            atomic_bytes(stage/name,csv_bytes(data,output_cols))
         atomic_json(stage/'screening_results.json',rows)
         atomic_json(stage/'sector_benchmarks.json',benchmarks)
         counts={k:dict(Counter('unknown' if r.get(k) is None else str(r.get(k)).lower() for r in rows)) for k in
@@ -3020,6 +3095,7 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
                      jq_universe_report.markdown_report(rows,meta,top).encode('utf-8'))
         meta['outputs']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(stage.iterdir())}
         atomic_json(stage/'run_manifest.json',meta)
+        if publication_check is not None:publication_check()
         os.replace(stage,final)
         # Complete history is immutable; publish display and then its pointer.
         latest_parent=output/'reports';latest_parent.mkdir(parents=True,exist_ok=True)
@@ -3046,15 +3122,31 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
 def analyze_store(store: Store, cfg: Config, output: Path, top: int=10,
                   snapshot_id: Optional[str]=None, asof: Optional[dt.date]=None,
                   cutoff: Optional[dt.datetime]=None,
-                  margin_snapshot_id: Optional[str]=None) -> Path:
+                  margin_snapshot_id: Optional[str]=None, *, require_current: bool=False) -> Path:
     snap=store.snapshot(snapshot_id)
     if not snap:raise DataError('凍結スナップショットがありません。先にメニュー1または --phase collect_all を実行してください')
     LOG.info('[分析開始] スナップショット=%s / 収集済み=%s銘柄（API通信なし）',snap.get('snapshot_id'),sum(i.get('complete') is True for i in snap.get('symbols',{}).values()))
     LOG.info('[登録候補] 信用入力=%s / 価格・財務の情報締切は元snapshotを保持',
              margin_snapshot_id or '通常snapshot内の信用残')
     records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff,margin_snapshot_id)
+    if require_current and (meta['run_status']=='diagnostic_only' or
+                            meta.get('registration_price_age_bd') != 0):
+        raise DataError('screening_inputs_not_current_or_verified: '+
+                        ','.join(meta.get('global_issues') or ['price_not_current']))
+    def confirm_publication_date():
+        # Ranking may take long enough to cross the next daily boundary. Never
+        # relabel a frozen result as current just because its own cutoff is old.
+        calendar_rows=bundle_rows(store,snap.get('globals',{}).get('calendar'))
+        current=registration_price_context(trading_sessions(calendar_rows),
+                                            date(meta['price_asof_date']),now_jst(),calendar_rows)
+        if current['registration_price_age_bd'] != 0:
+            raise DataError('screening_market_date_changed_during_analysis:run_screen_again')
     with ProcessLock(output,'analysis'):
-        path=write_run(records,stats,meta,output,top)
+        if require_current:
+            confirm_publication_date()
+            path=write_run(records,stats,meta,output,top,publication_check=confirm_publication_date)
+        else:
+            path=write_run(records,stats,meta,output,top)
     LOG.info('分析完了: A=%s B=%s 旧方式=%s status=%s -> %s',
              meta['registration_counts']['a']['eligible_count'],meta['registration_counts']['b']['eligible_count'],
              meta['eligible_count'],meta['run_status'],path)
@@ -3194,6 +3286,10 @@ def update_sector_statistics(store: Store, cfg: Config, output: Path,
 
 
 def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
+    return jq_screening_ui.run_interactive(sys.modules[__name__], args, cfg)
+
+
+def run_advanced_interactive(args: argparse.Namespace, cfg: Config) -> int:
     print(f'キャッシュ: {args.cache_dir.resolve()}', flush=True)
     print(f'出力先: {args.output_dir.resolve()}', flush=True)
     print('全銘柄収集は件数入力なしで、完了または上限付き再試行終了まで自動継続します。', flush=True)
@@ -3201,23 +3297,23 @@ def run_interactive(args: argparse.Namespace, cfg: Config) -> int:
     while True:
         print('', flush=True)
         print_collection_status(Store(args.cache_dir), compact=True)
-        print('\n=== メニュー ===', flush=True)
-        print('1) 全銘柄を収集・続きから再開（推奨）')
+        print('\n=== 詳細操作（旧メニュー番号） ===', flush=True)
+        print('1) 未取得・未完了銘柄を収集（既存の価格基準日は保持）')
         print('2) オフライン一括分析（A・B登録候補／旧方式比較）')
         print('3) 単銘柄の採点済み結果を表示')
-        print('4) 日付単位で差分更新（収集済み銘柄）')
+        print('4) 価格・財務・決算予定の差分更新（収集済み銘柄）')
         print('5) 収集状況・ロック状態を詳しく表示')
-        print('6) 鮮度を指定して全銘柄を再収集')
+        print('6) 価格確認日を指定して再収集（財務全履歴の鮮度判定ではありません）')
         print('7) 全銘柄を強制再収集（確認あり）')
         print('8) キャッシュ・生フィールド監査（通信なし）')
         print('9) セクター統計を再計算（通信なし）')
         print('10) 信用残だけを更新・続きから再開（価格基準日を保持）')
         print('11) 信用残の診断を出力（通信なし）')
         print('12) 取得した信用残を指定してA・B分析（通信なし）')
-        print('q) 終了', flush=True)
+        print('q) 通常メニューに戻る', flush=True)
         choice = _interactive_input('選択: ').lower()
         if choice == 'q':
-            print('[終了] 終了しました', flush=True)
+            print('通常メニューに戻ります', flush=True)
             return 0
         if choice == '5':
             print_collection_status(Store(args.cache_dir), compact=False)
@@ -3307,7 +3403,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--phase', choices=[
         'collect', 'collect_all', 'update', 'analyze', 'single', 'interactive',
         'fields-audit', 'cache-audit', 'sector-update', 'status',
-        'margin_refresh', 'margin_analyze'
+        'margin_refresh', 'margin_analyze', 'screen', 'show-report'
     ], default='interactive', help='引数なしで日本語の対話メニュー')
     default_config = Path(__file__).resolve().parent / 'config.json'
     p.add_argument('--config', type=Path, default=(default_config if default_config.is_file() else None),
@@ -3367,8 +3463,19 @@ def dispatch(args: argparse.Namespace, cfg: Config) -> int:
                  REGISTRATION_LOGIC_VERSION, LOGIC_VERSION, CODE_VERSION, CACHE_SCHEMA, digest(asdict(cfg))[:12])
     if phase == 'interactive':
         return run_interactive(args, cfg)
+    if phase == 'screen':
+        incompatible=('asof','information_cutoff','snapshot_id','margin_snapshot_id','run_id',
+                      'code','codes','update_from','refresh_days','force_refresh','force_full',
+                      'force','reset_pending','once','max_batches')
+        if any(getattr(args,key,None) is not None and getattr(args,key,None) is not False
+               for key in incompatible):
+            raise DataError('一括更新は最新の対象全体を確認します。過去日・銘柄限定・強制指定は詳細操作で指定してください')
+        return jq_screening_workflow.run_screening(sys.modules[__name__], args, cfg)
+    if phase == 'show-report':
+        return jq_screening_ui.show_saved_report(args.output_dir, args.cache_dir)
     if phase == 'status':
         print_collection_status(store, compact=False)
+        jq_screening_ui.print_workflow_status(args.cache_dir)
         return 0
     if phase == 'margin_analyze':
         if args.snapshot_id or args.asof:
@@ -3566,7 +3673,7 @@ def main(argv: Optional[list[str]]=None) -> int:
     try:return dispatch(args,Config.load(args.config))
     except (KeyboardInterrupt,EOFError):
         LOG.warning('[中断] キーボード終了を受け付けました。未完了の分析結果は公開しません')
-        LOG.info('[終了] 終了しました。収集済みの完了分は、同じ保存先のメニュー1/5で再開時に再利用します')
+        LOG.info('[終了] 保存済みの完了分は再利用します。通常操作は再起動後の「1」で再開してください')
         return 130
     except (DataError,CollectionError,OSError,ValueError,KeyError) as e:
         LOG.error('%s',e);return 1
