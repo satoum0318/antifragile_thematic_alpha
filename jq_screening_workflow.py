@@ -259,17 +259,28 @@ def run_screening(bot, args, cfg) -> int:
               'started_at': bot.now_jst().isoformat(), 'reason': None, 'source_snapshot_id': None,
               'margin_snapshot_id': None, 'run_id': None, 'counts': {}}
 
-    def checkpoint(stage, work=None):
+    def checkpoint(stage, work=None, *, best_effort=False):
         status.update(stage=stage, updated_at=bot.now_jst().isoformat())
         if work is not None:
             counts = {**_counts(work), **{k: v for k, v in status.get('counts', {}).items() if k.startswith('credit_')}}
             status.update(counts=counts, price_asof_date=work.get('price_asof_date'),
                           information_cutoff=work.get('information_cutoff'), **_full_summary(work))
             journal['work'] = work
+        pending = []
         if journal is not None:
             journal['stage'] = stage
-            bot.atomic_json(resume_path, journal)
-        bot.atomic_json(status_path, status)
+            pending.append((resume_path, journal))
+        pending.append((status_path, status))
+        saved = True
+        for path, payload in pending:
+            try:
+                bot.atomic_json(path, payload)
+            except (OSError, ValueError, TypeError) as exc:
+                if not best_effort:
+                    raise
+                saved = False
+                bot.LOG.error('[状態保存失敗] %s / %s', path, exc)
+        return saved
 
     def publication_warning(reason):
         status.update(status='partial', stage='done', reason='result_published_metadata_warning:'+str(reason),
@@ -433,14 +444,16 @@ def run_screening(bot, args, cfg) -> int:
             if published_path is not None:
                 return publication_warning('interrupted_after_publication')
             status.update(status='interrupted', reason='user_interrupted')
-            checkpoint(status['stage'], locals().get('work'))
-            bot.LOG.warning('[中断] 完了済みの履歴取得を保存しました。最新スクリーニングで再開できます')
+            if checkpoint(status['stage'], locals().get('work'), best_effort=True):
+                bot.LOG.warning('[中断] 完了済みの履歴取得を保存しました。最新スクリーニングで再開できます')
+            else:
+                bot.LOG.warning('[中断] 中断時の状態を完全には保存できませんでした。前回の保存地点から再開してください')
             return 130
         except (bot.CollectionError, bot.DataError, OSError, ValueError, KeyError, TypeError) as exc:
             if published_path is not None:
                 return publication_warning(exc)
             status.update(status='failed', reason=str(exc))
-            checkpoint(status['stage'], locals().get('work'))
+            checkpoint(status['stage'], locals().get('work'), best_effort=True)
             bot.LOG.error('[更新停止] %s。直前の公開済みランキングは保持します', exc)
             return 1
         finally:

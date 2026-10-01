@@ -52,7 +52,7 @@ import jq_screening_ui
 
 LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
 REGISTRATION_LOGIC_VERSION = jq_universe.UNIVERSE_LOGIC_VERSION
-CODE_VERSION = '1.3.0-rc1-guided-screening'
+CODE_VERSION = '1.3.0-rc2-guided-screening'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -225,10 +225,27 @@ def atomic_bytes(path: Path, data: bytes) -> None:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
-        os.replace(tmp, path)
+        # Windows readers/scanners can briefly deny replacement even after our
+        # own handle is closed. Keep the old file intact throughout each retry.
+        delays = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
+        for attempt in range(len(delays)+1):
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError as exc:
+                if getattr(exc, 'winerror', None) not in {5, 32, 33} or attempt == len(delays):
+                    raise
+                if attempt == 0:
+                    LOG.warning('[保存再試行] %s の置き換えが拒否されました。短い待機を挟んで再試行します: %s', path, exc)
+                time.sleep(delays[attempt])
     finally:
-        if os.path.exists(tmp):
+        try:
             os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # Cleanup must not hide the write/replace error (or undo success).
+            LOG.warning('[一時ファイル削除失敗] %s / %s', tmp, exc)
 
 
 def atomic_json(path: Path, obj: Any) -> None:

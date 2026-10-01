@@ -1,6 +1,6 @@
 # A・B登録候補スクリーニング 初期実装
 
-2026-09-30 JST。コード版 `1.3.0-rc1-guided-screening`、登録候補ロジック `JQ-UNIVERSE-AB-1.0-rc1`。
+2026-10-01 JST。コード版 `1.3.0-rc2-guided-screening`、登録候補ロジック `JQ-UNIVERSE-AB-1.0-rc1`。rc2はWindowsでの保存失敗への対策で、A/Bの判定条件は変更していません。詳細は [リリースノート](../CHANGELOG.md) を参照。
 一括操作の開発ブランチは `feat/jquants-guided-screening-20260930`。A/B初期実装は `feat/jquants-value-growth-swing-20260930` に保存。
 
 本書は [合意した方針](JQuants_Margin_Daily_Implementation.md#追加合意割安成長aと高成長信用売残b) を初期実装へ具体化した仕様です。ユーザーの実装指示を受け、未確定だった数値条件を、変更可能なRC初期値として下記に固定しました。投資成績から最適化・検証済みの閾値ではありません。将来の閾値変更は設定・ロジック版・比較結果を記録します。

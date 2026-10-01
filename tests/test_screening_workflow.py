@@ -363,3 +363,82 @@ def test_cleanup_failure_after_publication_reports_published_result_not_old_rete
     assert json.loads((h.args.output_dir/'latest_run.json').read_text('utf-8'))['run_id'] == 'r_1'
     assert '公開済み' in caplog.text
     assert '公開済みランキングは保持' not in caplog.text
+
+
+def test_transient_resume_replace_failure_completes_screening(harness, monkeypatch):
+    h = harness
+    h.seed()
+    replace, failures = bot.os.replace, []
+
+    def briefly_locked(source, destination):
+        if (Path(destination).name == 'screening_workflow_resume.json' and not failures
+                and json.loads(Path(source).read_text('utf-8'))['stage'] == 'full_history'):
+            error = PermissionError('simulated_temporary_lock')
+            error.winerror = 5
+            failures.append(error)
+            raise error
+        return replace(source, destination)
+
+    monkeypatch.setattr(bot.os, 'replace', briefly_locked)
+    monkeypatch.setattr(bot.time, 'sleep', lambda _: None)
+    assert h.run() == 0
+    assert len(failures) == 1
+    assert h.store.snapshot()['snapshot_id'] == h.runs[0][0]['snapshot_id']
+    assert not (h.store.root/'screening_workflow_resume.json').exists()
+
+
+@pytest.mark.parametrize('block_status', [False, True], ids=['resume-locked', 'all-state-locked'])
+def test_persistent_checkpoint_failure_preserves_report_and_original_error(harness, monkeypatch, caplog, block_status):
+    h = harness
+    h.seed()
+    bot.atomic_json(h.args.output_dir/'latest_run.json', {'run_id': 'old_report'})
+    h.fail_update = True
+    assert h.run() == 1
+    resume = h.store.root/'screening_workflow_resume.json'
+    before = resume.read_bytes()
+    h.fail_update = False
+    atomic_json = bot.atomic_json
+    blocked = {'screening_workflow_resume.json'}
+    if block_status:
+        blocked.add('screening_workflow_status.json')
+
+    def locked_checkpoint(path, payload):
+        if path.name in blocked:
+            raise PermissionError('simulated_persistent_lock:'+path.name)
+        return atomic_json(path, payload)
+
+    monkeypatch.setattr(bot, 'atomic_json', locked_checkpoint)
+    assert h.run() == 1
+    assert resume.read_bytes() == before
+    assert h.store.snapshot()['snapshot_id'] == 'original'
+    assert json.loads((h.args.output_dir/'latest_run.json').read_text('utf-8'))['run_id'] == 'old_report'
+    assert not h.runs
+    assert all(client.closed for client in h.clients)
+    assert '[状態保存失敗]' in caplog.text
+    assert '[更新停止] simulated_persistent_lock:screening_workflow_resume.json' in caplog.text
+    if not block_status:
+        status = json.loads((h.store.root/'screening_workflow_status.json').read_text('utf-8'))
+        assert status['status'] == 'failed'
+        assert status['reason'] == 'simulated_persistent_lock:screening_workflow_resume.json'
+    monkeypatch.setattr(bot, 'atomic_json', atomic_json)
+    assert h.run() == 0
+
+
+def test_interrupt_with_locked_checkpoint_does_not_claim_state_was_saved(harness, monkeypatch, caplog):
+    h = harness
+    h.interrupt_code = '10010'
+    atomic_json = bot.atomic_json
+
+    def locked_after_interrupt(path, payload):
+        if path.name == 'screening_workflow_resume.json' and h.calls:
+            raise PermissionError('simulated_checkpoint_lock_at_interrupt')
+        return atomic_json(path, payload)
+
+    monkeypatch.setattr(bot, 'atomic_json', locked_after_interrupt)
+    assert h.run() == 130
+    status = json.loads((h.store.root/'screening_workflow_status.json').read_text('utf-8'))
+    assert status['status'] == 'interrupted'
+    assert '中断時の状態を完全には保存できませんでした' in caplog.text
+    assert '完了済みの履歴取得を保存しました' not in caplog.text
+    assert not h.runs and h.store.snapshot() == {}
+    assert all(client.closed for client in h.clients)
