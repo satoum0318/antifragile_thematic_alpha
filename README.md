@@ -2,8 +2,8 @@
 
 J-Quants APIを使用した投資銘柄スクリーニングシステム
 
-開発版コード：`1.3.0-rc2-guided-screening`。通常メニューの「1」でデータ更新からA・B候補の出力まで実行します。
-登録候補ロジックは `JQ-UNIVERSE-AB-1.0-rc1`。旧 `JQ-STD-CORRECTED-1.0-rc1` の順位も比較用に保存します。
+コード版 `1.4.0-rc2-swing-review`。通常メニューの「1」でデータ更新からA・B候補の出力まで実行します。
+登録候補ロジックは `JQ-UNIVERSE-AB-1.2-rc1`。基礎データ計算と旧方式比較は `JQ-STD-CORRECTED-1.1-rc1` で識別します。
 [A・Bの条件・初期値・操作](docs/JQuants_Universe_AB_Implementation.md) /
 [A・B導入前のrc2版へ復元](archive/jquants-1.1.0-rc2-before-ab-20260930/README.md) /
 [信用残の操作・実装範囲](docs/JQuants_Margin_Daily_Implementation.md) /
@@ -93,9 +93,13 @@ output_standard/
 
 完了後は「2」で保存済みレポートを再表示し、詳しく見たい銘柄は「3」で銘柄コードを入力します。選ぶ銘柄はご自身で判断して別の売買Botへ登録し、確認が終わったら `q` で終了してください。次回、最新情報で選び直すときは再び「1」です。
 
-候補が0件または10件未満でも、追加の分析操作で件数を埋める必要はありません。Bは有効な20営業日の売残変化を優先し、未計算なら5営業日の変化を使います。日次信用残の開始直後はどちらも計算できず、履歴不足になります。同日の「1」の繰り返しでは履歴の日数は増えません。レポートの条件未達・未評価理由を確認してください。
+Bには、人が最終判断するための **参考候補を最大2件** 表示します。財務・成長・流動性・評価額を確認できた銘柄から、財務品質・成長・評価額の合計点（既定75点満点）で選び、信用売残の基準未達や履歴不足、株価の弱さ・過熱を併記します。正式なB適格件数・順位とは別欄です。参考候補の全件は `registration_reference_b.csv`、表示する最大2件は `top_registration_reference_b.csv` に保存します。財務不備や重大リスク等が残る銘柄で件数を埋めることはありません。
 
-現在のコード実装タグは `code-v1.3.0-rc2-guided-screening`、リリースタグは `release-v1.3.0-rc2-guided-screening` です。両タグにWindowsでの保存失敗への対策と文書更新を含みます。[リリースノート](CHANGELOG.md) に修正内容・検証結果と前版の運用確認記録を記載しています。
+Bの正式な適格判定では、有効な20営業日の売残変化を優先し、未計算なら5営業日の変化を使います。日次信用残の開始直後は履歴が足りず、正式適格0件のまま参考候補だけが表示される場合があります。同日の「1」の繰り返しでは履歴の日数は増えません。変更を反映するには起動中のプログラムを終了・再起動してください。次回の「1」で新しい形式のレポートが保存され、「2」で再表示できます。過去の保存済みレポートは作成時の内容を保持します。
+
+1.4.0-rc2では、非連結企業の会社予想、取得済みの当日決算予定、信用残の比較日、時価総額の取得元、公開時の想定売買日を修正しています。MA200以上でも終値がMA25未満かつ21営業日騰落率が負なら「反落・条件待ち」とし、正式A/Bの候補を保留します。B参考候補には、その価格条件を確認事項として表示します。長期の評価期間は主軸6〜12か月、補助1〜3年です。
+
+コード実装タグは `code-v1.4.0-rc2-swing-review`、リリースタグは `release-v1.4.0-rc2-swing-review` です。変更内容・検証結果と前版の運用確認記録は [リリースノート](CHANGELOG.md) に記載しています。
 
 ### コマンドラインオプション
 
@@ -125,17 +129,28 @@ python JQuamtsScreeningBot.py --phase margin_analyze
 python JQuamtsScreeningBot.py --phase fields-audit --budget 50
 ```
 
+### 固定期間リターンの確認
+
+`backtest_ic.py` は、保存済みA/Bのスコアと固定期間後のリターンをオフラインで照合します。現行キャッシュを使う場合は、将来の価格まで収録された価格用snapshotを指定できます。分析時の入力と、成績を測るための後日価格の入力を実行記録へ保存します。
+
+```bash
+python backtest_ic.py --master output_standard/history/<実行ID>/screening_offline.csv --cache-dir .jquants_cache_v2_standard --price-snapshot-id <後日価格snapshotのID>
+```
+
+評価開始日は、情報締切とレポート生成時刻の両方を過ぎた最初の寄り付きがある営業日に合わせ、その終値を起点にします。既定ではA・Bの正式適格をそれぞれ集計し、重複銘柄は両枠に含めます。スコアとのICも各枠の適格銘柄で計算します。既定の評価窓は21・63・126・252営業日です。先の価格が未収録の期間は欠測になります。配当再投資・売買コスト・外部売買BotのEXITを含めた成績は別途評価します。
+
 ## ファイル構成
 
 - `runner.py`: 便利なランナースクリプト
 - `JQuamtsScreeningBot.py`: J-Quants V2 Standard オフライン一括スクリーニング
 - `jq_universe.py` / `jq_universe_report.py`: A・Bの登録候補判定と根拠レポート
 - `jq_screening_workflow.py` / `jq_screening_ui.py`: 一括更新・再開・定期再取得と通常メニュー
-- `docs/JQuants_Universe_AB_Implementation.md`: **A・B登録候補の現行仕様**（`JQ-UNIVERSE-AB-1.0-rc1`）
-- `docs/JQuants_Standard_Screening_Logic_Master.md`: **旧方式比較・基礎データ計算の正本**（`JQ-STD-CORRECTED-1.0-rc1`）
+- `docs/JQuants_Universe_AB_Implementation.md`: **A・B登録候補の現行仕様**（`JQ-UNIVERSE-AB-1.2-rc1`）
+- `docs/JQuants_Standard_Screening_Logic_Master.md`: **旧方式比較・基礎データ計算の正本**（`JQ-STD-CORRECTED-1.1-rc1`）
 - `docs/スクリーニング仕様マニュアル.md`: 正本への案内
 - `docs/archive/スクリーニング仕様マニュアル_pre-jq-std-1.0-rc1.md`: 旧正本アーカイブ
 - `config/theme_tags.yaml`: テーマタグ定義
+- `backtest_ic.py`: 保存済み候補の固定期間リターン・IC確認
 - `.jquants_cache_v2_standard/`: 既定キャッシュ。信用残は専用 `margin_snapshots/` に保存
 - `output_standard/`: 既定出力。信用診断は専用 `margin_history/` に保存
 

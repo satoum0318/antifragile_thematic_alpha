@@ -1,39 +1,20 @@
 # -*- coding: utf-8 -*-
-"""
-backtest_ic.py — シンプル forward-return / IC バックテスト
+"""Frozen screening scores and subsequent close-to-close gross returns.
 
-目的:
-- JQuamtsScreeningBot.py が出力する
-  `screening_offline_*.csv` (スナップショット) を入力に、各銘柄の
-  凍結価格キャッシュ (.jquants_cache_v2/frozen/prices/<code>.csv)
-  と突き合わせて forward 21/63/126 営業日リターンを計算する。
-- 各スコア (entry_score / fundamental_edge_score / total_score /
-  piotroski_effective_score / return_252d 等) と forward リターン
-  との Spearman IC、レーン別の勝率・平均リターン・最大DD を出力する。
+Evaluate eligible A/B groups over 21/63/126/252 sessions by default. Standard
+prices use a pinned cache snapshot, its trading calendar and split factors.
+If no Standard snapshot exists, legacy frozen price CSVs remain supported.
+The entry reference is the first close whose session opens after both the
+information cutoff and report generation. Dividends and costs are excluded.
+The return is a fixed-horizon diagnostic without external trading-bot exits.
 
-使い方:
-    python backtest_ic.py \
-        --master output/reports/screening_offline_20260515_091919.csv \
-        --asof 2026-05-15 \
-        --horizons 21,63,126
+Example
+    python backtest_ic.py --master output_standard/history/RUN/screening_offline.csv
+        --price-snapshot-id PRICE_SNAPSHOT --horizons 21,63,126,252
 
-複数の screening_offline_*.csv を渡すと、各日付ごとに集計しつつ
-全体のプール IC も合算する。`--asof` を省略した場合はファイル名から
-タイムスタンプを抽出する (例: screening_offline_YYYYMMDD_HHMMSS.csv)。
-
-出力:
-- `output/backtest/ic_summary.csv`            … スコア × ホライズンごとの IC
-- `output/backtest/lane_stats.csv`            … レーン × ホライズンの勝率/平均/最大DD
-- `output/backtest/per_stock_returns.csv`     … 銘柄 × ホライズン の forward return（明細）
-- `output/backtest/run_meta.json`             … 実行メタ
-
-NOTE:
-- 「真の forward return」を測るためには現時点よりも `max(horizons)` 営業日以上
-  古い `--asof` を指定すること（直近すぎると forward が欠損で計算されない）。
-- 株式分割・配当再投資は調整しない（J-Quants v2 価格列が AdjustmentClose を
-  含む場合は優先採用する）。
-- スピアマン相関は scipy が無くても pandas.rank で計算可能なので外部依存は
-  最小限。
+Each horizon needs horizon + 1 complete session closes. Dates come from the
+sibling run_manifest.json, CSV context or a legacy filename. --asof supplies
+a missing legacy baseline, and future prices remain missing until observed.
 """
 
 from __future__ import annotations
@@ -53,23 +34,15 @@ import pandas as pd
 CACHE_DIR = Path(".jquants_cache_v2")
 FROZEN_PRICES_DIR = CACHE_DIR / "frozen" / "prices"
 DEFAULT_OUT_DIR = Path("output") / "backtest"
+STANDARD_CACHE_DIR = Path(".jquants_cache_v2_standard")
+JST = datetime.timezone(datetime.timedelta(hours=9))
 
 DEFAULT_SCORE_COLUMNS = [
-    "entry_score",
-    "fundamental_edge_score",
-    "total_score",
-    "piotroski_effective_score",
-    "piotroski_adjusted_score",
-    "ps_vs_sector_pre",
-    "return_252d",
-    "momentum_6m_1m",
-    "return_12m_1m",
-    "ma200_timing_score",
-    "safety_criteria_score",
-    "spec_score",
+    "registration_a_score",
+    "registration_b_score",
 ]
 
-DEFAULT_LANE_COLUMN = "candidate_lane"
+DEFAULT_LANE_COLUMN = "registration"
 
 
 def _parse_date(s: str) -> datetime.date:
@@ -83,10 +56,75 @@ def _parse_date(s: str) -> datetime.date:
 
 
 def _infer_asof_from_filename(path: Path) -> Optional[datetime.date]:
-    m = re.search(r"screening_offline_(\d{8})_\d{6}\.csv", path.name)
+    m = re.fullmatch(r"screening_offline_(?:r_)?(\d{8})_\d{6}(?:_\d{6}_[a-z0-9]+)?\.csv", path.name)
     if m:
         return datetime.datetime.strptime(m.group(1), "%Y%m%d").date()
     return None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime.datetime]:
+    if value is None or pd.isna(value):
+        return None
+    parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=JST) if parsed.tzinfo is None else parsed.astimezone(JST)
+
+
+def _screening_context(master_csv: Path, frame: pd.DataFrame, asof: Optional[datetime.date]) -> dict:
+    manifest_path = master_csv.parent / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8")) if manifest_path.is_file() else {}
+    values = {}
+    for key in ("price_asof_date", "information_cutoff", "generated_at", "next_trade_date", "run_id"):
+        observed = frame[key].dropna().astype(str).unique() if key in frame else []
+        if len(observed) > 1:
+            raise ValueError("Mixed screening context: " + key)
+        value = manifest.get(key)
+        if value is not None and len(observed) and str(value) != observed[0]:
+            raise ValueError("Manifest and screening CSV disagree: " + key)
+        values[key] = value if value is not None else observed[0] if len(observed) else None
+    price_day = _parse_date(values["price_asof_date"]) if values["price_asof_date"] else None
+    baseline = asof or price_day or _infer_asof_from_filename(master_csv)
+    if baseline is None:
+        raise ValueError("Screening date unavailable; supply --asof for a legacy CSV")
+    if price_day is not None and baseline < price_day:
+        raise ValueError("--asof precedes the screening price date")
+    timestamps = [_parse_timestamp(values[key]) for key in ("information_cutoff", "generated_at") if values[key]]
+    return {"asof": baseline, "available_after": max(timestamps) if timestamps else None,
+            "next_trade_date": _parse_date(values["next_trade_date"]) if values["next_trade_date"] else None,
+            "run_id": values["run_id"]}
+
+
+def _load_standard_prices(code: str, store: Any, snapshot: dict) -> Optional[pd.DataFrame]:
+    import JQuamtsScreeningBot as bot
+
+    item = snapshot.get("symbols", {}).get(code, {})
+    reference = item.get("prices")
+    if not reference:
+        return None
+    rows = bot.bundle_rows(store, reference)
+    if not rows:
+        return None
+    api_code = str(rows[0].get("Code", ""))
+    if bot.canonical_code(api_code) != code:
+        raise ValueError("Price snapshot code mismatch: " + code)
+    calendar_rows = bot.bundle_rows(store, snapshot.get("globals", {}).get("calendar"))
+    sessions = bot.trading_sessions(calendar_rows)
+    frame = bot.price_frame(rows, api_code, sessions, bot.date(snapshot.get("price_asof_date")))
+    return pd.DataFrame({"date": frame.index.date, "close": frame["AC"].to_numpy()})
+
+
+def _entry_reference_date(prices: pd.DataFrame, context: dict) -> Optional[datetime.date]:
+    possible = prices.loc[prices["date"] > context["asof"], "date"]
+    if context["next_trade_date"] is not None:
+        possible = possible[possible >= context["next_trade_date"]]
+    if context["available_after"] is not None:
+        possible = possible[possible.map(lambda day: datetime.datetime.combine(day, datetime.time(9), JST)
+                                        > context["available_after"])]
+    return possible.iloc[0] if len(possible) else None
+
+
+def _concat_nonempty(frames: List[pd.DataFrame]) -> pd.DataFrame:
+    available = [frame for frame in frames if not frame.empty]
+    return pd.concat(available, ignore_index=True) if available else pd.DataFrame()
 
 
 def _pick_close_column(df: pd.DataFrame) -> Optional[str]:
@@ -138,24 +176,27 @@ def _load_prices_for_code(code: str) -> Optional[pd.DataFrame]:
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df = df.dropna(subset=["date"])
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["close"])
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return df.reset_index(drop=True)
 
 
 def _forward_return_business_days(
-    prices: pd.DataFrame, asof: datetime.date, horizon: int
+    prices: pd.DataFrame, asof: datetime.date, horizon: int,
+    *, entry_date: Optional[datetime.date] = None,
 ) -> Optional[float]:
     """asof より厳密に後 (>) の最初の営業日を起点とし、そこから horizon 営業日後の
     終値を用いて単純リターンを算出する。"""
+    if horizon < 1:
+        raise ValueError("horizon must be positive")
     if prices is None or prices.empty:
         return None
-    sub = prices[prices["date"] > asof]
+    sub = prices[prices["date"] >= entry_date] if entry_date is not None else prices[prices["date"] > asof]
     if sub.empty or len(sub) <= horizon:
         return None
     base = sub.iloc[0]["close"]
-    target = sub.iloc[horizon - 1]["close"]  # horizon 営業日後の終値（=horizon-1 オフセット）
-    if base is None or target is None or base <= 0:
+    target = sub.iloc[horizon]["close"]
+    window = pd.to_numeric(sub.iloc[:horizon + 1]["close"], errors="coerce")
+    if not np.isfinite(window).all() or (window <= 0).any():
         return None
     try:
         return float(target) / float(base) - 1.0
@@ -223,6 +264,7 @@ def run_single_snapshot(
     horizons: List[int],
     score_cols: List[str],
     lane_col: str,
+    *, price_store: Any = None, price_snapshot: Optional[dict] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """1つの screening_offline_*.csv について、forward returns / IC / lane_stats を計算する。
 
@@ -233,31 +275,38 @@ def run_single_snapshot(
     """
     if not master_csv.exists():
         raise FileNotFoundError(f"master_csv not found: {master_csv}")
-    df = pd.read_csv(master_csv, encoding="utf-8-sig")
+    df = pd.read_csv(master_csv, encoding="utf-8-sig", dtype={"code": str})
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     if "code" not in df.columns:
         raise ValueError("master_csv に code 列がありません (flatten 後の CSV を渡してください)")
 
-    asof_eff = asof or _infer_asof_from_filename(master_csv) or datetime.date.today()
+    context = _screening_context(master_csv, df, asof)
+    asof_eff = context["asof"]
 
     rows: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         code = str(r.get("code") or "").strip()
         if not code:
             continue
-        prices = _load_prices_for_code(code)
+        prices = (_load_standard_prices(code, price_store, price_snapshot)
+                  if price_snapshot is not None else _load_prices_for_code(code))
         if prices is None:
             continue
+        entry_date = _entry_reference_date(prices, context)
         rec: Dict[str, Any] = {
             "code": code,
             "name": r.get("name"),
             "asof": asof_eff.isoformat(),
             "snapshot": master_csv.name,
+            "run_id": context["run_id"],
+            "entry_reference_date": entry_date.isoformat() if entry_date is not None else None,
+            "available_after": context["available_after"].isoformat() if context["available_after"] else None,
         }
         for h in horizons:
-            rec[f"fwd_ret_{h}d"] = _forward_return_business_days(prices, asof_eff, h)
+            rec[f"fwd_ret_{h}d"] = (_forward_return_business_days(prices, asof_eff, h, entry_date=entry_date)
+                                    if entry_date is not None else None)
         rows.append(rec)
 
     fwd = pd.DataFrame(rows)
@@ -265,17 +314,24 @@ def run_single_snapshot(
         return fwd, pd.DataFrame(), pd.DataFrame()
 
     merge_cols = [c for c in score_cols if c in df.columns]
-    snap_cols = ["code"] + [lane_col] if lane_col in df.columns else ["code"]
-    snap_cols += merge_cols
+    snap_cols = ["code"] + ([lane_col] if lane_col in df.columns else []) + merge_cols
+    eligible_columns = [f"registration_{route}_eligible" for route in ("a", "b")
+                        if f"registration_{route}_eligible" in df.columns]
+    snap_cols = list(dict.fromkeys(snap_cols + eligible_columns))
     snap = df[snap_cols].copy()
     snap["code"] = snap["code"].astype(str).str.strip()
     merged = fwd.merge(snap, on="code", how="left")
 
     ic_rows: List[Dict[str, Any]] = []
     for sc in merge_cols:
+        scored = merged
+        for route in ("a", "b"):
+            flag = f"registration_{route}_eligible"
+            if sc == f"registration_{route}_score" and flag in merged:
+                scored = merged[merged[flag].astype(str).str.lower().eq("true")]
         for h in horizons:
             yname = f"fwd_ret_{h}d"
-            ic, n = _spearman_ic(merged[sc], merged[yname])
+            ic, n = _spearman_ic(scored[sc], scored[yname])
             ic_rows.append({
                 "asof": asof_eff.isoformat(),
                 "snapshot": master_csv.name,
@@ -287,14 +343,19 @@ def run_single_snapshot(
     ic_summary = pd.DataFrame(ic_rows)
 
     lane_rows: List[pd.DataFrame] = []
-    if lane_col in merged.columns:
+    if lane_col == "registration" and eligible_columns:
+        for route in ("a", "b"):
+            flag = f"registration_{route}_eligible"
+            if flag not in merged:
+                continue
+            eligible = merged[merged[flag].astype(str).str.lower().eq("true")].copy()
+            eligible["registration"] = route
+            for h in horizons:
+                lane_rows.append(_lane_stats_single(eligible, "registration", f"fwd_ret_{h}d"))
+    elif lane_col in merged.columns:
         for h in horizons:
             lane_rows.append(_lane_stats_single(merged, lane_col, f"fwd_ret_{h}d"))
-    lane_stats = (
-        pd.concat([x for x in lane_rows if not x.empty], ignore_index=True)
-        if lane_rows
-        else pd.DataFrame()
-    )
+    lane_stats = _concat_nonempty(lane_rows)
     if not lane_stats.empty:
         lane_stats.insert(0, "snapshot", master_csv.name)
         lane_stats.insert(0, "asof", asof_eff.isoformat())
@@ -305,12 +366,14 @@ def run_single_snapshot(
 def pool_ic_summary(ic_frames: List[pd.DataFrame]) -> pd.DataFrame:
     if not ic_frames:
         return pd.DataFrame()
-    df = pd.concat(ic_frames, ignore_index=True)
+    df = _concat_nonempty(ic_frames)
     if df.empty:
         return df
+    df = df.dropna(subset=["ic_spearman"])
+    if df.empty:
+        return pd.DataFrame()
     out = (
-        df.dropna(subset=["ic_spearman"])
-        .groupby(["score", "horizon_days"], as_index=False)
+        df.groupby(["score", "horizon_days"], as_index=False)
         .agg(
             n_snapshots=("ic_spearman", "size"),
             mean_ic=("ic_spearman", "mean"),
@@ -328,7 +391,7 @@ def pool_ic_summary(ic_frames: List[pd.DataFrame]) -> pd.DataFrame:
 def pool_lane_stats(lane_frames: List[pd.DataFrame]) -> pd.DataFrame:
     if not lane_frames:
         return pd.DataFrame()
-    df = pd.concat([x for x in lane_frames if not x.empty], ignore_index=True)
+    df = _concat_nonempty(lane_frames)
     if df.empty:
         return df
     out = df.groupby(["lane", "horizon_col"], as_index=False).agg(
@@ -351,19 +414,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="screening_offline_*.csv のパス (複数指定可)")
     ap.add_argument("--asof", default=None,
                     help="マスタCSVの基準日 YYYY-MM-DD。複数 master 時はファイル名から推定。")
-    ap.add_argument("--horizons", default="21,63,126",
+    ap.add_argument("--horizons", default="21,63,126,252",
                     help="forward リターンのホライズン (営業日, カンマ区切り)")
     ap.add_argument("--lane-col", default=DEFAULT_LANE_COLUMN,
-                    help="レーン分類列 (default: candidate_lane)")
+                    help="レーン分類列。既定registrationは適格A/Bを別々に集計")
     ap.add_argument("--score-cols", default=None,
                     help="評価対象スコア列 (カンマ区切り)。省略時は既定一覧から実在列のみ採用")
     ap.add_argument("--outdir", default=str(DEFAULT_OUT_DIR),
                     help="出力ディレクトリ (default: output/backtest)")
+    ap.add_argument("--cache-dir", type=Path, default=STANDARD_CACHE_DIR,
+                    help="将来価格を含むStandardキャッシュ")
+    ap.add_argument("--price-snapshot-id", help="将来価格のsnapshot ID。省略時はlatestを固定")
     args = ap.parse_args(argv)
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
-    if not horizons:
-        print("[ERROR] horizons が空です", file=sys.stderr)
+    if not horizons or any(horizon < 1 for horizon in horizons):
+        print("[ERROR] horizons は正の営業日数で指定してください", file=sys.stderr)
         return 2
 
     if args.score_cols:
@@ -372,19 +438,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         score_cols = list(DEFAULT_SCORE_COLUMNS)
 
     if not args.master:
-        # 直近 N 件を自動探索
+        # Pin one immutable current-format run before considering old outputs.
         candidates: List[Path] = []
-        for d in (Path("output") / "reports", Path("output")):
+        current_history = Path("output_standard") / "history"
+        candidates = sorted(current_history.glob("r_*/screening_offline.csv"))
+        for d in (Path("output") / "reports", Path("output")) if not candidates else ():
             if d.exists():
                 candidates += sorted(d.glob("screening_offline_*.csv"))
         if not candidates:
-            print("[ERROR] --master 未指定で、output 配下に screening_offline_*.csv が見つかりません。", file=sys.stderr)
+            print("[ERROR] screening CSV が見つかりません。--master を指定してください。", file=sys.stderr)
             return 2
         masters = [candidates[-1]]
     else:
         masters = [Path(p) for p in args.master]
 
     asof_arg = _parse_date(args.asof) if args.asof else None
+    price_store, price_snapshot = None, None
+    if args.price_snapshot_id is not None or (args.cache_dir / "latest_snapshot.json").is_file():
+        import JQuamtsScreeningBot as bot
+
+        price_store = bot.Store(args.cache_dir)
+        price_snapshot = price_store.snapshot(args.price_snapshot_id)
+        if not price_snapshot:
+            raise ValueError("Price snapshot unavailable")
 
     all_fwd: List[pd.DataFrame] = []
     all_ic: List[pd.DataFrame] = []
@@ -398,6 +474,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             horizons=horizons,
             score_cols=score_cols,
             lane_col=args.lane_col,
+            price_store=price_store,
+            price_snapshot=price_snapshot,
         )
         all_fwd.append(fwd)
         all_ic.append(ic)
@@ -406,9 +484,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    fwd_all = pd.concat([x for x in all_fwd if not x.empty], ignore_index=True) if all_fwd else pd.DataFrame()
-    ic_all = pd.concat([x for x in all_ic if not x.empty], ignore_index=True) if all_ic else pd.DataFrame()
-    lane_all = pd.concat([x for x in all_lane if not x.empty], ignore_index=True) if all_lane else pd.DataFrame()
+    fwd_all = _concat_nonempty(all_fwd)
+    ic_all = _concat_nonempty(all_ic)
+    lane_all = _concat_nonempty(all_lane)
 
     if not fwd_all.empty:
         fwd_all.to_csv(outdir / "per_stock_returns.csv", index=False, encoding="utf-8-sig")
@@ -431,6 +509,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         "score_cols_used": score_cols,
         "lane_col": args.lane_col,
         "frozen_prices_dir": str(FROZEN_PRICES_DIR),
+        "price_snapshot_id": price_snapshot.get("snapshot_id") if price_snapshot else None,
+        "price_snapshot_input_hash": bot.digest(price_snapshot) if price_snapshot else None,
+        "price_cache_dir": str(args.cache_dir) if price_snapshot else None,
+        "entry_basis": "close_of_first_session_opening_after_cutoff_and_report_generation",
+        "horizon_basis": "elapsed_sessions_after_entry_reference_close",
+        "return_basis": "split_adjusted_gross_close_to_close" if price_snapshot else "legacy_csv_close_to_close",
         "n_codes_with_prices": int(fwd_all["code"].nunique()) if not fwd_all.empty else 0,
     }
     (outdir / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -295,7 +295,8 @@ def _corporate_action_reason(sessions: list[dt.date], prices: dict, *,
 def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str | None = None,
                       price_asof_date: dt.date | None = None,
                       calendar_rows: list[dict] | None = None,
-                      price_rows: list[dict] | None = None) -> dict:
+                      price_rows: list[dict] | None = None,
+                      reference_date: dt.date | None = None) -> dict:
     """Compute diagnostics from archived rows, never scoring or fetching data."""
     cutoff = _timestamp(cutoff)
     if cutoff is None:
@@ -400,6 +401,11 @@ def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code: str |
     if not candidates:
         problem = "observation_time_unknown" if not any(v.get("first_observed_at") for v in adapted["row_versions"]) else "not_available_by_cutoff"
         return stop(problem)
+    if reference_date is not None:
+        reference_date = _date(reference_date)
+        if reference_date not in candidates:
+            return stop('reference_date_unavailable')
+        candidates = {reference_date: candidates[reference_date]}
     day = max(candidates)
     version = candidates[day]
     row = version["normalized_row"]

@@ -50,9 +50,9 @@ import jq_universe_report
 import jq_screening_workflow
 import jq_screening_ui
 
-LOGIC_VERSION = 'JQ-STD-CORRECTED-1.0-rc1'
+LOGIC_VERSION = 'JQ-STD-CORRECTED-1.1-rc1'
 REGISTRATION_LOGIC_VERSION = jq_universe.UNIVERSE_LOGIC_VERSION
-CODE_VERSION = '1.3.0-rc2-guided-screening'
+CODE_VERSION = '1.4.0-rc2-swing-review'
 CACHE_SCHEMA = 'jq-standard-raw-v1'
 JST = dt.timezone(dt.timedelta(hours=9))
 BASE_URL = 'https://api.jquants.com/v2'
@@ -71,7 +71,7 @@ ALLOWED_ENDPOINTS = {
     'equities/master', 'equities/bars/daily', 'fins/summary',
     'indices/bars/daily/topix', 'markets/calendar', 'fins/earnings-date',
     'markets/margin-interest', 'markets/short-sale-report',
-    'equities/earnings-calendar',
+    'equities/earnings-calendar', 'equities/valuation',
 }
 SOFT_BASES = {
     'ma200_reclaim_core':92., 'bottom_reversal_core':85., 'weak_reclaim_watch':78.,
@@ -971,9 +971,9 @@ def guidance(statements: list[dict], history: list[dict]) -> dict:
             nk=('FNP',);ek='FEPS';source='quarter_or_revision_guidance'
             if te is not None and te<=base_end:
                 continue
-        prefix='NC' if s['scope']=='nonconsolidated' else ''
-        # NC forecasts use separate field spellings, no selective scope mixing.
-        if prefix:
+        # Standalone statements populate the main fields. Forecast revisions
+        # populate NC fields for standalone figures, irrespective of DocType.
+        if 'EarnForecastRevision' in doc and base['scope']=='nonconsolidated':
             nk=('NxFNCNP',) if source=='fy_next_guidance' else ('FNCNP',)
             ek='NxFNCEPS' if source=='fy_next_guidance' else 'FNCEPS'
         has_forecast_keys=any(k in raw for k in (*nk,ek))
@@ -1111,6 +1111,13 @@ def peg_quality(peg: Any, eg: Any, forward_known: bool, quality_watch: bool) -> 
             'peg_warnings':warnings,'peg_quality_class':grade}
 
 
+def observed_earnings_rows(bundle: dict) -> list[dict]:
+    """Carry acquisition evidence with derived rows while retaining raw pages."""
+    observed = bundle.get('collected_at')
+    return [{**row, '_first_observed_at': row.get('_first_observed_at') or observed}
+            for row in bundle.get('rows', [])]
+
+
 def earnings_context(rows: list[dict], api_code: str, cutoff: dt.datetime,
                      sessions: pd.DatetimeIndex, next_trade: Optional[dt.date], cfg: Config) -> dict:
     # Latest publication within each quarter/year-end-month-day stream. FYE is
@@ -1120,6 +1127,10 @@ def earnings_context(rows: list[dict], api_code: str, cutoff: dt.datetime,
         if str(r.get('Code','')).upper()!=api_code:
             raise DataError('earnings_code_mismatch')
         pub=published_at(r,'PubDate','PubTime')
+        observed=timestamp(r.get('_first_observed_at'))
+        if (pub is not None and pub>cutoff and not r.get('PubTime')
+                and observed is not None and pub.date()<=observed.date() and observed<=cutoff):
+            pub=observed
         if pub is None or pub>cutoff:
             continue
         key=(r.get('FQName'),str(r.get('FYE') or ''))
@@ -1142,6 +1153,7 @@ def earnings_context(rows: list[dict], api_code: str, cutoff: dt.datetime,
         if unknown_update:o['earnings_reason']='undetermined_latest_schedule'
         return o
     scheduled,pub,r=min(future,key=lambda x:x[0])
+    o.update(earnings_scheduled_date=scheduled.isoformat(), earnings_pub_date=pub.date().isoformat())
     if pd.Timestamp(scheduled) not in sessions or pd.Timestamp(next_trade) not in sessions:
         o['earnings_reason']='calendar_horizon_or_date_unverified';return o
     gap=int(sessions.get_loc(pd.Timestamp(scheduled))-sessions.get_loc(pd.Timestamp(next_trade)))
@@ -1171,10 +1183,11 @@ def risk_context(cfg: Config, code: str, cutoff: dt.datetime) -> dict:
 
 
 def margin_diagnostic(bundle: dict, cutoff: dt.datetime, *, expected_code=None,
-                      price_asof_date=None, calendar_rows=None, price_rows=None) -> dict:
+                      price_asof_date=None, calendar_rows=None, price_rows=None,
+                      reference_date=None) -> dict:
     """Diagnostic only; shared with the independent offline margin analysis."""
     options = dict(expected_code=expected_code, price_asof_date=price_asof_date,
-                   calendar_rows=calendar_rows, price_rows=price_rows)
+                    calendar_rows=calendar_rows, price_rows=price_rows, reference_date=reference_date)
     try:
         return _margin_diagnostic(bundle, cutoff, **options)
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -2266,8 +2279,10 @@ def collect_globals(client: Client, asof: Optional[dt.date]=None) -> tuple[dict,
     master_blob=client.fetch('equities/master',{'date':t.isoformat()})
     if not master_blob['rows']:raise CollectionError('master_empty')
     master_records(master_blob['rows']) # validation BEFORE promotion
+    valuation_blob=client.fetch('equities/valuation',{'date':t.isoformat()})
+    if valuation_blob.get('status')!='complete':raise CollectionError('valuation_incomplete')
     return {'calendar':client.store.put(calendar_blob),'topix':client.store.put(topix_blob),
-            'master':client.store.put(master_blob)},t
+            'master':client.store.put(master_blob),'valuation':client.store.put(valuation_blob)},t
 
 
 
@@ -2573,7 +2588,13 @@ def merge_daily_rows(old: list[dict], new: list[dict], kind: str) -> list[dict]:
     elif kind=='earnings':key=lambda r:(str(r.get('Code')),str(r.get('PubDate')),str(r.get('FQName')),str(r.get('FYE')))
     else:key=lambda r:digest(r)
     merged={key(r):r for r in old}
-    merged.update({key(r):r for r in new})
+    for row in new:
+        previous=merged.get(key(row))
+        if kind=='earnings' and previous is not None:
+            content=lambda r:{k:v for k,v in r.items() if k!='_first_observed_at'}
+            if content(previous)==content(row) and previous.get('_first_observed_at'):
+                row={**row,'_first_observed_at':previous['_first_observed_at']}
+        merged[key(row)]=row
     return [merged[k] for k in sorted(merged)]
 
 
@@ -2626,6 +2647,8 @@ def update_daily(client: Client, from_date: Optional[dt.date]=None, *,
         start=min(from_date,latest_start) if from_date is not None else latest_start
         end=now_jst().date()
         data={c:{k:bundle_rows(store,item.get(k)) for k in ('prices','summary','earnings')} for c,item in symbols.items()}
+        for c,item in symbols.items():
+            data[c]['earnings']=observed_earnings_rows(store.get(item['earnings'])) if item.get('earnings') else []
         sessions=trading_sessions(bundle_rows(store,snap['globals']['calendar']))
         if t < fallback and symbols:raise CollectionError('update_price_date_would_move_backwards')
         d=start;raw_update_refs=[]
@@ -2639,7 +2662,8 @@ def update_daily(client: Client, from_date: Optional[dt.date]=None, *,
                 blob=client.fetch(ep,{'date':str(d)})
                 if blob.get('status')!='complete':raise CollectionError('daily_update_not_complete:'+ep)
                 raw_update_refs.append(store.put(blob))
-                for raw in blob['rows']:
+                update_rows=observed_earnings_rows(blob) if kind=='earnings' else blob['rows']
+                for raw in update_rows:
                     c=allowed.get(str(raw.get('Code') or ''))
                     if c in data:data[c][kind]=merge_daily_rows(data[c][kind],[raw],kind)
             LOG.info('日付更新 %s',d)
@@ -2680,7 +2704,8 @@ def update_daily(client: Client, from_date: Optional[dt.date]=None, *,
 def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex,
                    asof: dt.date, cutoff: dt.datetime, regime: dict, cfg: Config,
                    next_trade: Optional[dt.date], global_issues: list[str],
-                   calendar_rows: Optional[list[dict]]=None) -> tuple[dict,list[dict]]:
+                   calendar_rows: Optional[list[dict]]=None,
+                   valuation_rows: Optional[dict]=None) -> tuple[dict,list[dict]]:
     r={**m,**regime,'price_asof_date':str(asof),'information_cutoff':cutoff.isoformat(),
        'logic_version':LOGIC_VERSION,'code_version':CODE_VERSION,'financial_data_mode':'summary_only',
        'structural_limitations':['summary_only','gross_margin_not_in_model','current_ratio_not_in_model'],
@@ -2748,7 +2773,14 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
     latest_sh=max(shares_rows,key=lambda s:(s['period_end'],s['disclosed_at'],s['scope']=='consolidated')) if shares_rows else {}
     r['shares_asof_date']=clean(latest_sh.get('period_end'))
     r['shares_age_days']=(asof-latest_sh['period_end']).days if latest_sh else None
-    if mcap is not None and mcap>0:
+    if valuation_rows is not None:
+        value=valuation_rows.get(m['api_code'], {})
+        valuation_cap=number(value.get('MktCap'))
+        if valuation_cap is not None and valuation_cap>0 and date(value.get('Date'))==asof:
+            r['market_cap']=valuation_cap*1_000_000.
+            r['market_cap_source']='jquants_valuation_treasury_excluded'
+        else:r['common_issues'].append('valuation_market_cap_missing_or_invalid')
+    elif mcap is not None and mcap>0:
         r['market_cap']=mcap*1_000_000.;r['market_cap_source']='jquants_daily'
     else:
         f,why=share_factor(frame,latest_sh.get('period_end'),asof)
@@ -2779,7 +2811,7 @@ def analyze_symbol(m: dict, item: dict, store: Store, sessions: pd.DatetimeIndex
         r['dividend_status']='増配' if a>b*1.02 else '減配' if a<b*.95 else '維持' if a>0 else '無配'
     try:
         if not item.get('earnings'):raise DataError('earnings_not_collected')
-        r.update(earnings_context(bundle_rows(store,item['earnings']),m['api_code'],cutoff,sessions,next_trade,cfg))
+        r.update(earnings_context(observed_earnings_rows(store.get(item['earnings'])),m['api_code'],cutoff,sessions,next_trade,cfg))
     except (DataError,KeyError,ValueError) as e:r['common_issues'].append(str(e))
     try:
         margin_bundle=store.get(item['margin']) if item.get('margin') else {}
@@ -2834,14 +2866,17 @@ def attach_registration(records: list[dict], store: Store, snap: dict, cfg: Conf
                 or timestamp(selected.get('information_cutoff')) is None):
             raise DataError('registration_margin_snapshot_invalid')
     context = registration_price_context(sessions, asof, cutoff, calendar_rows)
+    prior_sessions = sessions[sessions < pd.Timestamp(asof)]
+    reference_date = prior_sessions[-1].date() if len(prior_sessions) else None
+    context['registration_margin_comparison_date'] = str(reference_date) if reference_date else None
     mode = 'explicit_margin_snapshot' if selected is not None else 'normal_snapshot'
     for row in records:
         code = row['code']
         item = snap.get('symbols', {}).get(code, {})
         if selected is None:
-            diagnosis = copy.deepcopy({k:v for k,v in row.items() if k.startswith('margin_')})
             reference = item.get('margin')
-            attempt = diagnosis.get('margin_status', 'not_collected')
+            blob = jq_margin_workflow._read_optional_bundle(sys.modules[__name__], store, reference)
+            attempt = blob.get('status', 'not_collected')
         else:
             target = selected['targets'].get(code, {})
             selected_item = selected['symbols'].get(code, {})
@@ -2857,13 +2892,15 @@ def attach_registration(records: list[dict], store: Store, snap: dict, cfg: Conf
             elif (timestamp(blob.get('collected_at')) is not None
                   and timestamp(blob['collected_at']) > timestamp(selected['information_cutoff'])):
                 blob = {'status':'observation_after_snapshot_verification','rows':[]}
-            prices = jq_margin_workflow._read_optional_bundle(sys.modules[__name__], store, item.get('prices'))
-            diagnosis = margin_diagnostic(blob, cutoff, expected_code=row.get('api_code'),
-                price_asof_date=asof, calendar_rows=calendar_rows,
-                price_rows=prices.get('rows', []) if prices.get('status') == 'complete' else [])
+        prices = jq_margin_workflow._read_optional_bundle(sys.modules[__name__], store, item.get('prices'))
+        diagnosis = margin_diagnostic(blob, cutoff, expected_code=row.get('api_code'),
+            price_asof_date=asof, calendar_rows=calendar_rows, reference_date=reference_date,
+            price_rows=prices.get('rows', []) if prices.get('status') == 'complete' else [])
         # Explicit credit is evaluated against THIS run's price/cutoff. It does
         # not replace the regular margin_* fields or the normal snapshot.
         row.update(context)
+        row['registration_margin_reference_date_mismatch'] = (
+            reference_date is None or diagnosis.get('margin_reference_date') != str(reference_date))
         row.update(registration_margin_diagnostic=diagnosis,
                    registration_margin_input_mode=mode,
                    registration_margin_snapshot_id=selected.get('snapshot_id') if selected else None,
@@ -2887,7 +2924,14 @@ def attach_registration(records: list[dict], store: Store, snap: dict, cfg: Conf
             row['registration_'+route+'_rank'] = None
         for position,row in enumerate(candidates,1):
             row['registration_'+route+'_rank'] = position
-    return {**context, 'registration_logic_version':REGISTRATION_LOGIC_VERSION,
+    references = sorted((r for r in records if r.get('registration_b_reference_candidate') is True),
+                        key=jq_universe.reference_rank_key)
+    for row in records:
+        row['registration_b_reference_rank'] = None
+    for position,row in enumerate(references,1):
+        row['registration_b_reference_rank'] = position
+    return {**context, 'registration_margin_reference_date':str(reference_date) if reference_date else None,
+            'registration_logic_version':REGISTRATION_LOGIC_VERSION,
             'legacy_logic_version':LOGIC_VERSION, 'registration_rules':asdict(rules),
             'registration_rules_hash':digest(asdict(rules)),
             'registration_margin_input_mode':mode,
@@ -2896,13 +2940,20 @@ def attach_registration(records: list[dict], store: Store, snap: dict, cfg: Conf
             'registration_margin_source_snapshot_id':selected.get('source_snapshot_id') if selected else snap.get('snapshot_id'),
             'registration_margin_snapshot_cutoff':selected.get('information_cutoff') if selected else snap.get('information_cutoff'),
             'registration_counts':jq_universe_report.summarize(records),
+            'registration_b_reference_limit':jq_universe.B_REFERENCE_LIMIT,
             'registration_validation':'rc_initial_rules_not_performance_validated',
             'allocation_management':'user_only', 'orders_enabled':False}
 
 
+def next_trading_open(sessions: pd.DatetimeIndex, after: dt.datetime) -> Optional[dt.date]:
+    future=[s.date() for s in sessions if dt.datetime.combine(s.date(),dt.time(9),JST)>after]
+    return min(future) if future else None
+
+
 def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date]=None,
                    cutoff: Optional[dt.datetime]=None,
-                   margin_snapshot_id: Optional[str]=None) -> tuple[list[dict],dict,dict]:
+                    margin_snapshot_id: Optional[str]=None,
+                    entry_after: Optional[dt.datetime]=None) -> tuple[list[dict],dict,dict]:
     cfg.validate()
     t=asof or date(snap.get('price_asof_date'))
     information=cutoff or timestamp(snap.get('information_cutoff'))
@@ -2920,8 +2971,8 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
     calrows=bundle_rows(store,globals.get('calendar'))
     sessions=trading_sessions(calrows) if calrows else pd.DatetimeIndex([])
     if len(sessions)==0 or pd.Timestamp(t) not in sessions:global_issues.append('calendar_missing_or_asof_invalid')
-    future=[s.date() for s in sessions if dt.datetime.combine(s.date(),dt.time(9),JST)>information]
-    next_trade=min(future) if future else None
+    entry_clock=max(information,entry_after) if entry_after is not None else information
+    next_trade=next_trading_open(sessions,entry_clock)
     if next_trade is None:global_issues.append('next_trading_session_unknown')
     rawmaster=bundle_rows(store,globals.get('master'))
     if not rawmaster:global_issues.append('master_missing')
@@ -2930,12 +2981,20 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
     topix=bundle_rows(store,globals.get('topix'))
     regime=market_regime(topix,sessions,t)
     if regime['market_regime']=='unknown':global_issues.append('topix_required')
+    valuation_rows=None
+    if globals.get('valuation'):
+        valuation_rows={}
+        for value in bundle_rows(store,globals['valuation']):
+            api_code=str(value.get('Code') or '').strip().upper()
+            if date(value.get('Date'))!=t:raise DataError('valuation_asof_mismatch')
+            if api_code in valuation_rows:raise DataError('duplicate_valuation_code')
+            valuation_rows[api_code]=value
     records=[]
     for idx,m in enumerate(master,1):
         if m['instrument_type']!='stock':continue
         item=snap.get('symbols',{}).get(m['code'],{})
         try:r,hist=analyze_symbol(m,item,store,sessions,t,information,regime,cfg,next_trade,global_issues,
-                                calendar_rows=calrows)
+                                calendar_rows=calrows,valuation_rows=valuation_rows)
         except DataError as e:
             r={**m,**regime,'common_issues':[str(e)],'financial_issues':[],'light_issues':[],
                'benchmark_input_valid':False,'annual_comparable':False,'critical_missing_count':0,
@@ -2970,7 +3029,7 @@ def score_snapshot(store: Store, snap: dict, cfg: Config, asof: Optional[dt.date
         status='partial_universe'
     meta={'price_asof_date':str(t),'information_cutoff':information.isoformat(),'snapshot_id':snap.get('snapshot_id'),
           'logic_version':LOGIC_VERSION,'code_version':CODE_VERSION,'schema':CACHE_SCHEMA,
-          'next_trade_date':str(next_trade) if next_trade else None,'run_status':status,
+          'next_trade_date':str(next_trade) if next_trade else None,'entry_evaluation_at':entry_clock.isoformat(),'run_status':status,
           'global_issues':global_issues,'ordinary_master_count':len(records),'complete_symbol_count':int(complete_count),
           'eligible_count':sum(r['eligible_new_entry'] for r in records),'percentile_universe_id':universe_id,
           'pit_quality':'archived_input_snapshot_not_guaranteed_historical_vintage',
@@ -3118,6 +3177,7 @@ def write_run(records: list[dict], benchmarks: dict, meta: dict, output: Path,
         latest_parent=output/'reports';latest_parent.mkdir(parents=True,exist_ok=True)
         temp_latest=latest_parent/('.latest_'+run_id)
         shutil.copytree(final,temp_latest)
+        if publication_check is not None:publication_check()
         latest=latest_parent/'latest';previous=latest_parent/('.previous_'+run_id)
         if latest.exists():os.replace(latest,previous)
         try:
@@ -3145,7 +3205,8 @@ def analyze_store(store: Store, cfg: Config, output: Path, top: int=10,
     LOG.info('[分析開始] スナップショット=%s / 収集済み=%s銘柄（API通信なし）',snap.get('snapshot_id'),sum(i.get('complete') is True for i in snap.get('symbols',{}).values()))
     LOG.info('[登録候補] 信用入力=%s / 価格・財務の情報締切は元snapshotを保持',
              margin_snapshot_id or '通常snapshot内の信用残')
-    records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff,margin_snapshot_id)
+    records,stats,meta=score_snapshot(store,snap,cfg,asof,cutoff,margin_snapshot_id,
+                                      now_jst() if require_current else None)
     if require_current and (meta['run_status']=='diagnostic_only' or
                             meta.get('registration_price_age_bd') != 0):
         raise DataError('screening_inputs_not_current_or_verified: '+
@@ -3154,10 +3215,15 @@ def analyze_store(store: Store, cfg: Config, output: Path, top: int=10,
         # Ranking may take long enough to cross the next daily boundary. Never
         # relabel a frozen result as current just because its own cutoff is old.
         calendar_rows=bundle_rows(store,snap.get('globals',{}).get('calendar'))
-        current=registration_price_context(trading_sessions(calendar_rows),
-                                            date(meta['price_asof_date']),now_jst(),calendar_rows)
+        publication_time=now_jst()
+        sessions=trading_sessions(calendar_rows)
+        current=registration_price_context(sessions,
+                                            date(meta['price_asof_date']),publication_time,calendar_rows)
         if current['registration_price_age_bd'] != 0:
             raise DataError('screening_market_date_changed_during_analysis:run_screen_again')
+        if (meta.get('next_trade_date') is not None
+                and next_trading_open(sessions,publication_time)!=date(meta['next_trade_date'])):
+            raise DataError('screening_entry_session_changed_during_analysis:run_screen_again')
     with ProcessLock(output,'analysis'):
         if require_current:
             confirm_publication_date()

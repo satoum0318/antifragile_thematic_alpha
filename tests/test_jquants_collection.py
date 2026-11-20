@@ -32,6 +32,7 @@ class FakeSession:
                                  "CoName": "Synthetic ordinary stock", "Mkt": "0111",
                                  "ProdCat": "011", "S33": "5250"}],
             "equities/bars/daily": [],
+            "equities/valuation": [],
             "fins/summary": [{"Code": "99990", "DiscDate": "2026-05-15"}],
             "fins/earnings-date": [],
         }
@@ -157,5 +158,5 @@ def test_normal_collect_after_migration_fetches_margin_but_keeps_frozen_price_da
     assert second["price_asof_date"] == "2026-09-11"
     assert second["attempted_codes"] == []
     assert second["symbols"]["9999"] == first["symbols"]["9999"]
-    assert set(session.calls) == {"markets/calendar", "indices/bars/daily/topix", "equities/master"}
+    assert set(session.calls) == {"markets/calendar", "indices/bars/daily/topix", "equities/master", "equities/valuation"}
     assert "markets/margin-interest" not in session.calls

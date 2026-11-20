@@ -150,6 +150,22 @@ def test_market_day_change_during_report_writing_blocks_publication(tmp_path, mo
     assert not (tmp_path/'output'/'latest_run.json').exists()
 
 
+def test_opening_during_report_writing_blocks_publication(tmp_path, monkeypatch):
+    client, source, _, _ = source_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bot, 'now_jst', lambda: dt.datetime(2026, 10, 2, 8, 55, tzinfo=bot.JST))
+    meta = {'run_status': 'complete', 'registration_price_age_bd': 0, 'global_issues': [],
+            'price_asof_date': '2026-10-01', 'next_trade_date': '2026-10-02'}
+    monkeypatch.setattr(bot, 'score_snapshot', lambda *args: ([], {}, meta))
+    def write(records, stats, metadata, output, top, publication_check):
+        monkeypatch.setattr(bot, 'now_jst', lambda: dt.datetime(2026, 10, 2, 9, 10, tzinfo=bot.JST))
+        publication_check()
+        pytest.fail('A passed entry session must stop publication')
+    monkeypatch.setattr(bot, 'write_run', write)
+    with pytest.raises(bot.DataError, match='entry_session_changed_during_analysis'):
+        bot.analyze_store(client.store, bot.Config(), tmp_path/'output', require_current=True)
+    assert not (tmp_path/'output'/'latest_run.json').exists()
+
+
 def test_historical_failure_registry_does_not_mislabel_scoped_current_run(tmp_path, monkeypatch):
     client, _, _, _ = source_fixture(tmp_path, monkeypatch)
     bot.atomic_json(client.store.root/'collection_failures.json', {

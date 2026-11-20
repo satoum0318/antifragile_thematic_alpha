@@ -182,6 +182,57 @@ def test_a_sector_relative_valuation_changes_score_without_changing_b():
     assert missing["registration_b_status"] == "eligible"
 
 
+def test_b_ignores_only_the_sector_benchmark_issue_from_the_full_pipeline():
+    baseline = evaluate(candidate())
+    row = candidate(ps_vs_sector=None, light_issues=["sector_benchmark_insufficient"])
+    result = evaluate(row)
+    assert result["registration_a_status"] == "hold"
+    assert result["registration_b_status"] == "eligible"
+    assert result["registration_b_score"] == baseline["registration_b_score"]
+    assert "light_issues:sector_benchmark_insufficient" not in result["registration_b_reasons"]
+    row["light_issues"].append("disclosed_shares_market_cap_proxy")
+    result = evaluate(row)
+    assert result["registration_b_status"] == "hold"
+    assert "light_issues:disclosed_shares_market_cap_proxy" in result["registration_b_reasons"]
+    assert result["registration_b_reference_candidate"] is False
+
+
+@pytest.mark.parametrize("state", ["ma200_reclaim", "above_ma200_near"])
+def test_short_term_pullback_holds_both_routes_and_remains_a_manual_reference(state):
+    row = candidate(ma200_state=state, price=8024., ma_25=9893.4, return_21d=-.204)
+    before = copy.deepcopy(row)
+    result = evaluate(row)
+    assert row == before
+    assert result["registration_price_state"] == "pullback_wait"
+    for route in ("a", "b"):
+        assert result[f"registration_{route}_status"] == "hold"
+        assert "price_condition:pullback_wait" in result[f"registration_{route}_reasons"]
+    assert result["registration_b_reference_candidate"] is True
+    assert "price_condition:pullback_wait" in result["registration_b_reference_cautions"]
+    assert result["registration_evidence"]["price"] == 8024.
+    assert result["registration_evidence"]["ma_25"] == 9893.4
+
+
+@pytest.mark.parametrize("price,return21", [(101., -.1), (100., -.1), (99., .0), (99., .1)])
+def test_pullback_requires_both_a_negative_return_and_price_below_ma25(price, return21):
+    result = evaluate(candidate(price=price, ma_25=100., return_21d=return21))
+    assert result["registration_price_state"] == "uptrend_continuation"
+    assert result["registration_a_status"] == "eligible"
+    assert result["registration_b_status"] == "eligible"
+
+
+def test_credit_reference_date_mismatch_blocks_b_and_manual_references_without_changing_a():
+    baseline = evaluate(candidate())
+    result = evaluate(candidate(registration_margin_reference_date_mismatch=True))
+    assert result["registration_a_status"] == "eligible"
+    assert result["registration_a_score"] == baseline["registration_a_score"]
+    assert result["registration_b_status"] == "hold"
+    assert "margin_reference_date_mismatch" in result["registration_b_reasons"]
+    assert result["registration_b_components"]["supply"] is None
+    assert result["registration_b_reference_candidate"] is False
+    assert "margin_reference_date_mismatch" in result["registration_b_reference_blockers"]
+
+
 @pytest.mark.parametrize("status", ["no_rows", "fetch_failed", "unsupported_schema", "not_applicable"])
 def test_credit_missing_has_no_a_score_benefit_and_holds_b(status):
     original = evaluate(candidate())

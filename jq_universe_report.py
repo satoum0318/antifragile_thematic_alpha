@@ -16,7 +16,7 @@ LABELS = {
     "unassessed": "未評価", "caution": "注意", "observed": "需給指標を確認",
     "trend_transition": "上昇への転換局面", "uptrend_continuation": "上昇継続",
     "basing_wait": "底固め・条件待ち", "overheated_wait": "過熱・条件待ち",
-    "downtrend_wait": "下降・条件待ち",
+    "downtrend_wait": "下降・条件待ち", "pullback_wait": "反落・条件待ち",
     "quality": "財務品質", "growth": "成長", "valuation": "評価額", "technical": "価格局面", "supply": "信用需給",
     "supply_unassessed": "信用需給は未評価", "price_condition": "価格の条件待ち",
     "momentum_wait": "モメンタムの条件待ち", "momentum_unknown": "モメンタム未評価",
@@ -26,7 +26,7 @@ LABELS = {
     "short_balance_to_volume_below_threshold": "出来高に対する信用売残が条件未達",
     "short_balance_not_accumulating": "信用売残の積み上がりを未確認",
     "sales_cagr": "売上成長率", "return_63d": "63営業日の株価変化",
-    "return_rel_topix_63d": "63営業日のTOPIX相対変化", "turnover_persistence": "出来高の継続性",
+    "return_rel_topix_63d": "63営業日のTOPIX相対変化", "turnover_persistence": "売買代金の持続性",
     "short_change_pct": "信用売残の変化率",
     "available": "確認可能", "unavailable": "未評価", "unknown": "未評価",
     "not_collected": "未取得", "no_rows": "該当する信用残なし",
@@ -40,6 +40,7 @@ LABELS = {
     "corporate_action_unverified": "対象期間の株数調整を未確認",
     "corporate_action_basis_unknown": "株数調整の基準不明",
     "daily_history_insufficient": "日次履歴不足", "margin_history_insufficient": "信用履歴不足",
+    "margin_reference_date_mismatch": "信用残の申込日が共通比較日と不一致",
     "volume_history_insufficient": "出来高履歴不足", "zero_volume_denominator": "出来高の分母がゼロ",
     "zero_baseline": "比較開始時の残高がゼロ", "calendar_unverified": "営業日未確認",
     "not_available_by_cutoff": "締切時点では未確認", "not_observed_by_cutoff": "締切時点では未取得",
@@ -48,6 +49,9 @@ LABELS = {
     "confirmed_severe_risk": "確認済みの重大リスク", "earnings_blackout": "決算前後の保留期間",
     "liquidity_failed": "流動性の条件未達", "market_cap_failed": "企業規模の条件未達",
     "model_scope_financial": "金融業のため一般企業モデル対象外",
+    "accounting_risk_not_comprehensively_verified": "会計リスクの網羅的な確認は未実施",
+    "governance_status_not_comprehensively_verified": "ガバナンスの網羅的な確認は未実施",
+    "earnings_schedule_not_confirmed_pretrade_check_required": "決算予定は売買前に要確認",
 }
 
 
@@ -125,6 +129,10 @@ def groups(records: list[dict], top: int = 10) -> dict[str, list[dict]]:
         result[f"registration_candidates_{lane}.csv"] = candidates
     result["registration_review.csv"] = sorted((row for row in records if _review(row)),
                                                 key=lambda row: str(row.get("code", "")))
+    references = sorted((row for row in records if row.get("registration_b_reference_candidate") is True
+                         and not _eligible(row, "b")), key=jq_universe.reference_rank_key)
+    result["registration_reference_b.csv"] = references
+    result["top_registration_reference_b.csv"] = references[:min(top, jq_universe.B_REFERENCE_LIMIT)]
     return result
 
 
@@ -144,6 +152,8 @@ def summarize(records: list[dict]) -> dict:
             "warning_counts": dict(sorted(Counter(str(reason) for row in records
                                                    for reason in _items(row.get(prefix + "warnings"))).items())),
         }
+    result["b"]["reference_count"] = sum(row.get("registration_b_reference_candidate") is True
+                                         and not _eligible(row, "b") for row in records)
     for field in ("supply", "price"):
         result[field + "_state_counts"] = dict(sorted(Counter(
             row.get(f"registration_{field}_state") or "unknown" for row in records).items()))
@@ -167,6 +177,8 @@ def _metric(margin: dict, key: str, *, digits: int = 0, suffix: str = "") -> str
 def _change(margin: dict, n: int, side: str) -> str:
     absolute = _metric(margin, f"margin_{side}_change_{n}bd_vol", suffix="株")
     percentage = _metric(margin, f"margin_{side}_change_{n}bd_pct", digits=1, suffix="%")
+    if absolute == percentage:
+        return absolute
     return f"{absolute}（{percentage}）"
 
 
@@ -182,6 +194,42 @@ def _table(lines: list[str], headers: list[str], rows: list[list]) -> None:
     lines.append("|" + "|".join("---" for _ in headers) + "|")
     lines.extend("|" + "|".join(_escape(value) for value in row) + "|" for row in rows)
     lines.append("")
+
+
+def _reference_report(lines: list[str], candidates: list[dict], total: int, limit: int) -> None:
+    lines += [f"### 人が確認するB参考候補 — 最大{limit}件", "",
+              f"参考候補の条件を通過 {total}件 / 表示 {len(candidates)}件。正式なB適格判定は上記の件数です。",
+              "財務・成長・流動性・評価額の条件と、価格・信用データの整合性を確認した銘柄です。"
+              "信用売残の量・増減履歴、株価の弱さ・過熱は以下の確認事項として残し、投資適格かは人が判断します。",
+              "正式Bの既定の信用条件は売残/20日平均出来高が1以上、かつ有効な20日（未計算なら5日）の売残変化がプラスです。",
+              "参考点は財務品質・成長・評価額の合計（既定75点満点）。信用需給・価格持続性は採点せず、欠測分の再配点もしません。", ""]
+    if not candidates:
+        lines += ["参考候補に必要な条件を確認できた銘柄はありません。", ""]
+        return
+    overview = []
+    for index, record in enumerate(candidates, 1):
+        margin = _margin(record)
+        overview.append([index, record.get("code"), record.get("name"),
+                         _fmt(record.get("registration_b_reference_score")) + " / "
+                         + _fmt(record.get("registration_b_reference_score_max"), 0),
+                         _growth(record, "b"), _label(record.get("registration_price_state")),
+                         _metric(margin, "margin_short", suffix="株"),
+                         _metric(margin, "margin_short_to_volume_20bd", digits=2),
+                         _reasons(record.get("registration_b_reference_cautions"))])
+    _table(lines, ["順位", "コード", "銘柄", "参考点", "成長根拠", "価格局面", "信用売残", "売残 / 20日平均出来高", "投資判断前の確認事項"], overview)
+    for record in candidates:
+        margin = _margin(record)
+        lines += [f"- **{_escape(record.get('code'))} {_escape(record.get('name'))}**："
+                  f"財務品質 {_escape(record.get('summary_quality_score'))}/7、PS {_fmt(record.get('ps'))}、PER {_fmt(record.get('per'))}。"
+                  f"63営業日騰落率 {_percent(record.get('return_63d'), fraction=True)}、"
+                  f"TOPIX相対 {_percent(record.get('return_rel_topix_63d'), fraction=True)}、"
+                  f"売買代金の持続性 {_fmt(record.get('turnover_persistence'))}。",
+                  "  信用売残の変化: 5営業日 " + _escape(_change(margin, 5, "short"))
+                  + " / 20営業日 " + _escape(_change(margin, 20, "short")) + "。",
+                  "  信用の時点: 申込 " + _escape(margin.get("margin_reference_date"))
+                  + " / 公表 " + _escape(margin.get("margin_pub_date")) + "。",
+                  "  その他の確認事項: " + _escape(_reasons(record.get("registration_b_warnings"))) + "。"]
+    lines += ["", "詳細は top_registration_reference_b.csv、参考候補の全件は registration_reference_b.csv に保存します。", ""]
 
 
 def markdown_report(records: list[dict], meta: dict, top: int = 10) -> str:
@@ -212,12 +260,19 @@ def markdown_report(records: list[dict], meta: dict, top: int = 10) -> str:
                 _escape(scope_counts.get("credit_pending_count"))),
             "財務全履歴の最終取得（対象内の最古）: " + _escape(workflow.get("oldest_last_full_financial_at")),
             "未評価の理由は screening_unavailable.csv、市場による対象外は scope_excluded.csv を参照してください。", ""]
+    if meta.get("registration_margin_reference_date"):
+        lines += ["信用残の共通比較日は " + _escape(meta["registration_margin_reference_date"])
+                  + "（価格基準日の直前営業日）です。", ""]
     lines += ["信用取得の情報締切: " + _escape(meta.get("registration_margin_snapshot_cutoff")), ""]
     for lane, title in (("a", "A：割安で財務と成長根拠がある企業"),
                         ("b", "B：高成長と信用売残を確認するスイング候補")):
         candidates = selected[f"top_registration_{lane}.csv"]
         lines += [f"## {title} — 上位{top}件", ""]
         lines += [f"適格 {counts[lane]['eligible_count']}件 / 保留 {counts[lane]['hold_count']}件 / 対象外 {counts[lane]['excluded_count']}件。", ""]
+        if lane == "b":
+            _reference_report(lines, selected["top_registration_reference_b.csv"], counts["b"]["reference_count"],
+                              min(top, jq_universe.B_REFERENCE_LIMIT))
+            lines += ["### 正式なB適格候補", ""]
         if not candidates:
             lines += ["候補なし。欠測や条件未達を埋めて推奨することはしません。", ""]
             reasons = sorted(counts[lane]["reason_counts"].items(), key=lambda item: (-item[1], item[0]))[:10]

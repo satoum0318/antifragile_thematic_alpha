@@ -37,7 +37,8 @@ def test_groups_are_immutable_and_ties_are_stable_without_mixing_routes_or_holds
     first, shuffled = groups(rows, 1), groups(list(reversed(rows)), 1)
     assert rows == before
     assert set(first) == {"top_registration_a.csv", "top_registration_b.csv", "registration_candidates_a.csv",
-                          "registration_candidates_b.csv", "registration_review.csv"}
+                          "registration_candidates_b.csv", "registration_review.csv",
+                          "registration_reference_b.csv", "top_registration_reference_b.csv"}
     assert first == shuffled
     assert [row["code"] for row in first["top_registration_a.csv"]] == ["1100"]
     assert [row["code"] for row in first["registration_candidates_a.csv"]] == ["1100", "1200"]
@@ -129,3 +130,22 @@ def test_report_escapes_names_and_marks_credit_after_price_as_unusable():
     assert "銘柄\\|&lt;script&gt; 別行" in report
     assert "<script>" not in report
     assert "価格基準日より後の残高・判定使用不可" in report
+
+
+def test_report_explains_pullback_and_common_credit_date_holds_in_japanese():
+    record = candidate("1234", a="hold", b="hold")
+    record.update(registration_price_state="pullback_wait",
+                  registration_a_reasons=["price_condition:pullback_wait"],
+                  registration_b_reasons=["margin_reference_date_mismatch"])
+    report = markdown_report([record], metadata())
+    assert "反落・条件待ち" in report
+    assert "信用残の申込日が共通比較日と不一致" in report
+    assert groups([record])["top_registration_a.csv"] == []
+    assert groups([record])["top_registration_b.csv"] == []
+
+
+def test_report_exposes_the_common_credit_comparison_date():
+    meta = metadata()
+    meta["registration_margin_reference_date"] = "2026-10-23"
+    report = markdown_report([], meta)
+    assert "信用残の共通比較日は 2026-10-23（価格基準日の直前営業日）です。" in report

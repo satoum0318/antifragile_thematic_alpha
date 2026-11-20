@@ -133,7 +133,8 @@ def test_new_margin_with_old_price_is_not_a_supply_signal(tmp_path):
     save_margin_snapshot(store,snap,'newer_credit',rows=[future],observed='2026-10-29T18:00:00+09:00')
     rows,_,_=bot.score_snapshot(store,snap,bot.Config(),margin_snapshot_id='newer_credit')
     first=next(r for r in rows if r['code']==code)
-    assert first['registration_margin_diagnostic']['margin_after_price_asof'] is True
+    assert first['registration_margin_diagnostic']['margin_diagnostic_status'] == 'reference_date_unavailable'
+    assert first['registration_margin_reference_date_mismatch'] is True
     assert first['registration_b_eligible'] is False
     assert first['registration_supply_state']=='unassessed'
 
@@ -176,3 +177,30 @@ def test_outputs_have_separate_rankings_audits_and_single_uses_saved_results(tmp
     assert (destination/'report_registration_top10.md').is_file()
     with pytest.raises(bot.DataError,match='immutable_run_already_exists'):
         bot.write_run(rows,stats,meta,output,run_id='ab_result')
+
+
+def test_reference_candidates_are_saved_separately_with_verified_credit_and_no_strict_promotion(tmp_path):
+    store,snap=current_snapshot(tmp_path)
+    for code,item in snap['symbols'].items():
+        credit=margin_rows(code)[-2:]
+        for row in credit:
+            for key in ('ShrtVol','ShrtNegVol','ShrtStdVol','ShrtVal','ShrtNegVal','ShrtStdVal'):
+                row[key] //= 100
+        item['margin']=store.put({'status':'complete','rows':credit,'collected_at':'2026-10-27T18:00:00+09:00'})
+    rows,stats,meta=bot.score_snapshot(store,snap,bot.Config())
+    assert all(r['registration_b_eligible'] is False for r in rows)
+    assert all(r['registration_b_reference_candidate'] is True for r in rows)
+    assert all(r['registration_b_score'] is None for r in rows)
+    assert sorted(r['registration_b_reference_rank'] for r in rows)==list(range(1,len(rows)+1))
+    assert meta['registration_counts']['b']['reference_count']==len(rows)
+    assert meta['registration_b_reference_limit']==2
+    destination=bot.write_run(rows,stats,meta,tmp_path/'out',run_id='reference_result')
+    assert pd.read_csv(destination/'top_registration_b.csv').empty
+    references=pd.read_csv(destination/'top_registration_reference_b.csv')
+    assert len(references)==2 and not references['registration_b_eligible'].any()
+    report=(destination/'report_registration_top10.md').read_text('utf-8')
+    assert '人が確認するB参考候補' in report and f'通過 {len(rows)}件 / 表示 2件' in report
+    assert '信用履歴不足' in report
+    saved=json.loads((destination/'run_manifest.json').read_text('utf-8'))
+    for name in ('registration_reference_b.csv','top_registration_reference_b.csv','report_registration_top10.md'):
+        assert hashlib.sha256((destination/name).read_bytes()).hexdigest()==saved['outputs'][name]

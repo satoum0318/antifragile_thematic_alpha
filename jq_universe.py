@@ -12,7 +12,8 @@ from dataclasses import asdict, dataclass, fields
 from numbers import Real
 from typing import Any, Mapping
 
-UNIVERSE_LOGIC_VERSION = "JQ-UNIVERSE-AB-1.0-rc1"
+UNIVERSE_LOGIC_VERSION = "JQ-UNIVERSE-AB-1.2-rc1"
+B_REFERENCE_LIMIT = 2
 JST = dt.timezone(dt.timedelta(hours=9))
 
 
@@ -182,6 +183,8 @@ def _supply(record: dict, rules: UniverseConfig) -> dict:
     price_day = _date(record.get("price_asof_date"))
     credit_price_day = _date(record.get("margin_price_asof_date"))
     application, publication = _date(record.get("margin_reference_date")), _date(record.get("margin_pub_date"))
+    if record.get("registration_margin_reference_date_mismatch") is True:
+        problems.append("margin_reference_date_mismatch")
     if record.get("margin_diagnostic_status") != "available":
         problems.append("margin_unavailable:" + str(record.get("margin_diagnostic_status", "unknown")))
     if record.get("margin_validation_state") != "valid" or record.get("margin_target_state") != "applicable":
@@ -237,6 +240,36 @@ def _supply(record: dict, rules: UniverseConfig) -> dict:
             "short_balance": short, "short_to_volume_20bd": short_level,
             "long_to_volume_20bd": long_level,
             "comparison_valid": not problems}
+
+
+def _b_reference(record, rules, hold, excluded, components, growth, strict_eligible):
+    """Manual review keeps the financial gates and audited credit observations."""
+    allowed = {"short_balance_to_volume_below_threshold", "short_balance_not_accumulating",
+               "price_condition:downtrend_wait", "price_condition:overheated_wait", "price_condition:pullback_wait",
+               "momentum_wait:return_63d", "momentum_wait:return_rel_topix_63d",
+               "momentum_wait:turnover_persistence", "score_components_unavailable"}
+    # Only a short daily history may waive the change requirement. Invalid
+    # observations, corporate actions, and zero baselines remain blockers.
+    states, reasons = record.get("margin_metric_states") or {}, record.get("margin_metric_reasons") or {}
+    if isinstance(states, dict) and isinstance(reasons, dict) and all(states.get(f"margin_short_change_{n}bd_pct") == "unavailable"
+           and reasons.get(f"margin_short_change_{n}bd_pct") in {"margin_history_insufficient", "daily_history_insufficient"}
+           for n in (5, 20)):
+        allowed.add("short_evidence_missing:short_change_pct")
+    blockers = set(hold + excluded) - allowed
+    if growth["state"] != "confirmed":
+        blockers.add("reference_growth_unconfirmed")
+    parts = {key: components[key] for key in ("quality", "growth", "valuation")}
+    if any(_number(value) is None for value in parts.values()):
+        blockers.add("reference_score_incomplete")
+    candidate = not strict_eligible and not blockers
+    return {
+        "registration_b_reference_candidate": candidate,
+        "registration_b_reference_score": sum(parts.values()) if candidate else None,
+        "registration_b_reference_score_max": sum(getattr(rules, "B_WEIGHT_" + key.upper()) for key in parts),
+        "registration_b_reference_components": parts,
+        "registration_b_reference_cautions": sorted(set(hold + excluded) - {"score_components_unavailable"}) if candidate else [],
+        "registration_b_reference_blockers": sorted(blockers),
+    }
 
 
 def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = None) -> dict:
@@ -298,7 +331,12 @@ def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = No
         price_state = "downtrend_wait"
     if record.get("above_ma200_extended") is True:
         price_state = "overheated_wait"
-    if price_state in {"downtrend_wait", "overheated_wait", "unknown"}:
+    price, ma25, return21 = (_number(record.get(key)) for key in ("price", "ma_25", "return_21d"))
+    if (price_state in {"trend_transition", "uptrend_continuation"}
+            and price is not None and ma25 is not None and return21 is not None
+            and price < ma25 and return21 < 0):
+        price_state = "pullback_wait"
+    if price_state in {"downtrend_wait", "overheated_wait", "pullback_wait", "unknown"}:
         hold.append("price_condition:" + price_state)
     if price_state == "basing_wait":
         if count != 7 or passes is None or passes < 6:
@@ -328,6 +366,8 @@ def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = No
     for route in ("a", "b"):
         prefix, upper = "registration_" + route + "_", route.upper()
         route_hold, route_excluded = list(hold), list(excluded)
+        if route == "b":
+            route_hold = [reason for reason in route_hold if reason != "light_issues:sector_benchmark_insufficient"]
         growth = _growth(record, rules, upper)
         if growth["state"] == "insufficient":
             route_hold.extend(growth["reasons"])
@@ -347,7 +387,7 @@ def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = No
             elif valuation is not None:
                 valuation = .4 * _unit(1 - ps / max_ps) + .3 * _unit(1 - sector_ps / 2) + .3 * _unit(1 - per / max_per)
         technical = {"uptrend_continuation": 1., "trend_transition": .9, "basing_wait": .65,
-                     "overheated_wait": .2, "downtrend_wait": 0.}.get(price_state)
+                     "overheated_wait": .2, "downtrend_wait": 0., "pullback_wait": 0.}.get(price_state)
         if route == "b":
             if supply["reasons"]:
                 route_hold.extend(supply["reasons"])
@@ -386,6 +426,8 @@ def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = No
         if score is None:
             route_hold.append("score_components_unavailable")
         status = "excluded" if route_excluded else "hold" if route_hold else "eligible"
+        if route == "b":
+            out.update(_b_reference(record, rules, route_hold, route_excluded, components, growth, status == "eligible"))
         out.update({prefix + "eligible": status == "eligible", prefix + "status": status,
                     prefix + "score": score, prefix + "components": components,
                     prefix + "reasons": sorted(set(route_excluded + route_hold)),
@@ -400,10 +442,16 @@ def evaluate(record: dict, rules: UniverseConfig | Mapping[str, Any] | None = No
         "sales_cagr", "op_income_yoy_pct", "guidance_status", "guidance_target", "forward_guidance_disclosed",
         "forecast_net_income", "forward_np_change", "forecast_revision_rate", "positive_cfo_years_3y",
         "cumulative_cfo_to_np_3y", "ps", "per", "ps_vs_sector", "summary_quality_score", "summary_quality_available",
-        "return_21d", "return_63d", "return_rel_topix_63d", "turnover_persistence", "margin_long", "margin_short",
+        "price", "ma_25", "return_21d", "return_63d", "return_rel_topix_63d", "turnover_persistence", "margin_long", "margin_short",
         "margin_ratio", "margin_ratio_state", "margin_reference_date", "margin_pub_date", "margin_available_at",
-        "margin_frequency", "margin_application_age_bd", "margin_metric_reasons")}
+        "margin_frequency", "margin_application_age_bd", "margin_metric_reasons",
+        "registration_margin_reference_date_mismatch")}
     return out
+
+
+def reference_rank_key(record: dict) -> tuple:
+    score = _number(record.get("registration_b_reference_score"))
+    return (-(score if score is not None else -math.inf), str(record.get("code", "")))
 
 
 def rank_key(record: dict, route: str = "a") -> tuple:
